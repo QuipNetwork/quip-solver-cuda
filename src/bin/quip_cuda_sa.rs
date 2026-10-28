@@ -34,6 +34,12 @@ struct Cli {
     /// Optional lower cap on the node limit derived from device memory.
     #[arg(long)]
     max_nodes: Option<usize>,
+    /// Print the device capacity grid and exit without starting a session.
+    #[arg(long)]
+    probe_capacity: bool,
+    /// Emit the capacity grid as a single JSON object.
+    #[arg(long, requires = "probe_capacity")]
+    json: bool,
 }
 
 /// Top-level subcommands. Absent → the ordinary coordinator-driven miner
@@ -104,6 +110,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if cli.probe_capacity {
+        quip_solver_cuda::probe::print_probe(&device, cli.json);
+        return ExitCode::SUCCESS;
+    }
     let nodes = advertised_nodes(
         KernelKind::Sa,
         cli.max_nodes.unwrap_or(usize::MAX),
@@ -124,6 +134,19 @@ fn main() -> ExitCode {
 mod cli_tests {
     use super::{BenchAction, Cli, Command};
     use clap::Parser;
+
+    #[test]
+    fn parses_probe_capacity_flags() {
+        assert!(Cli::try_parse_from([
+            "quip-cuda-sa",
+            "--probe-capacity",
+            "--device",
+            "0",
+            "--json"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["quip-cuda-sa", "--json"]).is_err());
+    }
 
     #[test]
     fn parses_max_nodes() {

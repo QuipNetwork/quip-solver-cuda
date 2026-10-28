@@ -1227,7 +1227,7 @@ mod tests {
             &limits,
         );
         assert_eq!(storage, Storage::Dense);
-        let cells = crate::probe::probe(&limits, 128);
+        let cells = crate::probe::probe(KernelKind::Msa, &limits, 128);
         let cell = cells
             .iter()
             .find(|cell| {

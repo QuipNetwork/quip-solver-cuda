@@ -586,30 +586,53 @@ fn degree_62_sparse_63_dense() {
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn probe_capacity_json_parses() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_quip-cuda-msa"))
-        .args(["--probe-capacity", "--json", "--device", "0"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["cells"].as_array().unwrap().len(), 12);
-    assert_eq!(
-        value["cells"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|cell| cell["precision"] == "Int32")
-            .count(),
-        3
-    );
-    assert_eq!(value["betas"], 64);
-    assert!(value["reads"] == 128 || value["reads"] == 64);
-    for cell in value["cells"].as_array().unwrap() {
-        assert!(["shared", "spill", "dense"].contains(&cell["tier"].as_str().unwrap()));
+    for (kernel, binary) in [
+        (KernelKind::Sa, env!("CARGO_BIN_EXE_quip-cuda-sa")),
+        (KernelKind::Gibbs, env!("CARGO_BIN_EXE_quip-cuda-gibbs")),
+        (KernelKind::Msa, env!("CARGO_BIN_EXE_quip-cuda-msa")),
+    ] {
+        let output = std::process::Command::new(binary)
+            .args(["--probe-capacity", "--json", "--device", "0"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{kernel:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["kernel"], kernel.name());
+        let cells = value["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 12);
+        for precision in ["Binary", "Int8", "Int32", "Float32"] {
+            assert_eq!(
+                cells
+                    .iter()
+                    .filter(|cell| cell["precision"] == precision)
+                    .count(),
+                3
+            );
+        }
+        assert_eq!(value["betas"], 64);
+        let sms = value["sm_count"].as_u64().unwrap();
+        assert_eq!(
+            value["instances"],
+            (sms / u64::try_from(kernel.sms_per_instance()).unwrap()).max(1)
+        );
+        if kernel == KernelKind::Msa {
+            assert!(value["reads"] == 128 || value["reads"] == 64);
+        } else {
+            assert_eq!(value["reads"], 256);
+            assert!(cells.iter().all(|cell| cell["expected_slowdown"].is_null()));
+        }
+        let tiers = if kernel == KernelKind::Sa {
+            ["local", "global", "dense"]
+        } else {
+            ["shared", "spill", "dense"]
+        };
+        for cell in cells {
+            assert!(tiers.contains(&cell["tier"].as_str().unwrap()));
+        }
     }
 }
 
@@ -701,7 +724,8 @@ fn boundary_graph(
             Precision::Binary => 1.0,
             Precision::Int8 if conn == Connectivity::Complete => 1.0,
             Precision::Int8 if i % 2 == 0 => 0.016,
-            Precision::Int8 => -0.992,
+            // Force i32 deltas even for uncoupled SA (scaled field = 127).
+            Precision::Int8 => -2.032,
             Precision::Int32 if i % 2 == 0 => 0.001,
             Precision::Int32 => 1.001,
             Precision::Float32 => std::f64::consts::SQRT_2,
@@ -720,21 +744,36 @@ fn boundary_graph(
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn derived_node_boundaries_report_memory_before_node_caps() {
-    use quip_solver_cuda::capacity::{msa_max_model, Connectivity};
+    for kernel in [KernelKind::Sa, KernelKind::Gibbs, KernelKind::Msa] {
+        let mut device = CudaDevice::open_with_nodes(0, kernel, 5000).unwrap();
+        let limits = DeviceLimits {
+            free_bytes: if kernel == KernelKind::Sa {
+                1 << 30
+            } else {
+                64 << 20
+            },
+            ..device.limits
+        };
+        device = device.with_limits_for_test(limits);
+        let p = SampleParams {
+            num_reads: if kernel == KernelKind::Msa {
+                msa_device_reads(&limits)
+            } else {
+                2
+            },
+            num_sweeps: 64,
+            sweeps_per_beta: 1,
+            beta_range: Some((0.01, 0.1)),
+            ..SampleParams::default()
+        };
+        check_derived_boundaries(device, kernel, &p);
+    }
+}
+
+fn check_derived_boundaries(mut device: CudaDevice, kernel: KernelKind, p: &SampleParams) {
+    use quip_solver_cuda::capacity::{max_model, Connectivity};
     use quip_solver_cuda::streaming::{sample_one, sample_one_real};
-    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 5000).unwrap();
-    let limits = DeviceLimits {
-        free_bytes: 64 << 20,
-        ..device.limits
-    };
-    device = device.with_limits_for_test(limits);
-    let p = SampleParams {
-        num_reads: msa_device_reads(&limits),
-        num_sweeps: 256,
-        sweeps_per_beta: 4,
-        beta_range: Some((0.01, 0.1)),
-        ..SampleParams::default()
-    };
+    let limits = device.limits;
     let ctx = CudaContext::new(device.device_index).unwrap();
     for conn in [Connectivity::Degree(0), Connectivity::Complete] {
         for precision in [
@@ -743,19 +782,21 @@ fn derived_node_boundaries_report_memory_before_node_caps() {
             Precision::Int32,
             Precision::Float32,
         ] {
-            let shape = msa_max_model(conn, precision, p.num_reads, &limits);
+            let shape = max_model(kernel, conn, precision, p.num_reads, &limits);
+            assert!(shape.nodes > 1, "{kernel:?} {conn:?} {precision:?}");
+            eprintln!("boundary kernel={kernel:?} connectivity={conn:?} precision={precision:?} nodes={} reads={}", shape.nodes, p.num_reads);
             device.max_nodes = shape.nodes;
             let graph = |n| boundary_graph(conn, n, precision);
             let over = graph(shape.nodes + 1);
             ctx.synchronize().unwrap();
             let (before, _) = ctx.mem_get_info().unwrap();
-            let error = sample_one_real(&device, &over, &p).unwrap_err();
+            let error = sample_one_real(&device, &over, p).unwrap_err();
             assert!(
                 matches!(error, SampleError::ModelExceedsDeviceMemory { .. }),
                 "{conn:?} {precision:?}: {error:?}"
             );
             if precision == Precision::Float32 {
-                let error = bench_many_real(&device, &over, &p, 1).unwrap_err();
+                let error = bench_many_real(&device, &over, p, 1).unwrap_err();
                 assert!(
                     matches!(error, SampleError::ModelExceedsDeviceMemory { .. }),
                     "{conn:?} {precision:?}: {error:?}"
@@ -763,11 +804,11 @@ fn derived_node_boundaries_report_memory_before_node_caps() {
             }
             if precision != Precision::Float32 {
                 assert!(matches!(
-                    sample_one(&device, &over, &p, KernelKind::Msa),
+                    sample_one(&device, &over, p, kernel),
                     Err(SampleError::ModelExceedsDeviceMemory { .. })
                 ));
                 assert!(matches!(
-                    bench_many(&device, &over, &p, KernelKind::Msa, None, 1),
+                    bench_many(&device, &over, p, kernel, None, 1),
                     Err(SampleError::ModelExceedsDeviceMemory { .. })
                 ));
             }
@@ -776,24 +817,22 @@ fn derived_node_boundaries_report_memory_before_node_caps() {
             assert!(before.saturating_sub(after) <= 2 << 20);
             let fits = graph(shape.nodes);
             assert_eq!(
-                sample_one_real(&device, &fits, &p).unwrap().len(),
+                sample_one_real(&device, &fits, p).unwrap().len(),
                 p.num_reads
             );
             if precision == Precision::Float32 {
                 assert_eq!(
-                    bench_many_real(&device, &fits, &p, 1).unwrap().0.len(),
+                    bench_many_real(&device, &fits, p, 1).unwrap().0.len(),
                     p.num_reads
                 );
             }
             if precision != Precision::Float32 {
                 assert_eq!(
-                    sample_one(&device, &fits, &p, KernelKind::Msa)
-                        .unwrap()
-                        .len(),
+                    sample_one(&device, &fits, p, kernel).unwrap().len(),
                     p.num_reads
                 );
                 assert_eq!(
-                    bench_many(&device, &fits, &p, KernelKind::Msa, None, 1)
+                    bench_many(&device, &fits, p, kernel, None, 1)
                         .unwrap()
                         .0
                         .len(),
@@ -802,17 +841,17 @@ fn derived_node_boundaries_report_memory_before_node_caps() {
             }
             device.max_nodes = shape.nodes - 1;
             assert!(matches!(
-                sample_one_real(&device, &fits, &p),
+                sample_one_real(&device, &fits, p),
                 Err(SampleError::GraphTooLarge { .. })
             ));
             if precision == Precision::Float32 {
                 assert!(matches!(
-                    bench_many_real(&device, &fits, &p, 1),
+                    bench_many_real(&device, &fits, p, 1),
                     Err(SampleError::GraphTooLarge { .. })
                 ));
             } else {
                 assert!(matches!(
-                    bench_many(&device, &fits, &p, KernelKind::Msa, None, 1),
+                    bench_many(&device, &fits, p, kernel, None, 1),
                     Err(SampleError::GraphTooLarge { .. })
                 ));
             }

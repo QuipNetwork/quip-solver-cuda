@@ -35,11 +35,30 @@ and 4,000,000 edges with 48 models, the A4000 measured about 2 GiB for unit
 models and 5.2 GiB for weighted i32 models (see the
 [A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)).
 
-Run `quip-cuda-msa --probe-capacity` to show the capacity grid for the selected device.
+SA and Gibbs also derive their limits from device memory split among instances.
+SA uses one SM per instance. Gibbs uses four SMs per instance.
+A device with 48 SMs runs 48 SA instances or 12 Gibbs instances.
+
+SA uses local state for sparse models through 5,000 nodes. Larger sparse models use global state.
+Gibbs keeps its static shared array for sparse models through 4,800 nodes.
+Other Gibbs models keep a shared spin prefix. The rest of the spins use device memory.
+
+Both kernels choose the sparse or dense route that needs less memory.
+Their node limits describe Binary models with no edges. These limits use the default read count and 64 beta entries.
+Each model must fit with its own edges, precision, and beta count.
+Use `--max-nodes` to set a lower node limit.
+
+Run `quip-cuda-sa --probe-capacity`, `quip-cuda-gibbs --probe-capacity`, or `quip-cuda-msa --probe-capacity` to show the device capacity grid.
 Add `--device N` to select a GPU or `--json` for machine-readable output.
-The grid uses the mining read count and 64 beta entries.
-It shows separate Binary, Int8, Int32, and Float32 limits. Int32 also counts its integer acceptance tables.
-Each cell shows variables, couplers, and the shared, spill, or dense storage tier.
+The JSON includes the kernel name.
+
+The grid uses the read cap and 64 beta entries.
+It shows Binary, Int8, Int32, and Float32 limits for degree 20, degree 60, and complete models.
+Precision applies to both fields and couplers. Int32 also counts its integer acceptance tables where required.
+
+Each cell shows variables, couplers, bytes per instance, and the storage tier.
+SA tiers are local, global, and dense. Gibbs and MSA use shared, spill, and dense tiers.
+Without measured slowdown data, the probe reports unknown slowdown for SA and Gibbs.
 Use `quip-cuda-msa bench run --complete N --precision int8 --out DIR` to benchmark a complete graph.
 The precision options are `binary`, `int8`, `int32`, and `float`.
 
@@ -68,14 +87,16 @@ The local field bound is the largest of these sums.
 - **SA:** solves every whole-milli model up to a local field of 536,870,911 milli.
   SA uses the int8 kernel when `max_i(|h_i| + sum_j |J_ij|) / GCD_step <= 63`.
   This bound keeps the flip delta within int8 because `2 * field <= 127`.
-  Other models use the fixed-point wide kernel.
+  Larger deltas use i32 arithmetic, with i8 coefficients when the scaled values fit.
+  Wider coefficients use the fixed-point wide kernel.
   A complete graph with unit couplings and zero fields has field 63 at 64 nodes. It uses int8.
   At 65 nodes, its field is 64 and it uses wide.
   Its accept decision uses integers only, so the same seed gives the same decision on every GPU.
   The SA identity advertises 536,870,910 milli because `quip-solver-core` 0.0.3 `--solve` does not round coefficients (QUI-1813).
   The wide kernel cannot accept a move whose Metropolis probability is below about 7.6e-6.
-- **Gibbs:** accepts models whose absolute coefficients are at most 127 times the model's GCD step.
-  Gibbs refuses models that need a wide path.
+- **Gibbs:** uses i8 storage when absolute coefficients are at most 127 times the model's GCD step.
+  Wider whole-milli coefficients use i32 storage and field arithmetic.
+  The wide path accepts local fields up to 536,870,911 milli.
 - **MSA:** uses sparse storage through degree 62 and dense storage for higher degrees.
   Models with `h` in {-1, 0, 1} and `J` in {-1, 1} use the unit-weight kernel.
   Other models use the weighted kernel at the model's GCD step.
