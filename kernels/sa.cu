@@ -114,6 +114,9 @@ __device__ delta_t get_flip_energy_unpacked(
     const coef_t* csr_J_vals,
     int n,
     const coef_t* h
+#ifdef QUIP_SA_GLOBAL_STATE
+    , int total_threads, int global_tid
+#endif
 ) {
     const int start = __ldg(&csr_row_ptr[var]);
     const int end = __ldg(&csr_row_ptr[var + 1]);
@@ -128,10 +131,18 @@ __device__ delta_t get_flip_energy_unpacked(
     for (int p = start; p < end; ++p) {
         const int neighbor = __ldg(&csr_col_ind[p]);
         const coef_t Jij = __ldg(&csr_J_vals[p]);
+#ifdef QUIP_SA_GLOBAL_STATE
+        energy += unpacked_state[(long long)neighbor * total_threads + global_tid] * Jij;
+#else
         energy += unpacked_state[neighbor] * Jij;
+#endif
     }
 
+#ifdef QUIP_SA_GLOBAL_STATE
+    return (delta_t)(-2 * unpacked_state[(long long)var * total_threads + global_tid] * energy);
+#else
     return (delta_t)(-2 * unpacked_state[var] * energy);
+#endif
 }
 
 
@@ -169,9 +180,12 @@ __global__ void cuda_sa_self_feeding(
     int max_packed_size,
     unsigned int base_seed,
 
-    // Workspace (per global thread)
+    // Workspace (per global thread, interleaved in the global instantiation)
     delta_t* delta_energy_workspace,
     int max_N
+#ifdef QUIP_SA_GLOBAL_STATE
+    , signed char* state_workspace
+#endif
 #ifdef QUIP_SA_WIDE
     , const long long* __restrict__ beta_fixed
     , const int* __restrict__ delta_cut
@@ -241,8 +255,12 @@ __global__ void cuda_sa_self_feeding(
             (long long)slot_idx * nnz];
         const coef_t* my_h = &slot_h_vals[
             (long long)slot_idx * N];
+#ifdef QUIP_SA_GLOBAL_STATE
+        long long sample_base = (long long)slot_idx * num_reads * max_packed_size;
+#else
         int sample_base = slot_idx * num_reads
                           * max_packed_size;
+#endif
         int energy_base = slot_idx * num_reads;
 
         unsigned int slot_seed =
@@ -257,14 +275,23 @@ __global__ void cuda_sa_self_feeding(
         if (tid < num_reads) {
             int packed_size = (N + 7) / 8;
 
-            // Thread-local state
+            // Mining-size local state or interleaved global state
+#ifdef QUIP_SA_GLOBAL_STATE
+            signed char* unpacked_state = state_workspace;
+            int total_threads = num_nonces * blockDim.x;
+#else
             signed char unpacked_state[QUIP_MAX_NODES];
+#endif
 
             // Delta energy workspace (unique per global thread)
             int global_tid = blockIdx.x * blockDim.x + tid;
+#ifdef QUIP_SA_GLOBAL_STATE
+            delta_t* delta_energy = delta_energy_workspace;
+#else
             delta_t* delta_energy =
                 &delta_energy_workspace[
                     (long long)global_tid * max_N];
+#endif
 
             // Init RNG (unique per thread + slot)
             unsigned int rng_state =
@@ -274,24 +301,40 @@ __global__ void cuda_sa_self_feeding(
             // Random initial state
             for (int var = 0; var < N; var++) {
                 unsigned int r = xorshift32(rng_state);
+#ifdef QUIP_SA_GLOBAL_STATE
+                unpacked_state[(long long)var * total_threads + global_tid] =
+#else
                 unpacked_state[var] =
+#endif
                     (r & 1) ? (signed char)-1
                             : (signed char)1;
             }
 
             // Build initial delta_energy including h
             for (int var = 0; var < N; var++) {
+#ifdef QUIP_SA_GLOBAL_STATE
+                delta_energy[(long long)var * total_threads + global_tid] =
+#else
                 delta_energy[var] =
+#endif
                     get_flip_energy_unpacked(
                         var, unpacked_state,
                         csr_row_ptr, csr_col_ind,
+#ifdef QUIP_SA_GLOBAL_STATE
+                        my_J, N, my_h, total_threads, global_tid);
+#else
                         my_J, N, my_h);
+#endif
             }
 
             // Initial energy (h + J terms)
             energy_t current_energy = 0;
             for (int i = 0; i < N; i++) {
+#ifdef QUIP_SA_GLOBAL_STATE
+                signed char spin_i = unpacked_state[(long long)i * total_threads + global_tid];
+#else
                 signed char spin_i = unpacked_state[i];
+#endif
                 current_energy +=
                     (int)__ldg(&my_h[i]) * spin_i;
                 const int start =
@@ -305,7 +348,11 @@ __global__ void cuda_sa_self_feeding(
                         const coef_t Jij =
                             __ldg(&my_J[p]);
                         const signed char spin_j =
+#ifdef QUIP_SA_GLOBAL_STATE
+                            unpacked_state[(long long)j * total_threads + global_tid];
+#else
                             unpacked_state[j];
+#endif
                         current_energy +=
                             Jij * spin_i * spin_j;
                     }
@@ -337,7 +384,11 @@ __global__ void cuda_sa_self_feeding(
                      sweep++) {
                     for (int var = 0; var < N; var++) {
                         delta_t de =
+#ifdef QUIP_SA_GLOBAL_STATE
+                            delta_energy[(long long)var * total_threads + global_tid];
+#else
                             delta_energy[var];
+#endif
 
 #ifdef QUIP_SA_WIDE
                         if (de > rung_cut) {
@@ -381,8 +432,12 @@ __global__ void cuda_sa_self_feeding(
 
                             const signed char
                                 var_spin =
+#ifdef QUIP_SA_GLOBAL_STATE
+                                    unpacked_state[(long long)var * total_threads + global_tid];
+#else
                                     unpacked_state[
                                         var];
+#endif
                             const signed char
                                 multiplier =
                                     4 * var_spin;
@@ -405,17 +460,33 @@ __global__ void cuda_sa_self_feeding(
                                         &my_J[p]);
                                 const signed char
                                     ns =
+#ifdef QUIP_SA_GLOBAL_STATE
+                                        unpacked_state[(long long)neighbor * total_threads + global_tid];
+#else
                                         unpacked_state[
                                             neighbor];
+#endif
+#ifdef QUIP_SA_GLOBAL_STATE
+                                delta_energy[(long long)neighbor * total_threads + global_tid] +=
+#else
                                 delta_energy[
                                     neighbor] +=
+#endif
                                     multiplier
                                     * Jij * ns;
                             }
 
+#ifdef QUIP_SA_GLOBAL_STATE
+                            unpacked_state[(long long)var * total_threads + global_tid] =
+#else
                             unpacked_state[var] =
+#endif
                                 -var_spin;
+#ifdef QUIP_SA_GLOBAL_STATE
+                            delta_energy[(long long)var * total_threads + global_tid] = -de;
+#else
                             delta_energy[var] = -de;
+#endif
                         }
                     }
                 }
@@ -428,6 +499,19 @@ __global__ void cuda_sa_self_feeding(
                 // as `unpacked_state` it packs: a fixed size here would be
                 // overrun by any N above `size * 8`, and the two must not
                 // drift apart.
+#ifdef QUIP_SA_GLOBAL_STATE
+                signed char* out_sample = &slot_samples[
+                    sample_base + (long long)tid * max_packed_size];
+                for (int b = 0; b < packed_size; b++) {
+                    unsigned char packed = 0;
+                    for (int bit = 0; bit < 8 && b * 8 + bit < N; bit++) {
+                        if (unpacked_state[(long long)(b * 8 + bit) * total_threads + global_tid] < 0)
+                            packed |= 1u << bit;
+                    }
+                    out_sample[b] = (signed char)packed;
+                }
+
+#else
                 signed char packed_state[(QUIP_MAX_NODES + 7) / 8];
                 for (int b = 0; b < packed_size; b++)
                     packed_state[b] = 0;
@@ -445,6 +529,7 @@ __global__ void cuda_sa_self_feeding(
                 for (int b = 0; b < packed_size; b++)
                     out_sample[b] = packed_state[b];
 
+#endif
                 // Write energy to output
                 slot_energies[energy_base + tid] =
                     (int)current_energy;

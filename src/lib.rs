@@ -205,10 +205,9 @@ fn identity_max_nodes(max_nodes: usize) -> u32 {
     u32::try_from(max_nodes).unwrap_or(u32::MAX)
 }
 
-/// Backend identity for `quip-cuda-sa` at a resolved capacity. `max_nodes` is
-/// the self-feeding SA kernel's `unpacked_state` size (thread-local array in
-/// `kernels/sa.cu`) — a job over this would overrun kernel-local storage, not
-/// just run slowly, so it must reject `TooLarge` rather than clamp.
+/// Backend identity for `quip-cuda-sa` at its device-memory node limit,
+/// optionally reduced by `--max-nodes`. Each model also passes admission
+/// with its own topology, coefficient width, and beta schedule.
 #[must_use]
 pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
     BackendIdentity {

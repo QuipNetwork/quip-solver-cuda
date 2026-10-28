@@ -115,9 +115,7 @@ fn weighted_int8_matches_int32() {
             .map(|i| if i % 2 == 0 { 0.032 } else { -0.976 })
             .collect();
         assert_eq!(
-            plan(KernelKind::Msa, &graph, device.max_nodes)
-                .unwrap()
-                .path,
+            plan(KernelKind::Msa, &graph).unwrap().path,
             CoefficientPath::WeightedInt8
         );
         let (narrow, _) = bench_one(&device, &graph, &params(), KernelKind::Msa, None).unwrap();
@@ -272,7 +270,7 @@ fn real_sparse_acceptance_matches_replica_oracle() {
             .flat_map(|node| (1..=degree / 2).map(move |d| (node, (node + d) % 64)))
             .collect();
         let graph = IsingGraph::new(vec![0.125_000_01_f64; 64], vec![0.0; edges.len()], edges);
-        assert!(plan(KernelKind::Msa, &graph, device.max_nodes).is_err());
+        assert!(plan(KernelKind::Msa, &graph).is_err());
         for cap in [None, Some(0)] {
             device.msa_shared_spins_cap = cap;
             for num_reads in [63, 64, 65, 128].into_iter().filter(|&r| r <= max_reads) {

@@ -117,28 +117,12 @@ fn gibbs_opens_well_above_the_shared_default() {
     assert_eq!(dev.max_nodes, 32768);
 }
 
-/// SA is bounded by device memory, which no card satisfies at this size, so
-/// the refusal must name the request and the memory budget rather than let
-/// the driver fail later with a bare out-of-memory.
+/// Opening sets an optional cap. Per-model admission checks memory later.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn sa_refuses_above_the_device_memory_budget() {
-    if CudaDevice::device_count().unwrap_or(0) == 0 {
-        eprintln!("no CUDA device visible; skipping");
-        return;
-    }
-
-    let err = CudaDevice::open_with_nodes(0, KernelKind::Sa, 10_000_000)
-        .expect_err("SA above the device memory budget must fail at open");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("10000000"),
-        "message must name the request: {msg}"
-    );
-    assert!(
-        msg.contains("memory budget"),
-        "message must name the resource that bound it: {msg}"
-    );
+fn sa_large_node_cap_does_not_compile_a_large_local_frame() {
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 10_000_000).unwrap();
+    assert_eq!(device.max_nodes, 10_000_000);
 }
 
 /// SA now reaches far past its old 8192 cap. 16384 was the original

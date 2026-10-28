@@ -118,9 +118,9 @@ fn footprint_matches_measured_allocation() {
         ] {
             let graph = circulant(nodes, degree, precision);
             if precision == Precision::Float32 {
-                assert!(coefficients::plan(KernelKind::Msa, &graph, device.max_nodes).is_err());
+                assert!(coefficients::plan(KernelKind::Msa, &graph).is_err());
             } else {
-                let plan = coefficients::plan(KernelKind::Msa, &graph, device.max_nodes).unwrap();
+                let plan = coefficients::plan(KernelKind::Msa, &graph).unwrap();
                 assert_eq!(
                     Precision::from_plan(plan, precision == Precision::Binary),
                     precision
@@ -194,6 +194,61 @@ fn footprint_matches_measured_allocation() {
         }
     }
     dense_allocation_cases(device, &ctx);
+    sa_allocation_cases();
+}
+
+fn sa_allocation_cases() {
+    let nodes = 20_000;
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, nodes).unwrap();
+    let ctx = CudaContext::new(0).unwrap();
+    for precision in [Precision::Binary, Precision::Int32] {
+        let graph = circulant(nodes, 20, precision);
+        let params = SampleParams {
+            num_reads: 256,
+            num_sweeps: 1,
+            ..SampleParams::default()
+        };
+        let footprint = quip_solver_cuda::capacity::sa_footprint(
+            ModelShape {
+                nodes,
+                couplers: graph.edges.len(),
+                max_degree: 20,
+            },
+            precision,
+            Storage::Sparse,
+            256,
+            1,
+            &device.limits,
+        );
+        ctx.synchronize().unwrap();
+        let (before, _) = ctx.mem_get_info().unwrap();
+        let free = Arc::new(AtomicUsize::new(0));
+        let observer = AllocationAtLaunch {
+            ctx: Arc::clone(&ctx),
+            free: Arc::clone(&free),
+        };
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(observer), || {
+            bench_many(
+                &device,
+                &graph,
+                &params,
+                KernelKind::Sa,
+                None,
+                footprint.instances,
+            )
+            .unwrap();
+        });
+        let after = free.load(Ordering::SeqCst);
+        assert_ne!(after, 0);
+        let measured = before.checked_sub(after).unwrap();
+        eprintln!(
+            "sa precision={precision:?} measured={measured} footprint={}",
+            footprint.total()
+        );
+        assert!(measured > 0);
+        assert!(measured <= footprint.total());
+        assert!(footprint.total() - measured <= measured / 10 + (64 << 20));
+    }
 }
 
 fn dense_allocation_cases(device: CudaDevice, ctx: &Arc<CudaContext>) {
@@ -241,7 +296,7 @@ fn dense_graph(nodes: usize, precision: Precision) -> IsingGraph {
     }
     let graph = IsingGraph::new(vec![0.0; nodes], j, edges);
     if precision != Precision::Float32 {
-        let plan = coefficients::plan(KernelKind::Msa, &graph, nodes).unwrap();
+        let plan = coefficients::plan(KernelKind::Msa, &graph).unwrap();
         assert_eq!(Precision::from_plan(plan, true), precision);
     }
     graph
@@ -546,7 +601,7 @@ fn boundary_graph(
     }
     if precision != Precision::Float32 {
         assert_eq!(
-            Precision::from_plan(coefficients::plan(KernelKind::Msa, &g, n).unwrap(), true),
+            Precision::from_plan(coefficients::plan(KernelKind::Msa, &g).unwrap(), true),
             precision
         );
     }

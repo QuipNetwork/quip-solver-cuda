@@ -131,26 +131,18 @@ fn max_local_field(h: &[i64], j: &[i64], edges: &[(usize, usize)]) -> i64 {
 
 /// Classify one job for `kind`.
 ///
-/// `wide_max_nodes` is the device's node budget for wide SA.
-/// Zero means no wide SA path. MSA checks memory during session admission.
-///
 /// # Errors
 ///
 /// A message naming why no path holds the job exactly. Every refusal is
 /// permanent for this job on this binary.
-pub fn plan(
-    kind: KernelKind,
-    graph: &IsingGraph,
-    wide_max_nodes: usize,
-) -> Result<CoefficientPlan, String> {
-    plan_with_unit(kind, graph, wide_max_nodes).map(|(plan, _)| plan)
+pub fn plan(kind: KernelKind, graph: &IsingGraph) -> Result<CoefficientPlan, String> {
+    plan_with_unit(kind, graph).map(|(plan, _)| plan)
 }
 
 /// Preserve the literal-unit classification for the same job's beta resolution.
 pub(crate) fn plan_with_unit(
     kind: KernelKind,
     graph: &IsingGraph,
-    wide_max_nodes: usize,
 ) -> Result<(CoefficientPlan, bool), String> {
     let unit_mining = is_unit_mining(graph);
     // Unit Gibbs coefficients fit int8, and unit MSA uses its original kernel.
@@ -208,13 +200,6 @@ pub(crate) fn plan_with_unit(
         KernelKind::Sa if field > WIDE_MAX_FIELD => Err(format!(
             "sa: local field {field} times the model's {scale_milli} milli step exceeds the wide path's limit of {WIDE_MAX_FIELD}"
         )),
-        KernelKind::Sa if wide_max_nodes == 0 => {
-            Err("sa: the model needs the wide path, which this device does not offer".into())
-        }
-        KernelKind::Sa if graph.h.len() > wide_max_nodes => Err(format!(
-            "sa: the wide path holds {wide_max_nodes} nodes on this device, the model has {}",
-            graph.h.len()
-        )),
         KernelKind::Sa => Ok(CoefficientPlan { path: CoefficientPath::Wide, scale_milli }),
     };
     plan.map(|plan| (plan, unit_mining))
@@ -249,7 +234,7 @@ mod tests {
             vec![0.032, -0.976],
             vec![(0, 1), (1, 2)],
         );
-        let p = plan(KernelKind::Msa, &g, BIG_WIDE).unwrap();
+        let p = plan(KernelKind::Msa, &g).unwrap();
         assert_eq!(p.path, CoefficientPath::WeightedInt8);
         assert_eq!(p.scale_milli, 16);
     }
@@ -257,7 +242,7 @@ mod tests {
     #[test]
     fn int8_overflow_plans_wide() {
         let g = graph(vec![0.001, 0.0], vec![1.0], vec![(0, 1)]);
-        let p = plan(KernelKind::Msa, &g, BIG_WIDE).unwrap();
+        let p = plan(KernelKind::Msa, &g).unwrap();
         assert_eq!(p.path, CoefficientPath::Wide);
         assert_eq!(p.scale_milli, 1);
     }
@@ -266,7 +251,7 @@ mod tests {
     fn binary_model_plan_unchanged() {
         let g = graph(vec![-1.0, 0.0, 1.0], vec![1.0, -1.0], vec![(0, 1), (1, 2)]);
         assert_eq!(
-            plan(KernelKind::Msa, &g, BIG_WIDE).unwrap(),
+            plan(KernelKind::Msa, &g).unwrap(),
             CoefficientPlan {
                 path: CoefficientPath::Int8,
                 scale_milli: 1000,
@@ -274,14 +259,11 @@ mod tests {
         );
     }
 
-    const NO_WIDE: usize = 0;
-    const BIG_WIDE: usize = 1_000_000;
-
     #[test]
     fn mining_model_is_int8_at_unit_scale() {
         let g = graph(vec![1.0, -1.0, 0.0], vec![1.0, -1.0], vec![(0, 1), (1, 2)]);
         for kind in [KernelKind::Sa, KernelKind::Gibbs, KernelKind::Msa] {
-            let p = plan(kind, &g, NO_WIDE).expect("mining model plans");
+            let p = plan(kind, &g).expect("mining model plans");
             assert_eq!(
                 p,
                 CoefficientPlan {
@@ -296,7 +278,7 @@ mod tests {
     #[test]
     fn all_zero_model_is_int8_at_unit_scale() {
         let g = graph(vec![0.0; 3], vec![0.0, 0.0], vec![(0, 1), (1, 2)]);
-        let p = plan(KernelKind::Sa, &g, NO_WIDE).unwrap();
+        let p = plan(KernelKind::Sa, &g).unwrap();
         assert_eq!(
             p,
             CoefficientPlan {
@@ -309,7 +291,7 @@ mod tests {
     #[test]
     fn quarter_unit_model_scales_to_250_milli() {
         let g = graph(vec![0.25, -0.75], vec![0.5], vec![(0, 1)]);
-        let p = plan(KernelKind::Sa, &g, NO_WIDE).unwrap();
+        let p = plan(KernelKind::Sa, &g).unwrap();
         assert_eq!(
             p,
             CoefficientPlan {
@@ -323,7 +305,7 @@ mod tests {
     #[test]
     fn thousand_x_mining_model_scales_but_stays_int8() {
         let g = graph(vec![1000.0, -1000.0], vec![-1000.0], vec![(0, 1)]);
-        let p = plan(KernelKind::Sa, &g, NO_WIDE).unwrap();
+        let p = plan(KernelKind::Sa, &g).unwrap();
         assert_eq!(
             p,
             CoefficientPlan {
@@ -337,45 +319,36 @@ mod tests {
     fn sa_int8_holds_k64_without_field_and_k65_goes_wide() {
         // K_64, h = 0: field 63, delta 126 <= 127.
         assert_eq!(
-            plan(KernelKind::Sa, &complete(64, 0.0), NO_WIDE)
-                .unwrap()
-                .path,
+            plan(KernelKind::Sa, &complete(64, 0.0)).unwrap().path,
             CoefficientPath::Int8
         );
         // K_64, h = 1: field 64, delta 128 > 127.
         assert_eq!(
-            plan(KernelKind::Sa, &complete(64, 1.0), BIG_WIDE)
-                .unwrap()
-                .path,
+            plan(KernelKind::Sa, &complete(64, 1.0)).unwrap().path,
             CoefficientPath::Wide
         );
         // K_65, h = 0: field 64.
         assert_eq!(
-            plan(KernelKind::Sa, &complete(65, 0.0), BIG_WIDE)
-                .unwrap()
-                .path,
+            plan(KernelKind::Sa, &complete(65, 0.0)).unwrap().path,
             CoefficientPath::Wide
         );
         assert_eq!(
-            plan(KernelKind::Sa, &complete(200, 0.0), BIG_WIDE)
-                .unwrap()
-                .path,
+            plan(KernelKind::Sa, &complete(200, 0.0)).unwrap().path,
             CoefficientPath::Wide
         );
         assert_eq!(
-            plan(KernelKind::Sa, &complete(16, 1.0), NO_WIDE)
-                .unwrap()
-                .path,
+            plan(KernelKind::Sa, &complete(16, 1.0)).unwrap().path,
             CoefficientPath::Int8
         );
     }
 
     #[test]
-    fn wide_needs_a_node_budget() {
-        let err = plan(KernelKind::Sa, &complete(65, 0.0), NO_WIDE).unwrap_err();
-        assert!(err.contains("wide"), "{err}");
-        let err = plan(KernelKind::Sa, &complete(65, 0.0), 64).unwrap_err();
-        assert!(err.contains("65"), "{err}");
+    fn sa_wide_planning_leaves_node_admission_to_the_session() {
+        let g = graph(vec![1.001; 20_000], vec![1.0], vec![(0, 1)]);
+        assert_eq!(
+            plan(KernelKind::Sa, &g).unwrap().path,
+            CoefficientPath::Wide
+        );
     }
 
     #[test]
@@ -384,7 +357,7 @@ mod tests {
         #[allow(clippy::cast_precision_loss)] // WIDE_MAX_FIELD < i32::MAX, exact in f64
         let fits = WIDE_MAX_FIELD as f64 / 1000.0;
         let g = graph(vec![fits - 0.001, 0.0], vec![0.001], vec![(0, 1)]);
-        let p = plan(KernelKind::Sa, &g, BIG_WIDE).unwrap();
+        let p = plan(KernelKind::Sa, &g).unwrap();
         assert_eq!(
             p,
             CoefficientPlan {
@@ -394,32 +367,24 @@ mod tests {
         );
         // One milli more: refused.
         let g = graph(vec![fits, 0.0], vec![0.001], vec![(0, 1)]);
-        assert!(plan(KernelKind::Sa, &g, BIG_WIDE).is_err());
+        assert!(plan(KernelKind::Sa, &g).is_err());
     }
 
     #[test]
     fn gibbs_accepts_127_scale_units_and_refuses_128() {
         let ok = graph(vec![127.0, 0.0], vec![1.0], vec![(0, 1)]);
-        assert_eq!(
-            plan(KernelKind::Gibbs, &ok, NO_WIDE).unwrap().scale_milli,
-            1000
-        );
+        assert_eq!(plan(KernelKind::Gibbs, &ok).unwrap().scale_milli, 1000);
         let bad = graph(vec![128.0, 0.0], vec![1.0], vec![(0, 1)]);
-        assert!(plan(KernelKind::Gibbs, &bad, NO_WIDE).is_err());
+        assert!(plan(KernelKind::Gibbs, &bad).is_err());
         // 128 and 2 share the factor 2: scale 2000, values 64 and 1.
         let scaled = graph(vec![128.0, 0.0], vec![2.0], vec![(0, 1)]);
-        assert_eq!(
-            plan(KernelKind::Gibbs, &scaled, NO_WIDE)
-                .unwrap()
-                .scale_milli,
-            2000
-        );
+        assert_eq!(plan(KernelKind::Gibbs, &scaled).unwrap().scale_milli, 2000);
     }
 
     #[test]
     fn msa_unit_models_stay_on_the_unit_kernel() {
         let g = IsingGraph::new(vec![1.0, 0.0, -1.0], vec![1.0, -1.0], vec![(0, 1), (1, 2)]);
-        let p = plan(KernelKind::Msa, &g, 0).unwrap();
+        let p = plan(KernelKind::Msa, &g).unwrap();
         assert_eq!((p.path, p.scale_milli), (CoefficientPath::Int8, 1000));
     }
 
@@ -431,7 +396,7 @@ mod tests {
             vec![0.5, -0.75],
             vec![(0, 1), (1, 2)],
         );
-        let p = plan(KernelKind::Msa, &g, 5000).unwrap();
+        let p = plan(KernelKind::Msa, &g).unwrap();
         assert_eq!(
             (p.path, p.scale_milli),
             (CoefficientPath::WeightedInt8, 250)
@@ -445,19 +410,17 @@ mod tests {
         let edges = vec![(0, 1), (1, 2)];
         let fits = IsingGraph::new(vec![0.0; 3], vec![16_777.214, 0.001], edges.clone());
         assert_eq!(
-            plan(KernelKind::Msa, &fits, 5000).unwrap().path,
+            plan(KernelKind::Msa, &fits).unwrap().path,
             CoefficientPath::Wide
         );
         let over = IsingGraph::new(vec![0.0; 3], vec![16_777.215, 0.001], edges);
-        assert!(plan(KernelKind::Msa, &over, 5000).is_err());
+        assert!(plan(KernelKind::Msa, &over).is_err());
     }
 
     #[test]
     fn msa_weighted_planning_leaves_node_admission_to_the_session() {
         let g = IsingGraph::new(vec![0.5, 0.0], vec![1.0], vec![(0, 1)]);
-        assert!(plan(KernelKind::Msa, &g, 0).is_ok());
-        assert!(plan(KernelKind::Msa, &g, 1).is_ok());
-        assert!(plan(KernelKind::Msa, &g, 2).is_ok());
+        assert!(plan(KernelKind::Msa, &g).is_ok());
     }
 
     #[test]
@@ -474,7 +437,7 @@ mod tests {
         ] {
             let g = graph(vec![bad, 0.0], vec![1.0], vec![(0, 1)]);
             for kind in [KernelKind::Sa, KernelKind::Gibbs, KernelKind::Msa] {
-                assert!(plan(kind, &g, BIG_WIDE).is_err(), "{kind:?} accepted {bad}");
+                assert!(plan(kind, &g).is_err(), "{kind:?} accepted {bad}");
             }
         }
     }
@@ -495,10 +458,7 @@ mod tests {
                 graph(vec![0.0, 0.0], vec![value], vec![(0, 1)]),
             ] {
                 for kind in [KernelKind::Sa, KernelKind::Gibbs, KernelKind::Msa] {
-                    assert!(
-                        plan(kind, &g, BIG_WIDE).is_err(),
-                        "{kind:?} accepted {value}"
-                    );
+                    assert!(plan(kind, &g).is_err(), "{kind:?} accepted {value}");
                 }
                 let topology = SelfFeedingTopology::build(&g);
                 assert!(fill_coefficients::<i8>(&topology, &g, 1000).is_err());
@@ -513,7 +473,7 @@ mod tests {
             assert_eq!(to_milli(zero), Some(0));
             let g = graph(vec![zero, zero], vec![1.0], vec![(0, 1)]);
             for kind in [KernelKind::Sa, KernelKind::Gibbs, KernelKind::Msa] {
-                assert!(plan(kind, &g, BIG_WIDE).is_ok());
+                assert!(plan(kind, &g).is_ok());
             }
             let topology = crate::topology::SelfFeedingTopology::build(&g);
             assert_eq!(
@@ -559,13 +519,13 @@ mod tests {
         // 32 self-loop terms of J=2 give field 128 at scale 2000 -> 64 units, delta 128 > 127.
         let g = graph(vec![0.0], vec![2.0; 32], vec![(0, 0); 32]);
         assert_eq!(
-            plan(KernelKind::Sa, &g, BIG_WIDE).unwrap().path,
+            plan(KernelKind::Sa, &g).unwrap().path,
             CoefficientPath::Wide
         );
         // A duplicate edge counts once per copy on each endpoint.
         let g = graph(vec![0.0, 0.0], vec![1.0; 64], vec![(0, 1); 64]);
         assert_eq!(
-            plan(KernelKind::Sa, &g, BIG_WIDE).unwrap().path,
+            plan(KernelKind::Sa, &g).unwrap().path,
             CoefficientPath::Wide
         );
     }

@@ -349,7 +349,7 @@ fn weighted_graph(n: usize, mut seed: u64, path: CoefficientPath) -> IsingGraph 
     let graph = IsingGraph::new(h, j, edges);
     if path != CoefficientPath::Float32 {
         assert_eq!(
-            coefficients::plan(KernelKind::Msa, &graph, n).unwrap().path,
+            coefficients::plan(KernelKind::Msa, &graph).unwrap().path,
             path
         );
     }
@@ -521,7 +521,7 @@ fn dense_weighted_planted_mattis_multi_tile() {
         }
         let graph = IsingGraph::new(vec![0.0; n], j, edges);
         if precision != Precision::Float32 {
-            let plan = coefficients::plan(KernelKind::Msa, &graph, device.max_nodes).unwrap();
+            let plan = coefficients::plan(KernelKind::Msa, &graph).unwrap();
             assert_eq!(Precision::from_plan(plan, false), precision);
         }
         let reads =

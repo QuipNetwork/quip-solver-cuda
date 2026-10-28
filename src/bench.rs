@@ -751,6 +751,10 @@ fn run_run(
             // as the miner does when no lower cap was requested.
             device.max_nodes = msa_max_nodes(&device.limits, msa_device_reads(&device.limits));
         }
+        if kernel == KernelKind::Sa && max_nodes.is_none() {
+            device.max_nodes =
+                crate::capacity::advertised_nodes(kernel, usize::MAX, Some(&device.limits));
+        }
         device.msa_shared_spins_cap = args.msa_shared_spins;
         check_reads(kernel, args.reads, &device.limits)?;
         let width = stream_width(&device, kernel);
@@ -835,7 +839,7 @@ fn run_model(
     let plan = if real {
         float_plan(graph)
     } else {
-        bench_plan(ctx.device, graph, ctx.kernel, msa_lane)
+        bench_plan(graph, ctx.kernel, msa_lane)
     }
     .map_err(|e| BenchError::Device(e.to_string()))?;
     let (beta, sweeps_per_beta) = crate::streaming::build_beta_schedule(

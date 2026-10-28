@@ -122,6 +122,13 @@ fn every_supported_arch_compiles_and_assembles_every_kernel() {
                 &[][..],
             ),
             ("sa-wide", SA_SRC, 512, &[SA_WIDE_DEFINE][..]),
+            ("sa-global", SA_SRC, 5000, &["-DQUIP_SA_GLOBAL_STATE"][..]),
+            (
+                "sa-wide-global",
+                SA_SRC,
+                5000,
+                &["-DQUIP_SA_GLOBAL_STATE", SA_WIDE_DEFINE][..],
+            ),
             (
                 "msa-weighted-i32",
                 MSA_SRC,

@@ -132,33 +132,29 @@ async fn quip_cuda_gibbs_passes_solve_conformance() {
     assert_passes_solve_gate("quip-cuda-gibbs", &[]).await;
 }
 
-/// SA and Gibbs list `linear-schedule` and their limits without a device.
+/// Gibbs lists `linear-schedule` and its limits without a device.
 #[test]
 #[serial]
 fn capabilities_advertise_the_schedule_feature_and_limits() {
     ensure_built(&["quip-cuda-sa", "quip-cuda-msa", "quip-cuda-gibbs"]);
-    for (bin, degree, field) in [
-        ("quip-cuda-sa", 0, Some(536_870_910)),
-        ("quip-cuda-gibbs", 0, None),
-    ] {
-        let out = Command::new(profile_bin(bin))
-            .arg("--capabilities")
-            .output()
-            .unwrap();
-        let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert!(
-            caps["features"]
-                .as_array()
-                .is_some_and(|f| f.iter().any(|f| f == "linear-schedule")),
-            "{bin}: {caps}"
-        );
-        assert_eq!(caps["maxDegree"], degree, "{bin}: {caps}");
-        assert_eq!(caps["maxLocalFieldMilli"].as_u64(), field, "{bin}: {caps}");
-        assert_eq!(caps["exactResolutionMilli"], 1, "{bin}: {caps}");
-    }
+    let (bin, degree, field) = ("quip-cuda-gibbs", 0, None);
+    let out = Command::new(profile_bin(bin))
+        .arg("--capabilities")
+        .output()
+        .unwrap();
+    let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        caps["features"]
+            .as_array()
+            .is_some_and(|f| f.iter().any(|f| f == "linear-schedule")),
+        "{bin}: {caps}"
+    );
+    assert_eq!(caps["maxDegree"], degree, "{bin}: {caps}");
+    assert_eq!(caps["maxLocalFieldMilli"].as_u64(), field, "{bin}: {caps}");
+    assert_eq!(caps["exactResolutionMilli"], 1, "{bin}: {caps}");
 }
 
-/// SA and Gibbs capabilities and every version are headless (no CUDA).
+/// Gibbs capabilities and every version are headless (no CUDA).
 #[test]
 #[serial]
 fn capabilities_and_version_headless() {
@@ -171,7 +167,7 @@ fn capabilities_and_version_headless() {
     ] {
         let path = profile_bin(bin);
 
-        if algo != "msa" {
+        if algo == "gibbs" {
             let out = Command::new(&path).arg("--capabilities").output().unwrap();
             assert!(out.status.success(), "{bin} --capabilities failed");
             let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -188,6 +184,42 @@ fn capabilities_and_version_headless() {
             version.contains(&format!("protocol {PROTOCOL_VERSION}")),
             "{bin}: {version}"
         );
+    }
+}
+
+/// SA capabilities use the selected device memory and honor a lower cap.
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU"]
+fn sa_capabilities_report_device_memory_limits() {
+    ensure_built(&["quip-cuda-sa"]);
+    for cap in [None, Some("8192")] {
+        let mut command = Command::new(profile_bin("quip-cuda-sa"));
+        command.arg("--capabilities");
+        if let Some(cap) = cap {
+            command.args(["--max-nodes", cap]);
+        }
+        let out = command.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let nodes = caps["maxNodes"].as_u64().unwrap();
+        if cap.is_some() {
+            assert_eq!(nodes, 8192);
+        } else {
+            assert!(nodes > 5000);
+        }
+        assert_eq!(caps["maxDegree"], 0);
+        assert_eq!(caps["maxLocalFieldMilli"], 536_870_910);
+        assert_eq!(caps["exactResolutionMilli"], 1);
+        assert!(caps["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "linear-schedule"));
     }
 }
 
@@ -272,6 +304,53 @@ fn msa_bench_without_max_nodes_uses_device_limit() {
         } else {
             assert!(out.status.success(), "cap {cap:?}: {stderr}");
             let records = std::fs::read_to_string(dir.path().join("cuda-msa_n6000_s4.jsonl"))
+                .expect("bench record above the default node floor");
+            assert_eq!(records.lines().count(), 1);
+        }
+    }
+}
+
+/// An absent bench cap uses the device budget, while explicit caps still apply.
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU"]
+fn sa_bench_without_max_nodes_uses_device_limit() {
+    ensure_built(&["quip-cuda-sa"]);
+    for cap in [None, Some("5000"), Some("6000")] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new(profile_bin("quip-cuda-sa"));
+        if let Some(cap) = cap {
+            command.args(["--max-nodes", cap]);
+        }
+        let out = command
+            .args([
+                "bench",
+                "run",
+                "--nodes",
+                "6000",
+                "--reads",
+                "8",
+                "--sweeps",
+                "4",
+                "--warmup",
+                "0",
+                "--repeats",
+                "1",
+                "--out",
+            ])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if cap == Some("5000") {
+            assert!(!out.status.success(), "explicit cap must reject 6000 nodes");
+            assert!(
+                stderr.contains("6000") && stderr.contains("5000"),
+                "{stderr}"
+            );
+        } else {
+            assert!(out.status.success(), "cap {cap:?}: {stderr}");
+            let records = std::fs::read_to_string(dir.path().join("cuda-sa_n6000_s4.jsonl"))
                 .expect("bench record above the default node floor");
             assert_eq!(records.lines().count(), 1);
         }

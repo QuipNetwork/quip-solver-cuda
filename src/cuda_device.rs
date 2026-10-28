@@ -17,6 +17,8 @@ use tracing::trace_span;
 const SA_SRC: &str = include_str!("../kernels/sa.cu");
 /// NVRTC define selecting the wide SA coefficient and delta types.
 pub const SA_WIDE_DEFINE: &str = "-DQUIP_SA_WIDE";
+/// NVRTC define selecting global SA spin and delta storage.
+pub const SA_GLOBAL_DEFINE: &str = "-DQUIP_SA_GLOBAL_STATE";
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
 /// Multi-spin coded SA, see `kernels/msa.cu`.
 const MSA_SRC: &str = include_str!("../kernels/msa.cu");
@@ -292,6 +294,31 @@ fn compile_all_kernels(
     Ok((sa, sa_wide, msa, gibbs, msa_weighted))
 }
 
+/// Compile global SA variants only for an SA device open.
+fn compile_sa_global(ctx: &Arc<CudaContext>) -> Result<(CudaFunction, CudaFunction), CudaError> {
+    let arch = device_arch(ctx);
+    let arch_name = format!("sm_{arch}");
+    let driver = driver_version()?;
+    let compile = |name, defines: &[&str]| {
+        jit_cache::load_or_compile(
+            ctx,
+            name,
+            SA_SRC,
+            defines,
+            &arch_name,
+            driver,
+            capacity::SA_DEFAULT_NODES,
+            || compile_for_arch(SA_SRC, capacity::SA_DEFAULT_NODES, arch, defines),
+        )?
+        .load_function("cuda_sa_self_feeding")
+        .map_err(CudaError::from)
+    };
+    Ok((
+        compile("sa-global", &[SA_GLOBAL_DEFINE])?,
+        compile("sa-wide-global", &[SA_GLOBAL_DEFINE, SA_WIDE_DEFINE])?,
+    ))
+}
+
 /// Verify the loaded msa kernel declares no more static shared
 /// memory than [`capacity::MSA_STATIC_SHARED_BYTES`], opt it in to
 /// `shared_per_block_optin` less that constant, and return that
@@ -355,6 +382,7 @@ pub struct CudaDevice {
     pub(crate) sa: CudaFunction,
     /// Wide `cuda_sa_self_feeding`, compiled with [`SA_WIDE_DEFINE`].
     pub(crate) sa_wide: CudaFunction,
+    pub(crate) sa_global: Option<(CudaFunction, CudaFunction)>,
     /// `cuda_gibbs_self_feeding` — persistent kernel, `sms_per_nonce` blocks
     /// per nonce.
     pub(crate) gibbs: CudaFunction,
@@ -377,11 +405,10 @@ pub struct CudaDevice {
     pub max_sms: usize,
     /// Device memory and launch limits read once at open.
     pub limits: capacity::DeviceLimits,
-    /// Node capacity the running kernel was compiled for.
+    /// Optional node cap, checked after per-model memory admission.
     pub max_nodes: usize,
-    /// Node budget for wide SA jobs, capped at the compiled SA capacity.
-    /// Zero when this device is opened for msa or Gibbs.
-    pub sa_wide_max_nodes: usize,
+    /// Force the global SA instantiation for parity tests. Defaults to false.
+    pub sa_force_global: bool,
     _sa_mod: Arc<CudaModule>,
     _sa_wide_mod: Arc<CudaModule>,
     _gibbs_mod: Arc<CudaModule>,
@@ -397,7 +424,7 @@ impl fmt::Debug for CudaDevice {
             .field("pci_bus_id", &self.pci_bus_id)
             .field("max_sms", &self.max_sms)
             .field("max_nodes", &self.max_nodes)
-            .field("sa_wide_max_nodes", &self.sa_wide_max_nodes)
+            .field("sa_force_global", &self.sa_force_global)
             .field("msa_dynamic_shared_bytes", &self.msa_dynamic_shared_bytes)
             .finish_non_exhaustive()
     }
@@ -430,11 +457,11 @@ impl CudaDevice {
         Self::open_with_nodes(device_index, KernelKind::Sa, capacity::SA_DEFAULT_NODES)
     }
 
-    /// [`CudaDevice::open`], compiling `kernel` for `max_nodes`.
+    /// Open the selected kernel with an optional lower node cap.
     ///
-    /// The other two kernels compile at their own defaults. One process
-    /// drives one kernel, so only `kernel` needs the larger array, and a
-    /// bigger array would cost memory for a kernel that never launches here.
+    /// SA always compiles the fixed mining frame and its global variants.
+    /// Gibbs compiles its shared array at the resolved node count. MSA has no
+    /// compiled node array. Other kernels keep their default instantiations.
     ///
     /// # Errors
     ///
@@ -516,15 +543,11 @@ impl CudaDevice {
                 capacity::default_nodes(k)
             }
         };
-        let sa_nodes = nodes_for(KernelKind::Sa);
-        // The wide local frame is fixed at the compiled `sa_nodes`; only its
-        // four-byte delta workspace scales with the job size. Resolve that
-        // budget here so a device that holds a mining job but no wide job that
-        // large still opens: the wide job is refused per job instead.
-        let sa_wide_max_nodes = if kernel == KernelKind::Sa {
-            capacity::sa_wide_budget(sa_nodes, &limits)
+        let sa_nodes = capacity::SA_DEFAULT_NODES;
+        let sa_global = if kernel == KernelKind::Sa {
+            Some(compile_sa_global(&ctx)?)
         } else {
-            0
+            None
         };
         let msa_nodes = nodes_for(KernelKind::Msa);
         let gibbs_nodes = nodes_for(KernelKind::Gibbs);
@@ -591,7 +614,8 @@ impl CudaDevice {
             max_sms: max_sms.max(1),
             limits,
             max_nodes: resolved,
-            sa_wide_max_nodes,
+            sa_force_global: false,
+            sa_global,
             _sa_mod: sa_mod,
             _sa_wide_mod: sa_wide_mod,
             _gibbs_mod: gibbs_mod,

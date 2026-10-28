@@ -395,17 +395,9 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
     );
     let refused = IsingGraph::new(vec![1e-19, 0.0], vec![1.0], vec![(0, 1)]);
     let dev = device(kind);
-    let node_budget = match kind {
-        KernelKind::Sa => dev.sa_wide_max_nodes,
-        KernelKind::Msa => dev.max_nodes,
-        KernelKind::Gibbs => unreachable!("this test covers SA and MSA"),
-    };
+    assert_eq!(plan(kind, &unit).unwrap().path, CoefficientPath::Int8);
     assert_eq!(
-        plan(kind, &unit, node_budget).unwrap().path,
-        CoefficientPath::Int8
-    );
-    assert_eq!(
-        plan(kind, &wide, node_budget).unwrap().path,
+        plan(kind, &wide).unwrap().path,
         if kind == KernelKind::Msa {
             CoefficientPath::WeightedInt8
         } else {
