@@ -850,6 +850,113 @@ pub fn device_label_mismatch(miner_id: Option<&str>, device: usize) -> Option<us
 }
 
 #[cfg(test)]
+mod gibbs_wide_gpu_tests {
+    use super::{compile_for_arch, device_arch, driver_version, CudaDevice, GIBBS_SRC};
+    use crate::coefficients::{plan, CoefficientPath};
+    use crate::topology::{fill_coefficients, SelfFeedingTopology};
+    use crate::{capacity, jit_cache, IsingGraph, KernelKind};
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    // Call the production field helper with fixed spins, without sampling noise.
+    const FIELD_PROBE: &str = r#"
+extern "C" __global__ void gibbs_wide_fields_probe(
+    const int* row_ptr, const int* col_ind, const coef_t* j, const coef_t* h,
+    signed char* spill, int shared_spins, float* fields
+) {
+    __shared__ signed char prefix[2];
+#ifdef QUIP_GIBBS_SPILL
+    GibbsState state = {prefix, spill, shared_spins};
+#else
+    volatile signed char* state = prefix;
+#endif
+    for (int sign = -1; sign <= 1; sign += 2) {
+        state[0] = 1;
+        state[1] = (signed char)sign;
+        fields[(sign + 1) / 2] = compute_effective_field_shared(
+            0, state, row_ptr, 0, col_ind, 0, j, 0, h, 0);
+    }
+}
+"#;
+
+    fn check_wide_fields(spill: bool) {
+        let graph = IsingGraph::new(vec![16777.217, -0.001], vec![-16777.216], vec![(0, 1)]);
+        let plan = plan(KernelKind::Gibbs, &graph).unwrap();
+        assert_eq!(plan.path, CoefficientPath::Wide);
+        assert_eq!(plan.scale_milli, 1);
+        let topology = SelfFeedingTopology::build(&graph);
+        let (j, h) = fill_coefficients::<i32>(&topology, &graph, plan.scale_milli).unwrap();
+        assert_eq!(h, [16_777_217, -1]);
+        assert_eq!(j, [-16_777_216; 2]);
+        let device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 4800).unwrap();
+        let arch = device_arch(&device.ctx);
+        let source = format!("{GIBBS_SRC}\n{FIELD_PROBE}");
+        let mut defines = vec!["-DQUIP_GIBBS_COEF_I32"];
+        if spill {
+            defines.push("-DQUIP_GIBBS_SPILL");
+        }
+        let module = jit_cache::load_or_compile(
+            &device.ctx,
+            "gibbs-i32-field-probe",
+            &source,
+            &defines,
+            &format!("sm_{arch}"),
+            driver_version().unwrap(),
+            capacity::GIBBS_DEFAULT_NODES,
+            || compile_for_arch(&source, capacity::GIBBS_DEFAULT_NODES, arch, &defines),
+        )
+        .unwrap();
+        let function = module.load_function("gibbs_wide_fields_probe").unwrap();
+        let stream = &device.stream;
+        let d_rows = stream.clone_htod(&topology.row_ptr).unwrap();
+        let d_cols = stream.clone_htod(&topology.col_ind).unwrap();
+        let d_j = stream.clone_htod(&j).unwrap();
+        let d_h = stream.clone_htod(&h).unwrap();
+        let mut d_spill = stream.alloc_zeros::<i8>(2).unwrap();
+        let mut d_fields = stream.alloc_zeros::<f32>(2).unwrap();
+        for cap in [0_i32, 1, 2] {
+            let mut launch = stream.launch_builder(&function);
+            launch.arg(&d_rows).arg(&d_cols).arg(&d_j).arg(&d_h);
+            launch.arg(&mut d_spill).arg(&cap).arg(&mut d_fields);
+            // SAFETY: the probe receives matching two-node CSR and coefficient
+            // arrays, two output fields, and a tail large enough for every cap.
+            // One thread reads and writes the state. All buffers outlive the launch.
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .unwrap();
+            stream.synchronize().unwrap();
+            let fields = stream.clone_dtoh(&d_fields).unwrap();
+            assert_eq!(
+                fields
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                [33_554_432.0_f32.to_bits(), 1.0_f32.to_bits()],
+                "spill={spill} shared_spins={cap}: {fields:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "requires a CUDA GPU"]
+    fn gibbs_wide_static_preserves_integer_cancellation() {
+        check_wide_fields(false);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "requires a CUDA GPU"]
+    fn gibbs_wide_spill_preserves_integer_cancellation() {
+        check_wide_fields(true);
+    }
+}
+
+#[cfg(test)]
 mod msa_weighted_gpu_tests {
     use super::CudaDevice;
     use crate::{capacity, KernelKind};

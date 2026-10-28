@@ -171,7 +171,12 @@ __device__ float compute_effective_field_shared(
     int start = __ldg(&csr_row_ptr[rp_off + var]);
     int end = __ldg(&csr_row_ptr[rp_off + var + 1]);
 
+#ifdef QUIP_GIBBS_COEF_I32
+    // WIDE_MAX_FIELD bounds every integer partial sum below INT_MAX.
+    int h_eff = __ldg(&h_vals[h_off + var]);
+#else
     float h_eff = (float)__ldg(&h_vals[h_off + var]);
+#endif
 
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
@@ -182,10 +187,18 @@ __device__ float compute_effective_field_shared(
         int Jij = (int)__ldg(&csr_J_vals[j_off + p]);
 #endif
         int neighbor_spin = (int)shared_state[neighbor];
+#ifdef QUIP_GIBBS_COEF_I32
+        h_eff += Jij * neighbor_spin;
+#else
         h_eff += (float)(Jij * neighbor_spin);
+#endif
     }
 
+#ifdef QUIP_GIBBS_COEF_I32
+    return (float)h_eff;
+#else
     return h_eff;
+#endif
 }
 
 // ==============================================================================
