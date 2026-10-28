@@ -1,4 +1,4 @@
-//! Portfolio ground energies from SCIP, checked through MSA and SA storage paths.
+//! Portfolio ground energies from SCIP, checked through MSA, SA, and Gibbs storage paths.
 
 use quip_solver_cuda::capacity::{msa_device_reads, Storage};
 use quip_solver_cuda::cuda_device::CudaDevice;
@@ -87,10 +87,10 @@ fn verify_portfolio(kernel: KernelKind, forced: bool) {
     assert_eq!(states.len(), 108);
     let device = CudaDevice::open_with_nodes(0, kernel, 56).unwrap();
     let params = SampleParams {
-        num_reads: if kernel == KernelKind::Sa {
-            256
-        } else {
+        num_reads: if kernel == KernelKind::Msa {
             msa_device_reads(&device.limits)
+        } else {
+            256
         },
         num_sweeps: 8192,
         sweeps_per_beta: 128,
@@ -108,16 +108,20 @@ fn verify_portfolio(kernel: KernelKind, forced: bool) {
         }
         .unwrap_or_else(|error| panic!("{}: {error}", state.file));
         assert_eq!(reads.len(), params.num_reads, "{}", state.file);
-        assert_eq!(
-            last_storage(&device),
-            Some(if forced || kernel == KernelKind::Sa {
-                Storage::Dense
-            } else {
-                Storage::Sparse
-            }),
-            "{}",
-            state.file
-        );
+        // Small complete Gibbs models can have a smaller sparse footprint.
+        // Its automatic route depends on the device's instance count.
+        if kernel != KernelKind::Gibbs {
+            assert_eq!(
+                last_storage(&device),
+                Some(if forced || kernel == KernelKind::Sa {
+                    Storage::Dense
+                } else {
+                    Storage::Sparse
+                }),
+                "{}",
+                state.file
+            );
+        }
         let best = reads
             .iter()
             .map(|read| read.energy)
@@ -162,4 +166,10 @@ fn portfolio_dense_path_forced() {
 #[ignore = "requires a CUDA GPU"]
 fn sa_reaches_portfolio_ground_states() {
     verify_portfolio(KernelKind::Sa, false);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_reaches_portfolio_ground_states() {
+    verify_portfolio(KernelKind::Gibbs, false);
 }

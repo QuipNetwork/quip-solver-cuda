@@ -313,6 +313,9 @@ pub(crate) struct SaVariants {
 }
 
 pub(crate) struct GibbsVariants {
+    pub dense: CudaFunction,
+    pub i32_dense: CudaFunction,
+    pub f32_dense: CudaFunction,
     pub spill: CudaFunction,
     pub i32: CudaFunction,
     pub i32_spill: CudaFunction,
@@ -343,13 +346,18 @@ fn compile_gibbs_variants(
         if defines.contains(&"-DQUIP_GIBBS_SPILL") {
             let static_bytes = usize::try_from(function.shared_size_bytes()?)
                 .map_err(|_| CudaError::Driver("negative Gibbs static shared memory".into()))?;
-            if static_bytes > capacity::GIBBS_STATIC_SHARED_BYTES {
+            let reserved = capacity::GIBBS_STATIC_SHARED_BYTES
+                + if defines.contains(&"-DQUIP_GIBBS_DENSE") {
+                    capacity::GIBBS_DENSE_REDUCTION_BYTES
+                } else {
+                    0
+                };
+            if static_bytes > reserved {
                 return Err(CudaError::Driver(format!(
                     "Gibbs static shared memory {static_bytes} exceeds its reserved budget"
                 )));
             }
-            let dynamic_bytes =
-                shared_per_block_optin.saturating_sub(capacity::GIBBS_STATIC_SHARED_BYTES);
+            let dynamic_bytes = shared_per_block_optin.saturating_sub(reserved);
             function.set_attribute(
                 CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 i32::try_from(dynamic_bytes)
@@ -359,6 +367,23 @@ fn compile_gibbs_variants(
         Ok(function)
     };
     Ok(GibbsVariants {
+        dense: compile("gibbs-dense", &["-DQUIP_GIBBS_DENSE", "-DQUIP_GIBBS_SPILL"])?,
+        i32_dense: compile(
+            "gibbs-i32-dense",
+            &[
+                "-DQUIP_GIBBS_DENSE",
+                "-DQUIP_GIBBS_SPILL",
+                "-DQUIP_GIBBS_COEF_I32",
+            ],
+        )?,
+        f32_dense: compile(
+            "gibbs-f32-dense",
+            &[
+                "-DQUIP_GIBBS_DENSE",
+                "-DQUIP_GIBBS_SPILL",
+                "-DQUIP_GIBBS_COEF_F32",
+            ],
+        )?,
         spill: compile("gibbs-spill", &["-DQUIP_GIBBS_SPILL"])?,
         i32: compile("gibbs-i32", &["-DQUIP_GIBBS_COEF_I32"])?,
         i32_spill: compile(

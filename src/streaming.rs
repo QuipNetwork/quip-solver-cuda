@@ -619,11 +619,6 @@ fn session_shape_and_storage(
     betas: usize,
     precision: capacity::Precision,
 ) -> Result<(capacity::ModelShape, capacity::Storage), SampleError> {
-    if kernel == KernelKind::Gibbs && forced == Some(capacity::Storage::Dense) {
-        return Err(SampleError::Unsupported(
-            "Gibbs requires sparse storage".into(),
-        ));
-    }
     let n = graph.num_nodes();
     let mut degrees = vec![0usize; n];
     for &(u, v) in graph.edges.iter() {
@@ -655,7 +650,7 @@ fn session_shape_and_storage(
     Ok((shape, storage))
 }
 
-/// Dense matrices use direct row-major positions and no CSR or colouring.
+/// Dense matrices use row-major positions. Gibbs uses one node per colour.
 fn session_topology(
     device: &CudaDevice,
     kernel: KernelKind,
@@ -718,19 +713,27 @@ fn session_topology(
         }
         edge_pos.push((u32::try_from(ij).unwrap(), u32::try_from(ji).unwrap()));
     }
-    Ok(SelfFeedingTopology {
+    let topology = SelfFeedingTopology {
         n,
         nnz,
         row_ptr: vec![],
         col_ind: vec![],
         edge_pos,
-        colors: crate::topology::ColorBlocks {
-            starts: vec![],
-            counts: vec![],
-            nodes: vec![],
-            num_colors: 0,
+        colors: if kernel == KernelKind::Gibbs {
+            crate::topology::ColorBlocks::serial(n)
+        } else {
+            crate::topology::ColorBlocks {
+                starts: vec![],
+                counts: vec![],
+                nodes: vec![],
+                num_colors: 0,
+            }
         },
-    })
+    };
+    if kernel == KernelKind::Gibbs && arithmetic.coefficients.path == CoefficientPath::Float32 {
+        check_gibbs_real_fields(&topology, graph)?;
+    }
+    Ok(topology)
 }
 
 fn build_msa_dense_state(
@@ -973,13 +976,22 @@ fn build_algo_state(
             } else {
                 topology.colors.nodes.clone()
             };
-            let use_spill = topology.n > capacity::GIBBS_DEFAULT_NODES
+            let dense = topology.row_ptr.is_empty();
+            let use_spill = dense
+                || topology.n > capacity::GIBBS_DEFAULT_NODES
                 || device.gibbs_force_spill
                 || device.gibbs_shared_spins_cap.is_some();
             let shared_spins = if use_spill {
                 capacity::gibbs_shared_spins(
                     topology.n,
-                    device.limits.shared_bytes_per_block_optin,
+                    device
+                        .limits
+                        .shared_bytes_per_block_optin
+                        .saturating_sub(if dense {
+                            capacity::GIBBS_DENSE_REDUCTION_BYTES
+                        } else {
+                            0
+                        }),
                     device.gibbs_shared_spins_cap,
                 )
             } else {
@@ -1218,7 +1230,7 @@ impl<'a> SelfFeedingSession<'a> {
         // documented; only this one-time initialization needed ordering.
         stream_compute.synchronize()?;
 
-        record_storage(device, kernel, &topology);
+        record_storage(device, &topology);
         Ok(Self {
             device,
             kernel,
@@ -1772,22 +1784,30 @@ impl<'a> SelfFeedingSession<'a> {
             ));
         };
         let dims = &self.dims;
-        let (function, variant) = match (self.plan.path, d_spill.is_some()) {
-            (CoefficientPath::Int8 | CoefficientPath::WeightedInt8, false) => {
+        let dense = self.topology.row_ptr.is_empty();
+        let (function, variant) = match (self.plan.path, d_spill.is_some(), dense) {
+            (CoefficientPath::Int8 | CoefficientPath::WeightedInt8, false, false) => {
                 (&self.device.gibbs, "gibbs")
             }
-            (path, spill) => {
+            (path, spill, dense) => {
                 let kernels = self.device.gibbs_variants.as_ref().ok_or_else(|| {
                     SampleError::Unsupported("Gibbs variants require a Gibbs device".into())
                 })?;
-                match (path, spill) {
-                    (CoefficientPath::Int8 | CoefficientPath::WeightedInt8, _) => {
+                match (path, spill, dense) {
+                    (CoefficientPath::Int8 | CoefficientPath::WeightedInt8, _, true) => {
+                        (&kernels.dense, "gibbs-dense")
+                    }
+                    (CoefficientPath::Wide, _, true) => (&kernels.i32_dense, "gibbs-i32-dense"),
+                    (CoefficientPath::Float32, _, true) => (&kernels.f32_dense, "gibbs-f32-dense"),
+                    (CoefficientPath::Int8 | CoefficientPath::WeightedInt8, _, false) => {
                         (&kernels.spill, "gibbs-spill")
                     }
-                    (CoefficientPath::Wide, false) => (&kernels.i32, "gibbs-i32"),
-                    (CoefficientPath::Wide, true) => (&kernels.i32_spill, "gibbs-i32-spill"),
-                    (CoefficientPath::Float32, false) => (&kernels.f32, "gibbs-f32"),
-                    (CoefficientPath::Float32, true) => (&kernels.f32_spill, "gibbs-f32-spill"),
+                    (CoefficientPath::Wide, false, false) => (&kernels.i32, "gibbs-i32"),
+                    (CoefficientPath::Wide, true, false) => (&kernels.i32_spill, "gibbs-i32-spill"),
+                    (CoefficientPath::Float32, false, false) => (&kernels.f32, "gibbs-f32"),
+                    (CoefficientPath::Float32, true, false) => {
+                        (&kernels.f32_spill, "gibbs-f32-spill")
+                    }
                 }
             }
         };
@@ -2353,7 +2373,7 @@ pub fn sample_one_real(
         .collect())
 }
 
-/// Sample with an explicit storage tier. SA and MSA also support dense storage.
+/// Sample with an explicit sparse or dense storage tier.
 /// Exact graphs retain their coefficients and constant diagonal terms.
 ///
 /// # Errors
@@ -2381,21 +2401,19 @@ pub fn sample_one_real_forced(
         .collect())
 }
 
-fn record_storage(device: &CudaDevice, kernel: KernelKind, topology: &SelfFeedingTopology) {
-    if kernel == KernelKind::Msa || kernel == KernelKind::Sa {
-        *device
-            .last_storage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(if topology.row_ptr.is_empty() {
-                capacity::Storage::Dense
-            } else {
-                capacity::Storage::Sparse
-            });
-    }
+fn record_storage(device: &CudaDevice, topology: &SelfFeedingTopology) {
+    *device
+        .last_storage
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(if topology.row_ptr.is_empty() {
+            capacity::Storage::Dense
+        } else {
+            capacity::Storage::Sparse
+        });
 }
 
-/// Storage tier of the most recently built SA or MSA session on this device.
+/// Storage tier of the most recently built session on this device.
 #[doc(hidden)]
 #[must_use]
 pub fn last_storage(device: &CudaDevice) -> Option<capacity::Storage> {
@@ -2477,6 +2495,23 @@ fn check_gibbs_real_fields(
 ) -> Result<(), SampleError> {
     let (j, h) = crate::topology::fill_real_coefficients(topology, graph)
         .map_err(SampleError::Unsupported)?;
+    if topology.row_ptr.is_empty() {
+        // A row has at most N + 1 additions on any reduction path. The
+        // standard gamma bound covers f32 rounding regardless of grouping.
+        let operations = f64::from(to_kernel_i32("dense row", topology.n)?) + 1.0;
+        let error = operations * f64::from(f32::EPSILON);
+        for (row, field) in j.chunks(topology.n).zip(h) {
+            let bound = row.iter().map(|value| f64::from(value.abs())).sum::<f64>()
+                + f64::from(field.abs());
+            if bound / (1.0 - error) > f64::from(f32::MAX) / 2.0 {
+                return Err(SampleError::Unsupported(
+                    "real Gibbs local field exceeds the finite f32 delta range after rounding"
+                        .into(),
+                ));
+            }
+        }
+        return Ok(());
+    }
     // Sum absolute f32 coefficients in the kernel's CSR order. This bounds
     // every signed partial sum, including rounding, before device allocation.
     for (row, field) in topology.row_ptr.windows(2).zip(h) {
@@ -3631,7 +3666,7 @@ mod tests {
     }
 
     #[test]
-    fn gibbs_refuses_forced_dense_storage() {
+    fn gibbs_accepts_forced_dense_storage() {
         let graph = IsingGraph::new(vec![0.1; 2], vec![-0.5], vec![(0, 1)]);
         let result = session_shape_and_storage(
             &routing_limits(),
@@ -3642,7 +3677,7 @@ mod tests {
             64,
             capacity::Precision::Float32,
         );
-        assert!(matches!(result, Err(SampleError::Unsupported(_))));
+        assert_eq!(result.unwrap().1, capacity::Storage::Dense);
     }
 
     #[test]
@@ -3704,43 +3739,49 @@ mod tests {
 
     #[test]
     fn pair_scan_only_refines_automatic_dense_candidates() {
-        for edges in [vec![(0, 1)], vec![(0, 1), (0, 1)], vec![(0, 1), (1, 0)]] {
-            let repeated = edges.len() == 2;
-            let graph = IsingGraph::new(vec![0.0; 2], vec![1.0; edges.len()], edges);
-            for forced in [
-                None,
-                Some(capacity::Storage::Sparse),
-                Some(capacity::Storage::Dense),
-            ] {
-                PAIR_SCAN_COUNT.set(0);
-                let (shape, storage) = session_shape_and_storage(
-                    &routing_limits(),
-                    KernelKind::Sa,
-                    &graph,
-                    forced,
-                    256,
-                    64,
-                    capacity::Precision::Binary,
-                )
-                .unwrap();
-                assert_eq!(
-                    capacity::route_storage(
-                        KernelKind::Sa,
-                        shape,
-                        capacity::Precision::Binary,
+        for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
+            for edges in [vec![(0, 1)], vec![(0, 1), (0, 1)], vec![(0, 1), (1, 0)]] {
+                let repeated = edges.len() == 2;
+                let mut complete: Vec<_> = (0..20)
+                    .flat_map(|u| (u + 1..20).map(move |v| (u, v)))
+                    .collect();
+                complete.extend(edges.into_iter().skip(1));
+                let graph = IsingGraph::new(vec![0.0; 20], vec![1.0; complete.len()], complete);
+                for forced in [
+                    None,
+                    Some(capacity::Storage::Sparse),
+                    Some(capacity::Storage::Dense),
+                ] {
+                    PAIR_SCAN_COUNT.set(0);
+                    let (shape, storage) = session_shape_and_storage(
+                        &routing_limits(),
+                        kernel,
+                        &graph,
+                        forced,
                         256,
                         64,
-                        &routing_limits(),
-                    ),
-                    capacity::Storage::Dense,
-                );
-                let expected = forced.unwrap_or(if repeated {
-                    capacity::Storage::Sparse
-                } else {
-                    capacity::Storage::Dense
-                });
-                assert_eq!(storage, expected);
-                assert_eq!(PAIR_SCAN_COUNT.get(), usize::from(forced.is_none()));
+                        capacity::Precision::Binary,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        capacity::route_storage(
+                            kernel,
+                            shape,
+                            capacity::Precision::Binary,
+                            256,
+                            64,
+                            &routing_limits(),
+                        ),
+                        capacity::Storage::Dense,
+                    );
+                    let expected = forced.unwrap_or(if repeated {
+                        capacity::Storage::Sparse
+                    } else {
+                        capacity::Storage::Dense
+                    });
+                    assert_eq!(storage, expected);
+                    assert_eq!(PAIR_SCAN_COUNT.get(), usize::from(forced.is_none()));
+                }
             }
         }
     }

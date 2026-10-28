@@ -27,6 +27,32 @@ const SCREEN_SRC: &str = include_str!("../kernels/screen.cu");
 const KERNEL_VARIANTS: &[(&str, &str, usize, &[&str])] = &[
     ("sa", SA_SRC, 512, &[]),
     ("gibbs", GIBBS_SRC, 4800, &[]),
+    (
+        "gibbs-dense",
+        GIBBS_SRC,
+        4800,
+        &["-DQUIP_GIBBS_DENSE", "-DQUIP_GIBBS_SPILL"],
+    ),
+    (
+        "gibbs-i32-dense",
+        GIBBS_SRC,
+        4800,
+        &[
+            "-DQUIP_GIBBS_DENSE",
+            "-DQUIP_GIBBS_SPILL",
+            "-DQUIP_GIBBS_COEF_I32",
+        ],
+    ),
+    (
+        "gibbs-f32-dense",
+        GIBBS_SRC,
+        4800,
+        &[
+            "-DQUIP_GIBBS_DENSE",
+            "-DQUIP_GIBBS_SPILL",
+            "-DQUIP_GIBBS_COEF_F32",
+        ],
+    ),
     ("gibbs-spill", GIBBS_SRC, 4800, &["-DQUIP_GIBBS_SPILL"]),
     ("gibbs-i32", GIBBS_SRC, 4800, &["-DQUIP_GIBBS_COEF_I32"]),
     (

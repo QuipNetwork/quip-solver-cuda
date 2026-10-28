@@ -201,14 +201,23 @@ fn footprint_matches_measured_allocation() {
 fn gibbs_allocation_cases() {
     let device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 150_000).unwrap();
     let ctx = CudaContext::new(0).unwrap();
-    for nodes in [4_000, 4_801, 150_000] {
+    for (nodes, storage) in [
+        (4_000, Storage::Sparse),
+        (4_801, Storage::Sparse),
+        (150_000, Storage::Sparse),
+        (600, Storage::Dense),
+    ] {
         for precision in [
             Precision::Binary,
             Precision::Int8,
             Precision::Int32,
             Precision::Float32,
         ] {
-            let graph = circulant(nodes, 20, precision);
+            let graph = if storage == Storage::Dense {
+                dense_graph(nodes, precision)
+            } else {
+                circulant(nodes, 20, precision)
+            };
             let params = SampleParams {
                 num_reads: 256,
                 num_sweeps: 1,
@@ -218,10 +227,14 @@ fn gibbs_allocation_cases() {
                 ModelShape {
                     nodes,
                     couplers: graph.edges.len(),
-                    max_degree: 20,
+                    max_degree: if storage == Storage::Dense {
+                        nodes - 1
+                    } else {
+                        20
+                    },
                 },
                 precision,
-                Storage::Sparse,
+                storage,
                 256,
                 1,
                 &device.limits,

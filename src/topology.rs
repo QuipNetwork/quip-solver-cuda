@@ -57,6 +57,19 @@ pub struct ColorBlocks {
     pub(crate) num_colors: i32,
 }
 
+impl ColorBlocks {
+    /// Dense Gibbs updates nodes serially, so every node can own a colour.
+    pub(crate) fn serial(n: usize) -> Self {
+        let num_colors = i32::try_from(n).expect("validated kernel node count");
+        Self {
+            starts: (0..num_colors).collect(),
+            counts: vec![1; n],
+            nodes: (0..num_colors).collect(),
+            num_colors,
+        }
+    }
+}
+
 /// Greedy (Welsh-Powell) coloring of a CSR adjacency: process nodes in
 /// degree-descending order, assign the smallest color unused by any
 /// already-colored neighbor. Not the Zephyr-optimal 4-coloring, but valid
@@ -411,6 +424,22 @@ mod tests {
             vec![1.0, -1.0, 1.0, -1.0],
             vec![(0, 1), (1, 2), (2, 3), (3, 0)],
         )
+    }
+
+    #[test]
+    fn gibbs_dense_complete_colouring_is_fast_and_total() {
+        let start = std::time::Instant::now();
+        // A complete graph requires a unique colour for each node. Dense
+        // topology builds this partition directly, without materializing CSR.
+        let colors = ColorBlocks::serial(9_583);
+        assert_eq!(colors.counts.iter().sum::<i32>(), 9_583);
+        assert_eq!(colors.num_colors, 9_583);
+        for node in 0..9_583 {
+            assert_eq!(colors.starts[node], i32::try_from(node).unwrap());
+            assert_eq!(colors.counts[node], 1);
+            assert_eq!(colors.nodes[node], i32::try_from(node).unwrap());
+        }
+        assert!(start.elapsed().as_secs() < 30);
     }
 
     #[test]

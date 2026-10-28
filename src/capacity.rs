@@ -147,7 +147,7 @@ pub fn footprint(
 }
 
 /// Storage selected for a model. MSA uses dense storage above degree 62.
-/// SA chooses the smaller footprint. Gibbs uses sparse storage.
+/// SA and Gibbs choose the smaller footprint.
 #[must_use]
 pub fn route_storage(
     kernel: KernelKind,
@@ -159,16 +159,32 @@ pub fn route_storage(
 ) -> Storage {
     match kernel {
         KernelKind::Msa if shape.max_degree > MSA_MAX_DEGREE => Storage::Dense,
-        KernelKind::Sa => {
-            let dense = sa_footprint(shape, precision, Storage::Dense, reads, betas, limits);
-            let sparse = sa_footprint(shape, precision, Storage::Sparse, reads, betas, limits);
+        KernelKind::Sa | KernelKind::Gibbs => {
+            let dense = footprint(
+                kernel,
+                shape,
+                precision,
+                Storage::Dense,
+                reads,
+                betas,
+                limits,
+            );
+            let sparse = footprint(
+                kernel,
+                shape,
+                precision,
+                Storage::Sparse,
+                reads,
+                betas,
+                limits,
+            );
             if dense.total() <= sparse.total() {
                 Storage::Dense
             } else {
                 Storage::Sparse
             }
         }
-        KernelKind::Msa | KernelKind::Gibbs => Storage::Sparse,
+        KernelKind::Msa => Storage::Sparse,
     }
 }
 
@@ -394,6 +410,9 @@ pub const GIBBS_DEFAULT_NODES: usize = 4800;
 /// Two shared ints, rounded to the driver's 16-byte static allocation boundary.
 pub const GIBBS_STATIC_SHARED_BYTES: usize = 16;
 
+/// Eight warp partials for the 256-thread dense row reduction.
+pub(crate) const GIBBS_DENSE_REDUCTION_BYTES: usize = 32;
+
 /// Spins held in the dynamic shared prefix of a Gibbs block.
 #[must_use]
 pub fn gibbs_shared_spins(nodes: usize, optin_bytes: usize, cap: Option<usize>) -> usize {
@@ -402,7 +421,7 @@ pub fn gibbs_shared_spins(nodes: usize, optin_bytes: usize, cap: Option<usize>) 
         .min(cap.unwrap_or(usize::MAX))
 }
 
-/// Sparse Gibbs session allocation bound at full launch width.
+/// Gibbs session allocation bound at full launch width.
 /// Colour starts and counts are tiled per instance; nodes and CSR are shared.
 /// Each instance owns three coefficient/output slots and four block spills.
 #[must_use]
@@ -420,28 +439,46 @@ pub fn gibbs_footprint(
 pub(crate) fn gibbs_footprint_with_shared_cap(
     shape: ModelShape,
     precision: Precision,
-    _storage: Storage,
+    storage: Storage,
     reads: usize,
     betas: usize,
     limits: &DeviceLimits,
     cap: Option<usize>,
 ) -> Footprint {
     let n = shape.nodes;
-    let nnz = shape.couplers.saturating_mul(2).max(1);
-    let colours = n.min(shape.max_degree.saturating_add(1)).max(1);
+    let (nnz, colours, csr_bytes, reduction_bytes) = match storage {
+        Storage::Sparse => {
+            let nnz = shape.couplers.saturating_mul(2).max(1);
+            (
+                nnz,
+                n.min(shape.max_degree.saturating_add(1)).max(1),
+                n.saturating_add(1).saturating_add(nnz).saturating_mul(4),
+                0,
+            )
+        }
+        Storage::Dense => (
+            n.saturating_mul(n).max(1),
+            n.max(1),
+            8,
+            GIBBS_DENSE_REDUCTION_BYTES,
+        ),
+    };
     let coefficient_bytes = match precision {
         Precision::Binary | Precision::Int8 => 1,
         Precision::Int32 | Precision::Float32 => 4,
     };
-    let shared_bytes = n
-        .saturating_add(1)
-        .saturating_add(nnz)
-        .saturating_add(n.max(1))
-        .saturating_mul(4)
+    let shared_bytes = csr_bytes
+        .saturating_add(n.max(1).saturating_mul(4))
         .saturating_add(betas.max(1).saturating_mul(4))
         .saturating_add(POOL_ALLOWANCE_BYTES);
     let reads = reads.max(1);
-    let prefix = gibbs_shared_spins(n, limits.shared_bytes_per_block_optin, cap);
+    let prefix = gibbs_shared_spins(
+        n,
+        limits
+            .shared_bytes_per_block_optin
+            .saturating_sub(reduction_bytes),
+        cap,
+    );
     let spill = n
         .saturating_sub(prefix)
         .saturating_mul(KernelKind::Gibbs.sms_per_instance());
@@ -964,6 +1001,70 @@ mod tests {
     #[test]
     fn sa_instances_follow_sm_count() {
         assert_eq!(instances(KernelKind::Sa, 48), 48);
+    }
+
+    #[test]
+    fn gibbs_dense_footprint_counts_matrices_colours_and_spill() {
+        let limits = a4000_limits();
+        let shape = Connectivity::Complete.shape(600);
+        for (precision, per_instance) in [
+            (Precision::Binary, 1_147_305),
+            (Precision::Int8, 1_147_305),
+            (Precision::Int32, 4_392_705),
+            (Precision::Float32, 4_392_705),
+        ] {
+            let footprint = gibbs_footprint(shape, precision, Storage::Dense, 256, 64, &limits);
+            assert_eq!(footprint.instances, 12);
+            assert_eq!(footprint.shared_bytes, POOL_ALLOWANCE_BYTES + 2_664);
+            assert_eq!(footprint.per_instance_bytes, per_instance);
+            let spilled = gibbs_footprint_with_shared_cap(
+                shape,
+                precision,
+                Storage::Dense,
+                256,
+                64,
+                &limits,
+                Some(0),
+            );
+            assert_eq!(spilled.per_instance_bytes, per_instance + 2_399);
+            assert_eq!(
+                route_storage(KernelKind::Gibbs, shape, precision, 256, 64, &limits),
+                Storage::Dense
+            );
+            assert_eq!(
+                route_storage(
+                    KernelKind::Gibbs,
+                    Connectivity::Degree(20).shape(600),
+                    precision,
+                    256,
+                    64,
+                    &limits
+                ),
+                Storage::Sparse
+            );
+        }
+    }
+
+    #[test]
+    fn gibbs_small_complete_model_uses_the_smaller_sparse_footprint() {
+        let limits = a4000_limits();
+        let shape = Connectivity::Complete.shape(32);
+        let dense = gibbs_footprint(shape, Precision::Float32, Storage::Dense, 256, 64, &limits);
+        let sparse = gibbs_footprint(shape, Precision::Float32, Storage::Sparse, 256, 64, &limits);
+        // Three extra diagonals per instance cost 4,608 bytes. Removing
+        // shared CSR saves 4,092 bytes, so dense costs 516 bytes more.
+        assert_eq!(dense.total() - sparse.total(), 516);
+        assert_eq!(
+            route_storage(
+                KernelKind::Gibbs,
+                shape,
+                Precision::Float32,
+                256,
+                64,
+                &limits
+            ),
+            Storage::Sparse
+        );
     }
 
     #[test]
