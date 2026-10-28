@@ -503,6 +503,16 @@ __global__ void cuda_sa_self_feeding(
                                         unpacked_state[
                                             neighbor];
 #endif
+#ifdef QUIP_SA_COEF_F32
+                                delta_t* neighbor_delta = &delta_energy[
+#ifdef QUIP_SA_GLOBAL_STATE
+                                    (long long)neighbor * total_threads + global_tid];
+#else
+                                    neighbor];
+#endif
+                                // 4*J may overflow even when the updated delta fits.
+                                *neighbor_delta = fmaf((float)(multiplier * ns), Jij, *neighbor_delta);
+#else
 #ifdef QUIP_SA_GLOBAL_STATE
                                 delta_energy[(long long)neighbor * total_threads + global_tid] +=
 #else
@@ -511,6 +521,7 @@ __global__ void cuda_sa_self_feeding(
 #endif
                                     multiplier
                                     * Jij * ns;
+#endif
                             }
 
 #ifdef QUIP_SA_GLOBAL_STATE

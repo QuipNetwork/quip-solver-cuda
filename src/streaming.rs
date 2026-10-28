@@ -3433,6 +3433,105 @@ mod tests {
     }
 
     #[test]
+    fn float_plan_admits_large_bond_but_refuses_overfull_chain() {
+        let bond = IsingGraph::new(vec![0.0; 2], vec![1e38], vec![(0, 1)]);
+        assert_eq!(float_plan(&bond).unwrap().path, CoefficientPath::Float32);
+        // Two such bonds at an interior node exceed the existing field bound.
+        let chain = IsingGraph::new(vec![0.0; 3], vec![1e38; 2], vec![(0, 1), (1, 2)]);
+        assert!(float_plan(&chain).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn sa_float32_large_coupling_deltas_stay_finite() {
+        let mut device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 5000).unwrap();
+        let bond = IsingGraph::new(vec![0.0; 2], vec![1e38], vec![(0, 1)]);
+        // A weak power-of-two link keeps each field in range and the f32
+        // oracle exact, while both end bonds still overflow a separate 4*J.
+        let chain = IsingGraph::new(
+            vec![0.0; 4],
+            vec![1e38, 2.0_f64.powi(105), 1e38],
+            vec![(0, 1), (1, 2), (2, 3)],
+        );
+        for graph in [bond, chain] {
+            let stored = IsingGraph::new(
+                graph.h.clone(),
+                graph.j.iter().map(|&j| f64::from(j as f32)).collect(),
+                graph.edges.to_vec(),
+            );
+            let n = graph.num_nodes();
+            for global in [false, true] {
+                device.sa_force_global = global;
+                for sweeps in [1, 2, 4] {
+                    let mut session = SelfFeedingSession::build(
+                        &device,
+                        KernelKind::Sa,
+                        SelfFeedingTopology::build(&graph),
+                        1,
+                        256,
+                        1,
+                        SessionArithmetic {
+                            coefficients: real_plan(&device, &graph).unwrap(),
+                            msa_lane: DEFAULT_MSA_LANE,
+                        },
+                    )
+                    .unwrap();
+                    // At beta zero every finite delta must accept a flip.
+                    session.upload_beta_schedule(&[0.0]).unwrap();
+                    session.upload_slot(0, 0, &graph).unwrap();
+                    session.set_exit_now(0).unwrap();
+                    session.launch(1, 1, sweeps, kernel_seed(42)).unwrap();
+                    session.wait_exit().unwrap();
+                    let reads = session.download_slot(0, 0).unwrap();
+                    let AlgoState::SaReal { d_delta_energy, .. } = &session.algo_state else {
+                        panic!("expected Float32 SA state");
+                    };
+                    let deltas = session.stream_transfer.clone_dtoh(d_delta_energy).unwrap();
+                    assert_eq!(reads.len(), 256);
+                    for (read, spins) in reads.iter().enumerate() {
+                        let mut delta_sum = 0.0;
+                        for node in 0..n {
+                            let index = if global {
+                                node * 256 + read
+                            } else {
+                                read * n + node
+                            };
+                            let delta = f64::from(deltas[index]);
+                            assert!(delta.is_finite(), "n={n} global={global} sweeps={sweeps} read={read} node={node}: {delta}");
+                            let mut field = 0.0;
+                            for (&j, &(u, v)) in stored.j.iter().zip(stored.edges.iter()) {
+                                if u == node {
+                                    field += j * f64::from(spins[v]);
+                                }
+                                if v == node {
+                                    field += j * f64::from(spins[u]);
+                                }
+                            }
+                            assert_eq!(
+                                delta.to_bits(),
+                                (-2.0 * f64::from(spins[node]) * field).to_bits()
+                            );
+                            delta_sum += delta;
+                        }
+                        // The public real API scores on the host. Independently
+                        // recover device energy from its deltas: E = -sum(delta)/4
+                        // for zero fields, with each undirected edge counted twice.
+                        let device_energy = -delta_sum / 4.0;
+                        let host_energy = real_energy(spins, &stored);
+                        assert!(device_energy.is_finite());
+                        assert!(host_energy.is_finite());
+                        assert_eq!(device_energy.to_bits(), host_energy.to_bits());
+                        let original_energy = real_energy(spins, &graph);
+                        assert!(original_energy.is_finite());
+                        let rounding_bound = f64::from(f32::EPSILON) * graph.j.iter().sum::<f64>();
+                        assert!((original_energy - device_energy).abs() <= rounding_bound);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn real_beta_schedule_refuses_f32_overflow() {
         let graph = IsingGraph::new(vec![1.2e-38; 64], vec![], vec![]);
         let plan = float_plan(&graph).unwrap();
