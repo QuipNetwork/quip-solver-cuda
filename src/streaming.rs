@@ -557,6 +557,8 @@ enum AlgoState {
         d_neglog: CudaSlice<i64>,
     },
     Gibbs {
+        d_spill: Option<CudaSlice<i8>>,
+        shared_spins: i32,
         d_block_starts: CudaSlice<i32>,
         d_block_counts: CudaSlice<i32>,
         d_color_nodes: CudaSlice<i32>,
@@ -571,7 +573,10 @@ impl AlgoState {
         match self {
             Self::Msa(msa) | Self::MsaWeighted { msa, .. } => msa.shared_bytes,
             Self::MsaDense { shared_bytes, .. } => *shared_bytes,
-            Self::Sa { .. } | Self::SaWide { .. } | Self::SaReal { .. } | Self::Gibbs { .. } => 0,
+            Self::Gibbs { shared_spins, .. } => {
+                u32::try_from(*shared_spins).expect("validated shared spins")
+            }
+            Self::Sa { .. } | Self::SaWide { .. } | Self::SaReal { .. } => 0,
         }
     }
 }
@@ -959,7 +964,33 @@ fn build_algo_state(
             } else {
                 topology.colors.nodes.clone()
             };
+            let use_spill = topology.n > capacity::GIBBS_DEFAULT_NODES
+                || device.gibbs_force_spill
+                || device.gibbs_shared_spins_cap.is_some();
+            let shared_spins = if use_spill {
+                capacity::gibbs_shared_spins(
+                    topology.n,
+                    device.limits.shared_bytes_per_block_optin,
+                    device.gibbs_shared_spins_cap,
+                )
+            } else {
+                0
+            };
+            let d_spill = if use_spill {
+                Some(
+                    stream.alloc_zeros::<i8>(
+                        (topology.n - shared_spins)
+                            .saturating_mul(num_nonces)
+                            .saturating_mul(limits.sms_per_nonce)
+                            .max(1),
+                    )?,
+                )
+            } else {
+                None
+            };
             Ok(AlgoState::Gibbs {
+                d_spill,
+                shared_spins: to_kernel_i32("Gibbs shared spins", shared_spins)?,
                 d_block_starts: stream.clone_htod(&starts)?,
                 d_block_counts: stream.clone_htod(&counts)?,
                 d_color_nodes: stream.clone_htod(&nodes)?,
@@ -986,40 +1017,48 @@ fn check_model_capacity(
 ) -> Result<(), SampleError> {
     let n = shape.nodes;
     let plan = arithmetic.coefficients;
-    if kernel == KernelKind::Msa || kernel == KernelKind::Sa {
-        // The legacy f32 lane still holds i32 coefficients but omits integer tables.
-        let precision = if kernel == KernelKind::Msa
-            && plan.path == CoefficientPath::Wide
-            && arithmetic.msa_lane == MsaLane::F32
-        {
-            capacity::Precision::Float32
-        } else {
-            capacity::Precision::from_plan(plan, true)
-        };
-        let footprint = if kernel == KernelKind::Sa {
-            capacity::sa_footprint(shape, precision, storage, reads, betas, &device.limits)
-        } else {
-            capacity::msa_footprint_with_shared_cap(
-                shape,
-                precision,
-                storage,
-                reads,
-                betas,
-                &device.limits,
-                device.msa_shared_spins_cap,
-            )
-        };
-        let required_bytes = footprint.total();
-        let available_bytes = device.limits.usable_bytes();
-        if required_bytes > available_bytes {
-            return Err(SampleError::ModelExceedsDeviceMemory {
-                nodes: shape.nodes,
-                couplers: shape.couplers,
-                required_bytes,
-                available_bytes,
-                instances: footprint.instances,
-            });
-        }
+    // The legacy f32 lane still holds i32 coefficients but omits integer tables.
+    let precision = if kernel == KernelKind::Msa
+        && plan.path == CoefficientPath::Wide
+        && arithmetic.msa_lane == MsaLane::F32
+    {
+        capacity::Precision::Float32
+    } else {
+        capacity::Precision::from_plan(plan, true)
+    };
+    let footprint = if kernel == KernelKind::Sa {
+        capacity::sa_footprint(shape, precision, storage, reads, betas, &device.limits)
+    } else if kernel == KernelKind::Gibbs {
+        capacity::gibbs_footprint_with_shared_cap(
+            shape,
+            precision,
+            storage,
+            reads,
+            betas,
+            &device.limits,
+            device.gibbs_shared_spins_cap,
+        )
+    } else {
+        capacity::msa_footprint_with_shared_cap(
+            shape,
+            precision,
+            storage,
+            reads,
+            betas,
+            &device.limits,
+            device.msa_shared_spins_cap,
+        )
+    };
+    let required_bytes = footprint.total();
+    let available_bytes = device.limits.usable_bytes();
+    if required_bytes > available_bytes {
+        return Err(SampleError::ModelExceedsDeviceMemory {
+            nodes: shape.nodes,
+            couplers: shape.couplers,
+            required_bytes,
+            available_bytes,
+            instances: footprint.instances,
+        });
     }
     // Defense in depth: the backend identity's `max_nodes` already rejects
     // an oversized job in `job.rs` before it reaches the sampler. This
@@ -1762,6 +1801,8 @@ impl<'a> SelfFeedingSession<'a> {
                 self.launch_sa(cfg, num_betas, sweeps_per_beta, seed)?;
             }
             AlgoState::Gibbs {
+                d_spill,
+                shared_spins,
                 d_block_starts,
                 d_block_counts,
                 d_color_nodes,
@@ -1774,7 +1815,14 @@ impl<'a> SelfFeedingSession<'a> {
                         "launch_gibbs without int8 coefficients".into(),
                     ));
                 };
-                let mut b = self.stream_compute.launch_builder(&self.device.gibbs);
+                let function = if d_spill.is_some() {
+                    self.device.gibbs_spill.as_ref().ok_or_else(|| {
+                        SampleError::Unsupported("Gibbs spill requires a Gibbs device".into())
+                    })?
+                } else {
+                    &self.device.gibbs
+                };
+                let mut b = self.stream_compute.launch_builder(function);
                 b.arg(&self.d_row_ptr);
                 b.arg(&self.d_col_ind);
                 b.arg(d_block_starts);
@@ -1802,18 +1850,22 @@ impl<'a> SelfFeedingSession<'a> {
                 b.arg(chunks_per_model);
                 b.arg(reads_per_chunk);
                 b.arg(&seed);
-                let update_mode = 0i32; // heat-bath Gibbs (no metropolis knob on this wire path)
+                let update_mode = i32::from(self.device.gibbs_metropolis);
                 b.arg(&update_mode);
+                if let Some(spill) = d_spill {
+                    b.arg(spill);
+                    b.arg(shared_spins);
+                }
                 // SAFETY: same obligation as the SA arm above. The 24 `b.arg`
                 // calls mirror `cuda_gibbs_self_feeding` in `kernels/gibbs.cu`
-                // in order, type and count, ending in `base_seed` /
-                // `update_mode`. `n`, `nnz`, `max_packed`, `num_nonces` and
+                // in order, type and count. The spill variant appends its
+                // buffer and prefix length. `n`, `nnz`, `max_packed`, `num_nonces` and
                 // `reads_per_nonce` are the values `build` sized the slot
                 // buffers from; `num_colors`, `chunks_per_model` and
                 // `reads_per_chunk` likewise bound the color-block arrays
-                // `build` tiled per nonce. `build` rejected
-                // `n > limits.max_nodes`, keeping the kernel's fixed-size
-                // `shared_state[4800]` in range. The buffers outlive the
+                // `build` tiled per nonce. Above 4800 nodes the spill
+                // instantiation uses a launch-sized prefix and a tail per block.
+                // The buffers outlive the
                 // launch: `Drop` signals exit and synchronizes
                 // `stream_compute` before any `CudaSlice` field is freed.
                 unsafe { b.launch(cfg) }?;

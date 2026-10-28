@@ -103,8 +103,7 @@ fn msa_routes_a_spin_with_more_than_sixty_two_neighbours() {
     );
 }
 
-/// Gibbs holds its state in shared memory and measured flat cost per node out
-/// to 48000, so a capacity far above the default must still open.
+/// Gibbs uses its shared prefix above the static mining threshold.
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn gibbs_opens_well_above_the_shared_default() {
@@ -139,27 +138,12 @@ fn sa_opens_at_the_original_illegal_address_repro() {
     assert_eq!(dev.max_nodes, 16384);
 }
 
-/// The Gibbs ceiling comes from the device, not a constant. On a 48 KB
-/// shared-memory part this refuses 65536 and names the budget.
+/// Gibbs opens beyond the old shared ceiling; admission checks each model.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn gibbs_refuses_above_the_device_budget() {
-    if CudaDevice::device_count().unwrap_or(0) == 0 {
-        eprintln!("no CUDA device visible; skipping");
-        return;
-    }
-
-    let err = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 65536)
-        .expect_err("Gibbs above the device budget must fail at open");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("65536"),
-        "message must name the request: {msg}"
-    );
-    assert!(
-        msg.contains("budget"),
-        "message must name the device budget: {msg}"
-    );
+fn gibbs_opens_beyond_the_shared_budget() {
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 65536).unwrap();
+    assert_eq!(device.max_nodes, 65536);
 }
 
 /// Two capacities in one process must both load the kernel they asked for. A

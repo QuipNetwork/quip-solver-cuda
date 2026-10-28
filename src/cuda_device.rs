@@ -413,6 +413,16 @@ pub struct CudaDevice {
     /// `cuda_gibbs_self_feeding` — persistent kernel, `sms_per_nonce` blocks
     /// per nonce.
     pub(crate) gibbs: CudaFunction,
+    pub(crate) gibbs_spill: Option<CudaFunction>,
+    /// Hold at most this many spins in each Gibbs block's shared prefix.
+    /// Setting a cap forces the spill instantiation, including below 4800 nodes.
+    pub gibbs_shared_spins_cap: Option<usize>,
+    /// Force the spill instantiation with the full shared budget for parity tests.
+    #[doc(hidden)]
+    pub gibbs_force_spill: bool,
+    /// Exercise the kernel's Metropolis update mode in parity tests.
+    #[doc(hidden)]
+    pub gibbs_metropolis: bool,
     /// `cuda_msa_self_feeding` — persistent kernel, 1 block (1 SM) per
     /// nonce, 64 reads per replica word.
     pub(crate) msa: CudaFunction,
@@ -441,6 +451,7 @@ pub struct CudaDevice {
     _sa_mod: Arc<CudaModule>,
     _sa_wide_mod: Arc<CudaModule>,
     _gibbs_mod: Arc<CudaModule>,
+    _gibbs_spill_mod: Option<Arc<CudaModule>>,
     _msa_mod: Arc<CudaModule>,
 }
 
@@ -491,8 +502,8 @@ impl CudaDevice {
     /// Open the selected kernel with an optional lower node cap.
     ///
     /// SA always compiles the fixed mining frame and its global variants.
-    /// Gibbs compiles its shared array at the resolved node count. MSA has no
-    /// compiled node array. Other kernels keep their default instantiations.
+    /// Gibbs compiles its fixed shared array and, on Gibbs opens, its spill
+    /// variant. MSA has no compiled node array.
     ///
     /// # Errors
     ///
@@ -537,10 +548,7 @@ impl CudaDevice {
         )
         .map_err(|_| CudaError::Driver("CUDA reported a negative SM count".into()))?;
 
-        // Node capacity is a `-D` on the kernel, so it is resolved before the
-        // compile and must reach both `compile_for_arch` and the cache
-        // key. Gibbs is bounded by this device's shared memory, so the budget
-        // comes from the device rather than a constant.
+        // The opt-in shared budget controls the prefix, not the node limit.
         let shared_per_block = usize::try_from(
             ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
         )
@@ -581,7 +589,7 @@ impl CudaDevice {
             None
         };
         let msa_nodes = nodes_for(KernelKind::Msa);
-        let gibbs_nodes = nodes_for(KernelKind::Gibbs);
+        let gibbs_nodes = capacity::GIBBS_DEFAULT_NODES;
 
         // Detected capability -> clamped compile target. An unreadable
         // attribute degrades to the floor (70) rather than failing the open:
@@ -606,6 +614,40 @@ impl CudaDevice {
         let msa_dense = msa_mod.load_function("cuda_msa_dense_self_feeding")?;
         configure_msa_shared_memory(&msa_dense, shared_per_block_optin)?;
         let gibbs = gibbs_mod.load_function("cuda_gibbs_self_feeding")?;
+        let gibbs_spill_mod = if kernel == KernelKind::Gibbs {
+            Some(jit_cache::load_or_compile(
+                &ctx,
+                "gibbs-spill",
+                GIBBS_SRC,
+                &["-DQUIP_GIBBS_SPILL"],
+                &arch,
+                driver_version()?,
+                gibbs_nodes,
+                || compile_for_arch(GIBBS_SRC, gibbs_nodes, sel, &["-DQUIP_GIBBS_SPILL"]),
+            )?)
+        } else {
+            None
+        };
+        let gibbs_spill = gibbs_spill_mod
+            .as_ref()
+            .map(|module| module.load_function("cuda_gibbs_self_feeding"))
+            .transpose()?;
+        if let Some(function) = &gibbs_spill {
+            let static_bytes = usize::try_from(function.shared_size_bytes()?)
+                .map_err(|_| CudaError::Driver("negative Gibbs static shared memory".into()))?;
+            if static_bytes > capacity::GIBBS_STATIC_SHARED_BYTES {
+                return Err(CudaError::Driver(format!(
+                    "Gibbs static shared memory {static_bytes} exceeds its reserved budget"
+                )));
+            }
+            let dynamic_bytes =
+                shared_per_block_optin.saturating_sub(capacity::GIBBS_STATIC_SHARED_BYTES);
+            function.set_attribute(
+                CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                i32::try_from(dynamic_bytes)
+                    .map_err(|_| CudaError::Driver("Gibbs shared memory exceeds i32".into()))?,
+            )?;
+        }
         let msa_dynamic_shared_bytes = configure_msa_shared_memory(&msa, shared_per_block_optin)?;
         if let Some(weighted) = &msa_weighted {
             configure_msa_shared_memory(&weighted.i32, shared_per_block_optin)?;
@@ -636,6 +678,10 @@ impl CudaDevice {
             sa,
             sa_wide,
             gibbs,
+            gibbs_spill,
+            gibbs_shared_spins_cap: None,
+            gibbs_force_spill: false,
+            gibbs_metropolis: false,
             msa,
             msa_dense,
             last_storage: std::sync::Mutex::new(None),
@@ -652,6 +698,7 @@ impl CudaDevice {
             _sa_mod: sa_mod,
             _sa_wide_mod: sa_wide_mod,
             _gibbs_mod: gibbs_mod,
+            _gibbs_spill_mod: gibbs_spill_mod,
             _msa_mod: msa_mod,
         })
     }

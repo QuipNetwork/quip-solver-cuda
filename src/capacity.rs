@@ -1,9 +1,8 @@
 //! Node-capacity policy for the self-feeding kernels.
 //!
 //! SA uses its fixed local frame through 5000 nodes and global state above it.
-//! Gibbs sizes shared state at compile time. MSA keeps hot spins in dynamic
-//! shared memory and spills the rest. Footprints bound session allocations
-//! before device buffers are built.
+//! Gibbs and MSA keep hot spins in shared memory and spill the rest.
+//! Footprints bound session allocations before device buffers are built.
 
 use crate::coefficients::{CoefficientPath, CoefficientPlan};
 use crate::kernel::KernelKind;
@@ -33,12 +32,12 @@ const POOL_ALLOWANCE_BYTES: usize = 32 << 20;
 /// Device facts the capacity derivation needs, read once at open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceLimits {
-    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK`. Bounds Gibbs.
+    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK`.
     pub shared_bytes_per_block: usize,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`. Bounds msa,
+    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`. Bounds the prefix,
     /// whose block opts in to more than the default per-block limit.
     pub shared_bytes_per_block_optin: usize,
-    /// Free device memory at open, from `cuMemGetInfo`. Bounds SA.
+    /// Free device memory at open, from `cuMemGetInfo`. Bounds session buffers.
     pub free_bytes: usize,
     /// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
     pub sm_count: usize,
@@ -130,9 +129,6 @@ impl Footprint {
 }
 
 /// Device allocation estimate for the selected kernel at full width.
-///
-/// # Panics
-/// Panics for Gibbs until its device-memory footprint is available.
 #[must_use]
 pub fn footprint(
     kernel: KernelKind,
@@ -146,10 +142,7 @@ pub fn footprint(
     match kernel {
         KernelKind::Msa => msa_footprint(shape, precision, storage, reads, betas, limits),
         KernelKind::Sa => sa_footprint(shape, precision, storage, reads, betas, limits),
-        KernelKind::Gibbs => {
-            let kernel = kernel.name();
-            panic!("{kernel} has no device-memory footprint yet")
-        }
+        KernelKind::Gibbs => gibbs_footprint(shape, precision, storage, reads, betas, limits),
     }
 }
 
@@ -395,12 +388,79 @@ pub fn msa_per_instance_budget(limits: &DeviceLimits) -> usize {
     limits.usable_bytes() / instances(KernelKind::Msa, limits.sm_count)
 }
 
-/// Shipped `shared_state` size in `kernels/gibbs.cu`, and the floor.
+/// Shipped static shared-state size in `kernels/gibbs.cu`.
 pub const GIBBS_DEFAULT_NODES: usize = 4800;
 
-/// Bytes of shared memory the Gibbs kernel uses outside `shared_state`:
-/// `s_chunk` and `s_arrival`, one `int` each.
-pub const GIBBS_FIXED_SHARED_BYTES: usize = 8;
+/// Two shared ints, rounded to the driver's 16-byte static allocation boundary.
+pub const GIBBS_STATIC_SHARED_BYTES: usize = 16;
+
+/// Spins held in the dynamic shared prefix of a Gibbs block.
+#[must_use]
+pub fn gibbs_shared_spins(nodes: usize, optin_bytes: usize, cap: Option<usize>) -> usize {
+    nodes
+        .min(optin_bytes.saturating_sub(GIBBS_STATIC_SHARED_BYTES))
+        .min(cap.unwrap_or(usize::MAX))
+}
+
+/// Sparse Gibbs session allocation bound at full launch width.
+/// Colour starts and counts are tiled per instance; nodes and CSR are shared.
+/// Each instance owns three coefficient/output slots and four block spills.
+#[must_use]
+pub fn gibbs_footprint(
+    shape: ModelShape,
+    precision: Precision,
+    storage: Storage,
+    reads: usize,
+    betas: usize,
+    limits: &DeviceLimits,
+) -> Footprint {
+    gibbs_footprint_with_shared_cap(shape, precision, storage, reads, betas, limits, None)
+}
+
+pub(crate) fn gibbs_footprint_with_shared_cap(
+    shape: ModelShape,
+    precision: Precision,
+    _storage: Storage,
+    reads: usize,
+    betas: usize,
+    limits: &DeviceLimits,
+    cap: Option<usize>,
+) -> Footprint {
+    let n = shape.nodes;
+    let nnz = shape.couplers.saturating_mul(2).max(1);
+    let colours = n.min(shape.max_degree.saturating_add(1)).max(1);
+    let coefficient_bytes = match precision {
+        Precision::Binary | Precision::Int8 => 1,
+        Precision::Int32 | Precision::Float32 => 4,
+    };
+    let shared_bytes = n
+        .saturating_add(1)
+        .saturating_add(nnz)
+        .saturating_add(n.max(1))
+        .saturating_mul(4)
+        .saturating_add(betas.max(1).saturating_mul(4))
+        .saturating_add(POOL_ALLOWANCE_BYTES);
+    let reads = reads.max(1);
+    let prefix = gibbs_shared_spins(n, limits.shared_bytes_per_block_optin, cap);
+    let spill = n
+        .saturating_sub(prefix)
+        .saturating_mul(KernelKind::Gibbs.sms_per_instance());
+    let per_instance_bytes = n
+        .max(1)
+        .saturating_add(nnz)
+        .saturating_mul(coefficient_bytes)
+        .saturating_mul(3)
+        .saturating_add(reads.saturating_mul(n.div_ceil(8).max(1)).saturating_mul(3))
+        .saturating_add(reads.saturating_mul(12))
+        .saturating_add(32)
+        .saturating_add(colours.saturating_mul(8))
+        .saturating_add(spill.max(1));
+    Footprint {
+        shared_bytes,
+        per_instance_bytes,
+        instances: instances(KernelKind::Gibbs, limits.sm_count),
+    }
+}
 
 /// Minimum requested MSA capacity, also used when opening to read limits.
 /// The msa kernel has no compiled node array: its spin state uses dynamic
@@ -545,9 +605,6 @@ impl Connectivity {
 }
 
 /// Largest model for the selected kernel at the default beta count.
-///
-/// # Panics
-/// Panics for Gibbs until its device-memory footprint is available.
 #[must_use]
 pub fn max_model(
     kernel: KernelKind,
@@ -558,7 +615,7 @@ pub fn max_model(
 ) -> ModelShape {
     match kernel {
         KernelKind::Msa => msa_max_model(conn, precision, reads, limits),
-        KernelKind::Sa => {
+        KernelKind::Sa | KernelKind::Gibbs => {
             let mut high = i32::MAX as usize - 256;
             if let Connectivity::Degree(d) = conn {
                 high = high.min((i32::MAX as usize - 1) / d.max(1));
@@ -567,22 +624,27 @@ pub fn max_model(
             }
             let at = |n| {
                 let shape = conn.shape(n);
-                let storage = route_storage(
-                    KernelKind::Sa,
+                let storage =
+                    route_storage(kernel, shape, precision, reads, MSA_DEFAULT_BETAS, limits);
+                footprint(
+                    kernel,
                     shape,
                     precision,
+                    storage,
                     reads,
                     MSA_DEFAULT_BETAS,
                     limits,
-                );
-                sa_footprint(shape, precision, storage, reads, MSA_DEFAULT_BETAS, limits).total()
+                )
+                .total()
             };
             // The local frame disappears above the mining threshold. Search
             // the global interval first, then the local interval if none fits.
             let first_global = SA_DEFAULT_NODES + 1;
-            let global_fits = first_global <= high && at(first_global) <= limits.usable_bytes();
+            let global_fits = kernel == KernelKind::Sa
+                && first_global <= high
+                && at(first_global) <= limits.usable_bytes();
             let mut low = if global_fits { first_global } else { 0 };
-            if !global_fits {
+            if kernel == KernelKind::Sa && !global_fits {
                 high = high.min(SA_DEFAULT_NODES);
             }
             while low < high {
@@ -599,10 +661,6 @@ pub fn max_model(
                 }
             }
             conn.shape(low)
-        }
-        KernelKind::Gibbs => {
-            let kernel = kernel.name();
-            panic!("{kernel} has no device-memory footprint yet")
         }
     }
 }
@@ -744,16 +802,13 @@ fn msa_max_fitting(
 /// Which device limit bounds a kernel's capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetResource {
-    /// Gibbs holds its spin state in shared memory, per block.
-    SharedMemory,
-    /// SA and MSA session buffers are bounded by device memory.
+    /// Session buffers are bounded by device memory.
     DeviceMemory,
 }
 
 impl std::fmt::Display for BudgetResource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SharedMemory => write!(f, "shared-memory"),
             Self::DeviceMemory => write!(f, "memory"),
         }
     }
@@ -763,9 +818,7 @@ impl std::fmt::Display for BudgetResource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CapacityError {
     /// Above what this device can hold. `resource` names which limit bound
-    /// it, because SA is bounded by device memory, Gibbs by shared memory and
-    /// msa by the memory its session needs, and a message
-    /// naming the wrong resource sends the reader to the wrong knob.
+    /// it. Session buffers must fit the usable device memory.
     #[error("requested {requested} nodes exceeds the device {resource} budget of {budget}")]
     AboveDeviceBudget {
         /// Nodes asked for.
@@ -775,13 +828,6 @@ pub enum CapacityError {
         /// Which device limit bound this request.
         resource: BudgetResource,
     },
-}
-
-/// Largest Gibbs `shared_state` this device can hold, in nodes. One node is
-/// one `signed char`, so bytes and nodes are the same number.
-#[must_use]
-pub fn gibbs_budget(shared_bytes_per_block: usize) -> usize {
-    shared_bytes_per_block.saturating_sub(GIBBS_FIXED_SHARED_BYTES)
 }
 
 /// Capacity used when `--max-nodes` is absent.
@@ -796,9 +842,8 @@ pub fn default_nodes(kernel: KernelKind) -> usize {
 
 /// Capacity to advertise in `--capabilities`.
 ///
-/// SA and MSA derive maxima from device memory and advertise zero without
-/// device limits. A requested capacity is an optional lower cap. Gibbs uses
-/// its requested node count until device open validates shared memory.
+/// Kernels derive maxima from device memory and advertise zero without
+/// device limits. A requested capacity is an optional lower cap.
 #[must_use]
 pub fn advertised_nodes(
     kernel: KernelKind,
@@ -807,10 +852,10 @@ pub fn advertised_nodes(
 ) -> usize {
     let want = requested.max(default_nodes(kernel));
     match kernel {
-        KernelKind::Sa => limits.map_or(0, |limits| {
+        KernelKind::Sa | KernelKind::Gibbs => limits.map_or(0, |limits| {
             requested.min(
                 max_model(
-                    KernelKind::Sa,
+                    kernel,
                     Connectivity::Degree(0),
                     Precision::Binary,
                     256,
@@ -822,20 +867,19 @@ pub fn advertised_nodes(
         KernelKind::Msa => limits.map_or(0, |limits| {
             want.min(msa_max_nodes(limits, msa_device_reads(limits)))
         }),
-        KernelKind::Gibbs => want,
     }
 }
 
 /// Resolve a requested capacity against the kernel and the device.
 ///
-/// Gibbs and MSA raise requests below their defaults and reject requests
-/// above their device bounds. SA preserves the requested cap independently
-/// of its fixed local frame and checks memory per model.
+/// MSA raises requests below its default and rejects requests above its
+/// device bound. SA and Gibbs preserve the requested cap and check memory
+/// per model.
 ///
 /// # Errors
 ///
 /// [`CapacityError::AboveDeviceBudget`] when the request exceeds
-/// [`gibbs_budget`] or [`msa_max_nodes`] for this device.
+/// [`msa_max_nodes`] for this device.
 pub fn resolve(
     kernel: KernelKind,
     requested: usize,
@@ -844,14 +888,10 @@ pub fn resolve(
     let floor = default_nodes(kernel);
     let want = requested.max(floor);
     let (budget, resource) = match kernel {
-        KernelKind::Sa => return Ok(requested),
+        KernelKind::Sa | KernelKind::Gibbs => return Ok(requested),
         KernelKind::Msa => (
             msa_max_nodes(limits, msa_device_reads(limits)),
             BudgetResource::DeviceMemory,
-        ),
-        KernelKind::Gibbs => (
-            gibbs_budget(limits.shared_bytes_per_block),
-            BudgetResource::SharedMemory,
         ),
     };
     if want > budget {
@@ -869,6 +909,47 @@ mod tests {
     use super::*;
     use crate::coefficients::{CoefficientPath, CoefficientPlan};
     use crate::kernel::KernelKind;
+
+    #[test]
+    fn gibbs_instances_use_four_sms() {
+        assert_eq!(instances(KernelKind::Gibbs, 48), 12);
+    }
+
+    #[test]
+    fn gibbs_max_model_exceeds_old_shared_ceiling() {
+        let limits = a4000_limits();
+        let m = max_model(
+            KernelKind::Gibbs,
+            Connectivity::Degree(20),
+            Precision::Binary,
+            256,
+            &limits,
+        );
+        assert!(m.nodes > GIBBS_DEFAULT_NODES);
+    }
+
+    #[test]
+    fn gibbs_explicit_cap_below_the_shared_array_is_preserved() {
+        let limits = a4000_limits();
+        assert_eq!(resolve(KernelKind::Gibbs, 1000, &limits), Ok(1000));
+        assert_eq!(
+            advertised_nodes(KernelKind::Gibbs, 1000, Some(&limits)),
+            1000
+        );
+        let memory_limit = max_model(
+            KernelKind::Gibbs,
+            Connectivity::Degree(0),
+            Precision::Binary,
+            256,
+            &limits,
+        )
+        .nodes;
+        assert_eq!(
+            advertised_nodes(KernelKind::Gibbs, usize::MAX, Some(&limits)),
+            memory_limit
+        );
+        assert_eq!(advertised_nodes(KernelKind::Gibbs, usize::MAX, None), 0);
+    }
 
     fn a4000_limits() -> DeviceLimits {
         DeviceLimits {
@@ -1444,31 +1525,11 @@ mod tests {
         assert_eq!(msa_per_instance_budget(&a4000_limits()), 268_435_456);
     }
 
-    /// A4000 reports 49152 bytes of shared memory per block. `s_chunk` and
-    /// `s_arrival` take 8 of them, so 49144 nodes is the Gibbs ceiling.
-    /// Measured: 48000 runs, 65536 fails to compile.
-    #[test]
-    fn gibbs_budget_subtracts_the_fixed_shared_members() {
-        assert_eq!(gibbs_budget(49152), 49144);
-    }
-
     #[test]
     fn resolve_accepts_a_request_inside_both_bounds() {
         let limits = a4000(A4000_FREE);
         assert_eq!(resolve(KernelKind::Gibbs, 5640, &limits), Ok(5640));
         assert_eq!(resolve(KernelKind::Sa, 5640, &limits), Ok(5640));
-    }
-
-    #[test]
-    fn resolve_rejects_gibbs_above_the_device_budget() {
-        assert_eq!(
-            resolve(KernelKind::Gibbs, 65536, &a4000(A4000_FREE)),
-            Err(CapacityError::AboveDeviceBudget {
-                requested: 65536,
-                budget: 49144,
-                resource: BudgetResource::SharedMemory,
-            })
-        );
     }
 
     #[test]
@@ -1490,15 +1551,11 @@ mod tests {
         );
     }
 
-    /// Gibbs and MSA retain their default node floors.
+    /// MSA retains its default node floor.
     #[test]
-    fn resolve_gibbs_and_msa_raise_small_requests_to_the_default() {
+    fn resolve_msa_raises_small_requests_to_the_default() {
         let limits = a4000(A4000_FREE);
         assert_eq!(resolve(KernelKind::Msa, 64, &limits), Ok(MSA_DEFAULT_NODES));
-        assert_eq!(
-            resolve(KernelKind::Gibbs, 64, &limits),
-            Ok(GIBBS_DEFAULT_NODES)
-        );
     }
 
     #[test]
@@ -1524,23 +1581,6 @@ mod tests {
         }
     }
 
-    /// Same contract for Gibbs, whose budget comes from shared memory.
-    #[test]
-    fn resolve_gibbs_accepts_at_the_budget_and_rejects_above_it() {
-        let limits = a4000(A4000_FREE);
-        let budget = gibbs_budget(limits.shared_bytes_per_block);
-        assert_eq!(budget, 49144);
-        assert_eq!(resolve(KernelKind::Gibbs, budget, &limits), Ok(budget));
-        assert_eq!(
-            resolve(KernelKind::Gibbs, budget + 1, &limits),
-            Err(CapacityError::AboveDeviceBudget {
-                requested: budget + 1,
-                budget,
-                resource: BudgetResource::SharedMemory,
-            })
-        );
-    }
-
     /// A card with room for the default still opens on a plain invocation.
     #[test]
     fn an_ordinary_card_affords_the_default() {
@@ -1548,17 +1588,6 @@ mod tests {
         assert_eq!(
             resolve(KernelKind::Sa, SA_DEFAULT_NODES, &limits),
             Ok(SA_DEFAULT_NODES)
-        );
-    }
-
-    /// Gibbs has no static ceiling — its bound comes from the device — so the
-    /// request passes through and `open_with_nodes` is what refuses.
-    #[test]
-    fn advertised_passes_gibbs_through_above_the_default() {
-        assert_eq!(advertised_nodes(KernelKind::Gibbs, 32768, None), 32768);
-        assert_eq!(
-            advertised_nodes(KernelKind::Gibbs, 64, None),
-            GIBBS_DEFAULT_NODES
         );
     }
 

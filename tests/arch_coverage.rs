@@ -115,6 +115,7 @@ fn every_supported_arch_compiles_and_assembles_every_kernel() {
         for (name, src, nodes, defines) in [
             ("sa", SA_SRC, 512, &[][..]),
             ("gibbs", GIBBS_SRC, 4800, &[][..]),
+            ("gibbs-spill", GIBBS_SRC, 4800, &["-DQUIP_GIBBS_SPILL"][..]),
             (
                 "msa",
                 MSA_SRC,

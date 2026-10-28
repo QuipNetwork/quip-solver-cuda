@@ -22,6 +22,13 @@
 #define QUIP_MAX_NODES 4800
 #endif
 
+// Spill sessions can have coefficient and sample slots larger than 2 GiB.
+#ifdef QUIP_GIBBS_SPILL
+#define GIBBS_OFFSET unsigned long long
+#else
+#define GIBBS_OFFSET int
+#endif
+
 // ==============================================================================
 // NonceControl layout (flat int array, CTRL_STRIDE ints per nonce)
 // ==============================================================================
@@ -126,13 +133,30 @@ __device__ __forceinline__ void set_spin_packed(
 // h_eff = h_i + sum_j(J_ij * x_j)
 // ==============================================================================
 
+#ifdef QUIP_GIBBS_SPILL
+// Both loads and stores use the same split, with one tail per block.
+struct GibbsState {
+    volatile signed char* prefix;
+    volatile signed char* spill;
+    int shared_spins;
+
+    __device__ __forceinline__ volatile signed char& operator[](int var) const {
+        return var < shared_spins ? prefix[var] : spill[var - shared_spins];
+    }
+};
+#endif
+
 __device__ float compute_effective_field_shared(
     int var,
+#ifdef QUIP_GIBBS_SPILL
+    GibbsState shared_state,
+#else
     volatile signed char* shared_state,
+#endif
     const int* csr_row_ptr, int rp_off,
     const int* csr_col_ind, int ci_off,
-    const signed char* csr_J_vals, int j_off,
-    const signed char* h_vals, int h_off
+    const signed char* csr_J_vals, GIBBS_OFFSET j_off,
+    const signed char* h_vals, GIBBS_OFFSET h_off
 ) {
     int start = __ldg(&csr_row_ptr[rp_off + var]);
     int end = __ldg(&csr_row_ptr[rp_off + var + 1]);
@@ -236,8 +260,21 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
     int reads_per_chunk,
     unsigned int base_seed,
     int update_mode
+#ifdef QUIP_GIBBS_SPILL
+    , signed char* spin_spill,
+    int gibbs_shared_spins
+#endif
 ) {
+#ifdef QUIP_GIBBS_SPILL
+    extern __shared__ signed char spin_prefix[];
+    GibbsState shared_state = {
+        spin_prefix,
+        spin_spill + (unsigned long long)blockIdx.x * (N - gibbs_shared_spins),
+        gibbs_shared_spins
+    };
+#else
     __shared__ signed char shared_state[QUIP_MAX_NODES];
+#endif
     __shared__ int s_chunk;
     __shared__ int s_arrival;
 
@@ -336,10 +373,10 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
     // === Model loop: process models until no READY slot ===
     while (true) {
         // Compute buffer offsets for this slot
-        int slot_idx = nonce_id * 3 + active_slot;
-        int j_off = slot_idx * nnz;
-        int h_off = slot_idx * N;
-        int sample_base = slot_idx * reads_per_nonce
+        GIBBS_OFFSET slot_idx = nonce_id * 3 + active_slot;
+        GIBBS_OFFSET j_off = slot_idx * nnz;
+        GIBBS_OFFSET h_off = slot_idx * N;
+        GIBBS_OFFSET sample_base = slot_idx * reads_per_nonce
                           * max_packed_size;
         int energy_base = slot_idx * reads_per_nonce;
 

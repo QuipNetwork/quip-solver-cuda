@@ -751,7 +751,7 @@ fn run_run(
             // as the miner does when no lower cap was requested.
             device.max_nodes = msa_max_nodes(&device.limits, msa_device_reads(&device.limits));
         }
-        if kernel == KernelKind::Sa && max_nodes.is_none() {
+        if (kernel == KernelKind::Sa || kernel == KernelKind::Gibbs) && max_nodes.is_none() {
             device.max_nodes =
                 crate::capacity::advertised_nodes(kernel, usize::MAX, Some(&device.limits));
         }

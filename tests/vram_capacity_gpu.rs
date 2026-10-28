@@ -195,6 +195,66 @@ fn footprint_matches_measured_allocation() {
     }
     dense_allocation_cases(device, &ctx);
     sa_allocation_cases();
+    gibbs_allocation_cases();
+}
+
+fn gibbs_allocation_cases() {
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 150_000).unwrap();
+    let ctx = CudaContext::new(0).unwrap();
+    for nodes in [4_000, 4_801, 150_000] {
+        for precision in [Precision::Binary, Precision::Int8] {
+            let graph = circulant(nodes, 20, precision);
+            let params = SampleParams {
+                num_reads: 256,
+                num_sweeps: 1,
+                ..SampleParams::default()
+            };
+            let footprint = quip_solver_cuda::capacity::gibbs_footprint(
+                ModelShape {
+                    nodes,
+                    couplers: graph.edges.len(),
+                    max_degree: 20,
+                },
+                precision,
+                Storage::Sparse,
+                256,
+                1,
+                &device.limits,
+            );
+            assert_eq!(
+                footprint.instances,
+                stream_width(&device, KernelKind::Gibbs)
+            );
+            ctx.synchronize().unwrap();
+            let (before, _) = ctx.mem_get_info().unwrap();
+            let free = Arc::new(AtomicUsize::new(0));
+            let observer = AllocationAtLaunch {
+                ctx: Arc::clone(&ctx),
+                free: Arc::clone(&free),
+            };
+            tracing::subscriber::with_default(
+                tracing_subscriber::registry().with(observer),
+                || {
+                    bench_many(
+                        &device,
+                        &graph,
+                        &params,
+                        KernelKind::Gibbs,
+                        None,
+                        footprint.instances,
+                    )
+                    .unwrap();
+                },
+            );
+            let after = free.load(Ordering::SeqCst);
+            assert_ne!(after, 0);
+            let measured = before.checked_sub(after).unwrap();
+            eprintln!("gibbs N={nodes} precision={precision:?} instances={} measured={measured} footprint={}", footprint.instances, footprint.total());
+            assert!(measured > 0);
+            assert!(measured <= footprint.total());
+            assert!(footprint.total() - measured <= measured / 10 + (64 << 20));
+        }
+    }
 }
 
 fn sa_allocation_cases() {
