@@ -1,6 +1,6 @@
 //! Precision storage and real-valued MSA sampling on a CUDA device.
 
-use quip_solver_cuda::capacity::{msa_device_reads, MsaStorage};
+use quip_solver_cuda::capacity::{msa_device_reads, Storage};
 use quip_solver_cuda::coefficients::{plan, CoefficientPath};
 use quip_solver_cuda::cuda_device::{CudaDevice, MsaLane};
 use quip_solver_cuda::sampler::SampleError;
@@ -287,7 +287,7 @@ fn real_sparse_acceptance_matches_replica_oracle() {
                 let mut repeated = Vec::new();
                 for _ in 0..2 {
                     let reads = sample_one_real(&device, &graph, &params).unwrap();
-                    assert_eq!(last_storage(&device), Some(MsaStorage::Sparse));
+                    assert_eq!(last_storage(&device), Some(Storage::Sparse));
                     assert_eq!(reads.len(), num_reads);
                     repeated.push(reads.into_iter().map(|read| read.spins).collect::<Vec<_>>());
                 }

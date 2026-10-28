@@ -575,7 +575,7 @@ fn session_topology(
     device: &CudaDevice,
     kernel: KernelKind,
     graph: &IsingGraph,
-    forced: Option<capacity::MsaStorage>,
+    forced: Option<capacity::Storage>,
     reads: usize,
     betas: usize,
     arithmetic: SessionArithmetic,
@@ -595,12 +595,12 @@ fn session_topology(
     let max_degree = degrees.into_iter().max().unwrap_or(0);
     let storage = if kernel == KernelKind::Msa {
         forced.unwrap_or(if max_degree > capacity::MSA_MAX_DEGREE {
-            capacity::MsaStorage::Dense
+            capacity::Storage::Dense
         } else {
-            capacity::MsaStorage::Sparse
+            capacity::Storage::Sparse
         })
     } else {
-        capacity::MsaStorage::Sparse
+        capacity::Storage::Sparse
     };
     check_model_capacity(
         device,
@@ -615,7 +615,7 @@ fn session_topology(
         betas,
         arithmetic.normalized(),
     )?;
-    if storage == capacity::MsaStorage::Sparse {
+    if storage == capacity::Storage::Sparse {
         return Ok(SelfFeedingTopology::build(graph));
     }
     let nnz = n
@@ -878,7 +878,7 @@ fn check_model_capacity(
     device: &CudaDevice,
     kernel: KernelKind,
     shape: capacity::ModelShape,
-    storage: capacity::MsaStorage,
+    storage: capacity::Storage,
     reads: usize,
     betas: usize,
     arithmetic: SessionArithmetic,
@@ -954,9 +954,9 @@ fn check_session_capacity(
             max_degree: topology.max_degree(),
         },
         if topology.row_ptr.is_empty() {
-            capacity::MsaStorage::Dense
+            capacity::Storage::Dense
         } else {
-            capacity::MsaStorage::Sparse
+            capacity::Storage::Sparse
         },
         reads,
         betas,
@@ -2063,7 +2063,7 @@ fn sample_one_planned(
     params: &SampleParams,
     kernel: KernelKind,
     plan: CoefficientPlan,
-    forced: Option<capacity::MsaStorage>,
+    forced: Option<capacity::Storage>,
 ) -> Result<Vec<Vec<i8>>, SampleError> {
     let n = graph.num_nodes();
     if n == 0 {
@@ -2165,7 +2165,7 @@ pub fn sample_one_real_forced(
     device: &CudaDevice,
     graph: &IsingGraph,
     params: &SampleParams,
-    storage: capacity::MsaStorage,
+    storage: capacity::Storage,
 ) -> Result<SampleSet, SampleError> {
     let plan = if graph.edges.iter().any(|&(u, v)| u == v) {
         // Preserve the exact dense diagonal fixture, whose terms are constant.
@@ -2191,9 +2191,9 @@ fn record_storage(device: &CudaDevice, kernel: KernelKind, topology: &SelfFeedin
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(if topology.row_ptr.is_empty() {
-                capacity::MsaStorage::Dense
+                capacity::Storage::Dense
             } else {
-                capacity::MsaStorage::Sparse
+                capacity::Storage::Sparse
             });
     }
 }
@@ -2201,7 +2201,7 @@ fn record_storage(device: &CudaDevice, kernel: KernelKind, topology: &SelfFeedin
 /// Storage tier of the most recently built MSA session on this device.
 #[doc(hidden)]
 #[must_use]
-pub fn last_storage(device: &CudaDevice) -> Option<capacity::MsaStorage> {
+pub fn last_storage(device: &CudaDevice) -> Option<capacity::Storage> {
     *device
         .last_msa_storage
         .lock()

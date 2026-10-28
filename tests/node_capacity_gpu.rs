@@ -99,7 +99,7 @@ fn msa_routes_a_spin_with_more_than_sixty_two_neighbours() {
     assert_eq!(reads.len(), 8);
     assert_eq!(
         quip_solver_cuda::streaming::last_storage(&device),
-        Some(quip_solver_cuda::capacity::MsaStorage::Dense)
+        Some(quip_solver_cuda::capacity::Storage::Dense)
     );
 }
 

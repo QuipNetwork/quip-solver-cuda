@@ -100,9 +100,9 @@ impl Precision {
     }
 }
 
-/// Device representation of the MSA coupling matrix.
+/// Device representation of the coupling matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MsaStorage {
+pub enum Storage {
     /// Two directed CSR entries per undirected coupling.
     Sparse,
     /// Row-major dense matrix storage.
@@ -141,6 +141,55 @@ impl Footprint {
     }
 }
 
+/// Device allocation estimate for the selected kernel at full width.
+///
+/// # Panics
+/// Panics for SA and Gibbs until their device-memory footprints are available.
+#[must_use]
+pub fn footprint(
+    kernel: KernelKind,
+    shape: ModelShape,
+    precision: Precision,
+    storage: Storage,
+    reads: usize,
+    betas: usize,
+    limits: &DeviceLimits,
+) -> Footprint {
+    match kernel {
+        KernelKind::Msa => msa_footprint(shape, precision, storage, reads, betas, limits),
+        KernelKind::Sa | KernelKind::Gibbs => {
+            let kernel = kernel.name();
+            panic!("{kernel} has no device-memory footprint yet")
+        }
+    }
+}
+
+/// Storage selected for a model. MSA uses dense storage above degree 62.
+/// SA and Gibbs use sparse storage until their dense paths are available.
+#[must_use]
+pub fn route_storage(
+    kernel: KernelKind,
+    shape: ModelShape,
+    _precision: Precision,
+    _reads: usize,
+    _betas: usize,
+    _limits: &DeviceLimits,
+) -> Storage {
+    match kernel {
+        KernelKind::Msa if shape.max_degree > MSA_MAX_DEGREE => Storage::Dense,
+        KernelKind::Msa | KernelKind::Sa | KernelKind::Gibbs => Storage::Sparse,
+    }
+}
+
+/// Read cap for the selected kernel on this device.
+#[must_use]
+pub fn max_reads(kernel: KernelKind, limits: &DeviceLimits) -> usize {
+    match kernel {
+        KernelKind::Msa => msa_device_reads(limits),
+        KernelKind::Sa | KernelKind::Gibbs => 256,
+    }
+}
+
 /// Device allocation estimate for MSA sessions at full width.
 ///
 /// CSR and colour tables, beta schedules and integer acceptance tables are
@@ -158,7 +207,7 @@ impl Footprint {
 pub fn msa_footprint(
     shape: ModelShape,
     precision: Precision,
-    storage: MsaStorage,
+    storage: Storage,
     reads: usize,
     betas: usize,
     limits: &DeviceLimits,
@@ -170,14 +219,14 @@ pub fn msa_footprint(
 pub(crate) fn msa_footprint_with_shared_cap(
     shape: ModelShape,
     precision: Precision,
-    storage: MsaStorage,
+    storage: Storage,
     reads: usize,
     betas: usize,
     limits: &DeviceLimits,
     shared_cap: Option<usize>,
 ) -> Footprint {
     let count = instances(KernelKind::Msa, limits.sm_count);
-    if storage == MsaStorage::Dense {
+    if storage == Storage::Dense {
         let coefficient_bytes = match precision {
             Precision::Binary | Precision::Int8 => 1,
             Precision::Int32 | Precision::Float32 => 4,
@@ -495,15 +544,6 @@ pub enum Connectivity {
 }
 
 impl Connectivity {
-    /// Storage used for this connectivity's capacity calculation.
-    #[must_use]
-    pub fn storage(self) -> MsaStorage {
-        match self {
-            Self::Degree(d) if d <= MSA_MAX_DEGREE => MsaStorage::Sparse,
-            Self::Degree(_) | Self::Complete => MsaStorage::Dense,
-        }
-    }
-
     /// Shape at a given node count, saturating for oversized requests.
     #[must_use]
     pub fn shape(self, nodes: usize) -> ModelShape {
@@ -519,6 +559,27 @@ impl Connectivity {
     }
 }
 
+/// Largest model for the selected kernel at the default beta count.
+///
+/// # Panics
+/// Panics for SA and Gibbs until their device-memory footprints are available.
+#[must_use]
+pub fn max_model(
+    kernel: KernelKind,
+    conn: Connectivity,
+    precision: Precision,
+    reads: usize,
+    limits: &DeviceLimits,
+) -> ModelShape {
+    match kernel {
+        KernelKind::Msa => msa_max_model(conn, precision, reads, limits),
+        KernelKind::Sa | KernelKind::Gibbs => {
+            let kernel = kernel.name();
+            panic!("{kernel} has no device-memory footprint yet")
+        }
+    }
+}
+
 /// Largest model that fits the default beta schedule and kernel index widths.
 #[must_use]
 pub fn msa_max_model(
@@ -527,8 +588,17 @@ pub fn msa_max_model(
     reads: usize,
     limits: &DeviceLimits,
 ) -> ModelShape {
-    let storage = conn.storage();
-    let mut high = if storage == MsaStorage::Dense {
+    // Select storage for the topology family before searching its node count.
+    // Complete-model capacity keeps dense storage even at small memory budgets.
+    let storage = route_storage(
+        KernelKind::Msa,
+        conn.shape(usize::MAX),
+        precision,
+        reads,
+        MSA_DEFAULT_BETAS,
+        limits,
+    );
+    let mut high = if storage == Storage::Dense {
         // Dense row-major matrix indices are signed 32-bit integers.
         46_340
     } else {
@@ -630,7 +700,7 @@ fn msa_max_fitting(
         let footprint = msa_footprint(
             shape(mid),
             Precision::Binary,
-            MsaStorage::Sparse,
+            Storage::Sparse,
             reads,
             MSA_DEFAULT_BETAS,
             limits,
@@ -775,6 +845,88 @@ mod tests {
     }
 
     #[test]
+    fn msa_dispatch_matches_msa_footprint() {
+        let limits = a4000_limits();
+        let shape = Connectivity::Degree(20).shape(64_000);
+        for precision in [
+            Precision::Binary,
+            Precision::Int8,
+            Precision::Int32,
+            Precision::Float32,
+        ] {
+            assert_eq!(
+                footprint(
+                    KernelKind::Msa,
+                    shape,
+                    precision,
+                    Storage::Sparse,
+                    128,
+                    MSA_DEFAULT_BETAS,
+                    &limits
+                ),
+                msa_footprint(
+                    shape,
+                    precision,
+                    Storage::Sparse,
+                    128,
+                    MSA_DEFAULT_BETAS,
+                    &limits
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn msa_max_model_unchanged_by_dispatch() {
+        let limits = a4000_limits();
+        for conn in [
+            Connectivity::Degree(20),
+            Connectivity::Degree(60),
+            Connectivity::Complete,
+        ] {
+            for precision in [
+                Precision::Binary,
+                Precision::Int8,
+                Precision::Int32,
+                Precision::Float32,
+            ] {
+                assert_eq!(
+                    max_model(KernelKind::Msa, conn, precision, 128, &limits),
+                    msa_max_model(conn, precision, 128, &limits),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn msa_routes_by_degree() {
+        let limits = a4000_limits();
+        let at = |d| {
+            route_storage(
+                KernelKind::Msa,
+                Connectivity::Degree(d).shape(10_000),
+                Precision::Binary,
+                128,
+                64,
+                &limits,
+            )
+        };
+        assert_eq!(at(62), Storage::Sparse);
+        assert_eq!(at(63), Storage::Dense);
+    }
+
+    #[test]
+    fn max_reads_per_kernel() {
+        let limits = a4000_limits();
+        assert_eq!(max_reads(KernelKind::Sa, &limits), 256);
+        assert_eq!(max_reads(KernelKind::Gibbs, &limits), 256);
+        assert_eq!(
+            max_reads(KernelKind::Msa, &limits),
+            msa_device_reads(&limits)
+        );
+    }
+
+    #[test]
     fn msa_accepts_a_million_uncoupled_nodes_when_the_footprint_fits() {
         let limits = a4000_limits();
         let shape = ModelShape {
@@ -783,15 +935,7 @@ mod tests {
             max_degree: 0,
         };
         assert!(
-            msa_footprint(
-                shape,
-                Precision::Binary,
-                MsaStorage::Sparse,
-                128,
-                64,
-                &limits
-            )
-            .total()
+            msa_footprint(shape, Precision::Binary, Storage::Sparse, 128, 64, &limits).total()
                 <= limits.usable_bytes()
         );
         assert_eq!(
@@ -817,33 +961,11 @@ mod tests {
             couplers: c,
             max_degree: 40,
         };
-        let u = msa_footprint(
-            s(2_000_000),
-            Precision::Binary,
-            MsaStorage::Sparse,
-            128,
-            1,
-            &l,
-        );
-        let w = msa_footprint(
-            s(2_000_000),
-            Precision::Int32,
-            MsaStorage::Sparse,
-            128,
-            1,
-            &l,
-        );
+        let u = msa_footprint(s(2_000_000), Precision::Binary, Storage::Sparse, 128, 1, &l);
+        let w = msa_footprint(s(2_000_000), Precision::Int32, Storage::Sparse, 128, 1, &l);
         assert!(w.total() > u.total());
         assert!(
-            msa_footprint(
-                s(4_000_000),
-                Precision::Binary,
-                MsaStorage::Sparse,
-                128,
-                1,
-                &l
-            )
-            .total()
+            msa_footprint(s(4_000_000), Precision::Binary, Storage::Sparse, 128, 1, &l).total()
                 > u.total()
         );
         assert_eq!(u.instances, 48);
@@ -896,8 +1018,8 @@ mod tests {
             couplers: 2_000_000,
             max_degree: 40,
         };
-        let narrow = msa_footprint(shape, Precision::Int8, MsaStorage::Sparse, 128, 1, &l);
-        let wide = msa_footprint(shape, Precision::Int32, MsaStorage::Sparse, 128, 1, &l);
+        let narrow = msa_footprint(shape, Precision::Int8, Storage::Sparse, 128, 1, &l);
+        let wide = msa_footprint(shape, Precision::Int32, Storage::Sparse, 128, 1, &l);
         // Three slots, two directed halves per edge, three extra bytes per coefficient.
         assert_eq!(
             wide.per_instance_bytes - narrow.per_instance_bytes,
@@ -913,8 +1035,8 @@ mod tests {
             couplers: 2_000_000,
             max_degree: 40,
         };
-        let one = msa_footprint(shape, Precision::Binary, MsaStorage::Sparse, 64, 1, &l);
-        let two = msa_footprint(shape, Precision::Binary, MsaStorage::Sparse, 128, 1, &l);
+        let one = msa_footprint(shape, Precision::Binary, Storage::Sparse, 64, 1, &l);
+        let two = msa_footprint(shape, Precision::Binary, Storage::Sparse, 128, 1, &l);
         // 64 more reads in three sample/energy slots, plus the larger spill.
         assert_eq!(two.per_instance_bytes - one.per_instance_bytes, 3_200_768);
         let mut no_shared = l;
@@ -922,7 +1044,7 @@ mod tests {
         let spilled = msa_footprint(
             shape,
             Precision::Binary,
-            MsaStorage::Sparse,
+            Storage::Sparse,
             128,
             1,
             &no_shared,
@@ -939,7 +1061,7 @@ mod tests {
                 max_degree: 1_999,
             },
             Precision::Binary,
-            MsaStorage::Dense,
+            Storage::Dense,
             128,
             64,
             &a4000_limits(),
@@ -969,7 +1091,7 @@ mod tests {
                         max_degree: 0,
                     },
                     precision,
-                    MsaStorage::Dense,
+                    Storage::Dense,
                     128,
                     64,
                     &limits,
@@ -1012,7 +1134,7 @@ mod tests {
                     max_degree: 1_999,
                 },
                 precision,
-                MsaStorage::Dense,
+                Storage::Dense,
                 128,
                 64,
                 &a4000_limits(),
@@ -1031,7 +1153,7 @@ mod tests {
                 max_degree: usize::MAX,
             },
             Precision::Int32,
-            MsaStorage::Sparse,
+            Storage::Sparse,
             usize::MAX,
             1,
             &a4000_limits(),
@@ -1061,11 +1183,11 @@ mod tests {
         for (precision, bytes_per_beta) in [(Precision::Binary, 4), (Precision::Int32, 16)] {
             for betas in [1, 65_536] {
                 let extra = 17;
-                let base = msa_footprint(shape, precision, MsaStorage::Sparse, 128, betas, &limits);
+                let base = msa_footprint(shape, precision, Storage::Sparse, 128, betas, &limits);
                 let longer = msa_footprint(
                     shape,
                     precision,
-                    MsaStorage::Sparse,
+                    Storage::Sparse,
                     128,
                     betas + extra,
                     &limits,
@@ -1086,7 +1208,7 @@ mod tests {
         };
         for precision in [Precision::Binary, Precision::Int32] {
             let footprint =
-                |betas| msa_footprint(shape, precision, MsaStorage::Sparse, 128, betas, &limits);
+                |betas| msa_footprint(shape, precision, Storage::Sparse, 128, betas, &limits);
             assert_eq!(footprint(0), footprint(1));
             assert_eq!(footprint(usize::MAX).total(), usize::MAX);
         }
@@ -1466,7 +1588,14 @@ mod tests {
                     msa_footprint(
                         shape,
                         Precision::Binary,
-                        conn.storage(),
+                        route_storage(
+                            KernelKind::Msa,
+                            shape,
+                            Precision::Binary,
+                            128,
+                            MSA_DEFAULT_BETAS,
+                            &limits,
+                        ),
                         128,
                         MSA_DEFAULT_BETAS,
                         &limits,
@@ -1514,38 +1643,32 @@ mod tests {
                     if shape.nodes == 0 {
                         continue;
                     }
+                    let storage = route_storage(
+                        KernelKind::Msa,
+                        shape,
+                        precision,
+                        128,
+                        MSA_DEFAULT_BETAS,
+                        &limits,
+                    );
                     assert!(
-                        msa_footprint(
-                            shape,
-                            precision,
-                            conn.storage(),
-                            128,
-                            MSA_DEFAULT_BETAS,
-                            &limits
-                        )
-                        .total()
+                        msa_footprint(shape, precision, storage, 128, MSA_DEFAULT_BETAS, &limits)
+                            .total()
                             <= limits.usable_bytes()
                     );
-                    if conn.storage() == MsaStorage::Dense {
+                    if storage == Storage::Dense {
                         assert!(i32::try_from(shape.nodes * shape.nodes).is_ok());
                     } else {
                         assert!(i32::try_from(shape.couplers * 2 + 20).is_ok());
                     }
                     let next = conn.shape(shape.nodes + 1);
                     assert!(
-                        msa_footprint(
-                            next,
-                            precision,
-                            conn.storage(),
-                            128,
-                            MSA_DEFAULT_BETAS,
-                            &limits
-                        )
-                        .total()
+                        msa_footprint(next, precision, storage, 128, MSA_DEFAULT_BETAS, &limits)
+                            .total()
                             > limits.usable_bytes()
-                            || (conn.storage() == MsaStorage::Dense
+                            || (storage == Storage::Dense
                                 && i32::try_from(next.nodes * next.nodes).is_err())
-                            || (conn.storage() == MsaStorage::Sparse
+                            || (storage == Storage::Sparse
                                 && (i32::try_from(next.couplers * 2 + 20).is_err()
                                     || i32::try_from(
                                         next.nodes * 2 + MSA_THREADS_PER_NONCE as usize

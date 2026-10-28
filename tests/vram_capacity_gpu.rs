@@ -2,7 +2,7 @@
 
 use cudarc::driver::{sys::CUdevice_attribute, CudaContext};
 use quip_solver_cuda::capacity::{
-    msa_device_reads, msa_footprint, DeviceLimits, ModelShape, MsaStorage, Precision,
+    msa_device_reads, msa_footprint, DeviceLimits, ModelShape, Precision, Storage,
 };
 use quip_solver_cuda::coefficients;
 use quip_solver_cuda::cuda_device::CudaDevice;
@@ -154,7 +154,7 @@ fn footprint_matches_measured_allocation() {
                     max_degree: degree,
                 },
                 precision,
-                MsaStorage::Sparse,
+                Storage::Sparse,
                 params.num_reads,
                 betas,
                 &limits,
@@ -264,7 +264,7 @@ fn measure_dense_allocation(
             max_degree: nodes - 1,
         },
         precision,
-        MsaStorage::Dense,
+        Storage::Dense,
         num_reads,
         1,
         &device.limits,
@@ -370,7 +370,7 @@ fn dense_oversized_model_refused_before_allocation() {
     ctx.synchronize().unwrap();
     let (before, _) = ctx.mem_get_info().unwrap();
     let error =
-        quip_solver_cuda::streaming::sample_one_real_forced(&device, &graph, &p, MsaStorage::Dense)
+        quip_solver_cuda::streaming::sample_one_real_forced(&device, &graph, &p, Storage::Dense)
             .unwrap_err();
     let SampleError::ModelExceedsDeviceMemory {
         nodes,
@@ -406,7 +406,7 @@ fn degree_62_sparse_63_dense() {
     sample_ising(&device, &graph, &p, KernelKind::Msa).unwrap();
     assert_eq!(
         quip_solver_cuda::streaming::last_storage(&device),
-        Some(MsaStorage::Sparse)
+        Some(Storage::Sparse)
     );
     let mut graph = graph;
     let mut edges = graph.edges.to_vec();
@@ -416,7 +416,7 @@ fn degree_62_sparse_63_dense() {
     sample_ising(&device, &graph, &p, KernelKind::Msa).unwrap();
     assert_eq!(
         quip_solver_cuda::streaming::last_storage(&device),
-        Some(MsaStorage::Dense)
+        Some(Storage::Dense)
     );
 }
 

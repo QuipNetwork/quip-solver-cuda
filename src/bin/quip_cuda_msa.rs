@@ -10,7 +10,7 @@ use quip_solver_core::{run, CommonArgs};
 use quip_solver_cuda::bench::{run_bench, BenchAction};
 use quip_solver_cuda::capacity::{
     instances, msa_device_reads, msa_max_couplers, msa_max_nodes, msa_per_instance_budget, resolve,
-    Connectivity, MsaStorage, MSA_DEFAULT_BETAS, MSA_DEFAULT_NODES,
+    Connectivity, Storage, MSA_DEFAULT_BETAS, MSA_DEFAULT_NODES,
 };
 use quip_solver_cuda::cuda_device::{device_label_mismatch, CudaDevice};
 use quip_solver_cuda::nvml_gov::UtilGovernor;
@@ -157,7 +157,7 @@ fn print_probe(device: &CudaDevice, reads: usize, json: bool) {
         let cells: Vec<_> = cells.iter().map(|cell| serde_json::json!({
             "connectivity": connectivity(cell.connectivity),
             "precision": format!("{:?}", cell.precision),
-            "storage": match cell.storage { MsaStorage::Sparse => "Sparse", MsaStorage::Dense => "Dense" },
+            "storage": match cell.storage { Storage::Sparse => "Sparse", Storage::Dense => "Dense" },
             "tier": cell.tier(), "spill": cell.spill,
             "nodes": cell.nodes, "couplers": cell.couplers,
             "per_instance_bytes": cell.per_instance_bytes,

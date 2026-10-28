@@ -1,9 +1,10 @@
 //! MSA capacity grid derived from the session allocation model.
 
 use crate::capacity::{
-    msa_dynamic_shared_bytes, msa_footprint, msa_max_model, msa_spin_layout, Connectivity,
-    DeviceLimits, MsaStorage, Precision, MSA_DEFAULT_BETAS,
+    max_model, msa_dynamic_shared_bytes, msa_footprint, msa_spin_layout, route_storage,
+    Connectivity, DeviceLimits, Precision, Storage, MSA_DEFAULT_BETAS,
 };
+use crate::kernel::KernelKind;
 
 /// One capacity cell at fixed connectivity, precision, reads, and beta count.
 #[derive(Debug, Clone)]
@@ -13,7 +14,7 @@ pub struct ProbeCell {
     /// Coefficient storage and arithmetic tier.
     pub precision: Precision,
     /// Sparse CSR or dense matrix.
-    pub storage: MsaStorage,
+    pub storage: Storage,
     /// Whether sparse spins extend beyond shared memory.
     pub spill: bool,
     /// Largest supported variable count.
@@ -32,9 +33,9 @@ impl ProbeCell {
     #[must_use]
     pub fn tier(&self) -> &'static str {
         match (self.storage, self.spill) {
-            (MsaStorage::Dense, _) => "dense",
-            (MsaStorage::Sparse, true) => "spill",
-            (MsaStorage::Sparse, false) => "shared",
+            (Storage::Dense, _) => "dense",
+            (Storage::Sparse, true) => "spill",
+            (Storage::Sparse, false) => "shared",
         }
     }
 }
@@ -54,8 +55,16 @@ pub fn probe(limits: &DeviceLimits, reads: usize) -> Vec<ProbeCell> {
             Precision::Int32,
             Precision::Float32,
         ] {
-            let shape = msa_max_model(connectivity, precision, reads, limits);
-            let storage = connectivity.storage();
+            let shape = max_model(KernelKind::Msa, connectivity, precision, reads, limits);
+            // Match the capacity search's storage, including small complete models.
+            let storage = route_storage(
+                KernelKind::Msa,
+                connectivity.shape(usize::MAX),
+                precision,
+                reads,
+                MSA_DEFAULT_BETAS,
+                limits,
+            );
             let footprint =
                 msa_footprint(shape, precision, storage, reads, MSA_DEFAULT_BETAS, limits);
             let (_, shared_spins) = msa_spin_layout(
@@ -68,7 +77,7 @@ pub fn probe(limits: &DeviceLimits, reads: usize) -> Vec<ProbeCell> {
                 connectivity,
                 precision,
                 storage,
-                spill: storage == MsaStorage::Sparse && shared_spins < shape.nodes,
+                spill: storage == Storage::Sparse && shared_spins < shape.nodes,
                 nodes: shape.nodes,
                 couplers: shape.couplers,
                 per_instance_bytes: footprint.per_instance_bytes,
@@ -161,8 +170,24 @@ mod tests {
         let mut limits = a4000_limits();
         let conn = Connectivity::Degree(20);
         let shape = conn.shape(10_000);
-        let float = msa_footprint(shape, Precision::Float32, conn.storage(), 128, 64, &limits);
-        let integer = msa_footprint(shape, Precision::Int32, conn.storage(), 128, 64, &limits);
+        let storage =
+            |precision| route_storage(KernelKind::Msa, shape, precision, 128, 64, &limits);
+        let float = msa_footprint(
+            shape,
+            Precision::Float32,
+            storage(Precision::Float32),
+            128,
+            64,
+            &limits,
+        );
+        let integer = msa_footprint(
+            shape,
+            Precision::Int32,
+            storage(Precision::Int32),
+            128,
+            64,
+            &limits,
+        );
         assert_eq!(integer.total() - float.total(), 525_056);
         limits.free_bytes = (float.total() + 100).div_ceil(4) * 5;
         assert!(float.total() <= limits.usable_bytes());
@@ -178,7 +203,7 @@ mod tests {
         assert!(cell(Precision::Int32).nodes < shape.nodes);
         assert_eq!(
             cell(Precision::Int32).nodes,
-            msa_max_model(conn, Precision::Int32, 128, &limits).nodes
+            max_model(KernelKind::Msa, conn, Precision::Int32, 128, &limits).nodes
         );
     }
 

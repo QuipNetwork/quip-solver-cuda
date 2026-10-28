@@ -269,7 +269,7 @@ fn msa_routes_k64_on_unit_and_weighted_paths() {
             );
             assert_eq!(
                 quip_solver_cuda::streaming::last_storage(dev),
-                Some(quip_solver_cuda::capacity::MsaStorage::Dense)
+                Some(quip_solver_cuda::capacity::Storage::Dense)
             );
         }
     }

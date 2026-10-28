@@ -362,7 +362,7 @@ pub struct CudaDevice {
     /// nonce, 64 reads per replica word.
     pub(crate) msa: CudaFunction,
     pub(crate) msa_dense: CudaFunction,
-    pub(crate) last_msa_storage: std::sync::Mutex<Option<capacity::MsaStorage>>,
+    pub(crate) last_msa_storage: std::sync::Mutex<Option<capacity::Storage>>,
     /// Weighted storage/lane variants, available only on MSA opens.
     pub(crate) msa_weighted: Option<MsaWeightedKernels>,
     /// Dynamic shared memory one msa block may request: the device's opt-in
