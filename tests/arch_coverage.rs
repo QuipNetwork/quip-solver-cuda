@@ -122,6 +122,25 @@ fn every_supported_arch_compiles_and_assembles_every_kernel() {
                 &[][..],
             ),
             ("sa-wide", SA_SRC, 512, &[SA_WIDE_DEFINE][..]),
+            ("sa-dense", SA_SRC, 5000, &["-DQUIP_SA_DENSE"][..]),
+            (
+                "sa-wi8-dense",
+                SA_SRC,
+                5000,
+                &["-DQUIP_SA_DENSE", "-DQUIP_SA_COEF_I8_DELTA_I32"][..],
+            ),
+            (
+                "sa-wide-dense",
+                SA_SRC,
+                5000,
+                &["-DQUIP_SA_DENSE", SA_WIDE_DEFINE][..],
+            ),
+            (
+                "sa-f32-dense",
+                SA_SRC,
+                5000,
+                &["-DQUIP_SA_DENSE", "-DQUIP_SA_COEF_F32"][..],
+            ),
             ("sa-global", SA_SRC, 5000, &["-DQUIP_SA_GLOBAL_STATE"][..]),
             (
                 "sa-wide-global",

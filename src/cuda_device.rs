@@ -306,6 +306,10 @@ pub(crate) struct SaVariants {
     pub int8_global: CudaFunction,
     pub real: CudaFunction,
     pub real_global: CudaFunction,
+    pub dense: CudaFunction,
+    pub int8_dense: CudaFunction,
+    pub wide_dense: CudaFunction,
+    pub real_dense: CudaFunction,
 }
 
 /// Compile additional SA variants only for an SA device open.
@@ -334,6 +338,10 @@ fn compile_sa_variants(ctx: &Arc<CudaContext>) -> Result<SaVariants, CudaError> 
         int8_global: compile("sa-wi8-global", &[SA_GLOBAL_DEFINE, SA_COEF_I8_DEFINE])?,
         real: compile("sa-f32", &[SA_COEF_F32_DEFINE])?,
         real_global: compile("sa-f32-global", &[SA_GLOBAL_DEFINE, SA_COEF_F32_DEFINE])?,
+        dense: compile("sa-dense", &["-DQUIP_SA_DENSE"])?,
+        int8_dense: compile("sa-wi8-dense", &["-DQUIP_SA_DENSE", SA_COEF_I8_DEFINE])?,
+        wide_dense: compile("sa-wide-dense", &["-DQUIP_SA_DENSE", SA_WIDE_DEFINE])?,
+        real_dense: compile("sa-f32-dense", &["-DQUIP_SA_DENSE", SA_COEF_F32_DEFINE])?,
     })
 }
 
@@ -409,7 +417,7 @@ pub struct CudaDevice {
     /// nonce, 64 reads per replica word.
     pub(crate) msa: CudaFunction,
     pub(crate) msa_dense: CudaFunction,
-    pub(crate) last_msa_storage: std::sync::Mutex<Option<capacity::Storage>>,
+    pub(crate) last_storage: std::sync::Mutex<Option<capacity::Storage>>,
     /// Weighted storage/lane variants, available only on MSA opens.
     pub(crate) msa_weighted: Option<MsaWeightedKernels>,
     /// Dynamic shared memory one msa block may request: the device's opt-in
@@ -630,7 +638,7 @@ impl CudaDevice {
             gibbs,
             msa,
             msa_dense,
-            last_msa_storage: std::sync::Mutex::new(None),
+            last_storage: std::sync::Mutex::new(None),
             msa_weighted,
             msa_dynamic_shared_bytes,
             msa_shared_spins_cap: None,

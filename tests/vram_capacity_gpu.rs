@@ -198,65 +198,82 @@ fn footprint_matches_measured_allocation() {
 }
 
 fn sa_allocation_cases() {
-    let nodes = 20_000;
-    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, nodes).unwrap();
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 20_000).unwrap();
     let ctx = CudaContext::new(0).unwrap();
-    for precision in [
-        Precision::Binary,
-        Precision::Int8,
-        Precision::Int32,
-        Precision::Float32,
-    ] {
-        let graph = circulant(nodes, 20, precision);
-        let params = SampleParams {
-            num_reads: 256,
-            num_sweeps: 1,
-            ..SampleParams::default()
+    for storage in [Storage::Sparse, Storage::Dense] {
+        let nodes = if storage == Storage::Dense {
+            2_000
+        } else {
+            20_000
         };
-        let footprint = quip_solver_cuda::capacity::sa_footprint(
-            ModelShape {
-                nodes,
-                couplers: graph.edges.len(),
-                max_degree: 20,
-            },
-            precision,
-            Storage::Sparse,
-            256,
-            1,
-            &device.limits,
-        );
-        ctx.synchronize().unwrap();
-        let (before, _) = ctx.mem_get_info().unwrap();
-        let free = Arc::new(AtomicUsize::new(0));
-        let observer = AllocationAtLaunch {
-            ctx: Arc::clone(&ctx),
-            free: Arc::clone(&free),
-        };
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(observer), || {
-            if precision == Precision::Float32 {
-                bench_many_real(&device, &graph, &params, footprint.instances).unwrap();
+        for precision in [
+            Precision::Binary,
+            Precision::Int8,
+            Precision::Int32,
+            Precision::Float32,
+        ] {
+            let graph = if storage == Storage::Dense {
+                dense_graph(nodes, precision)
             } else {
-                bench_many(
-                    &device,
-                    &graph,
-                    &params,
-                    KernelKind::Sa,
-                    None,
-                    footprint.instances,
-                )
-                .unwrap();
-            }
-        });
-        let after = free.load(Ordering::SeqCst);
-        assert_ne!(after, 0);
-        let measured = before.checked_sub(after).unwrap();
-        eprintln!(
-            "sa precision={precision:?} measured={measured} footprint={}",
-            footprint.total()
-        );
-        assert!(measured > 0);
-        assert!(measured <= footprint.total());
-        assert!(footprint.total() - measured <= measured / 10 + (64 << 20));
+                circulant(nodes, 20, precision)
+            };
+            let params = SampleParams {
+                num_reads: 256,
+                num_sweeps: 1,
+                ..SampleParams::default()
+            };
+            let footprint = quip_solver_cuda::capacity::sa_footprint(
+                ModelShape {
+                    nodes,
+                    couplers: graph.edges.len(),
+                    max_degree: if storage == Storage::Dense {
+                        nodes - 1
+                    } else {
+                        20
+                    },
+                },
+                precision,
+                storage,
+                256,
+                1,
+                &device.limits,
+            );
+            ctx.synchronize().unwrap();
+            let (before, _) = ctx.mem_get_info().unwrap();
+            let free = Arc::new(AtomicUsize::new(0));
+            let observer = AllocationAtLaunch {
+                ctx: Arc::clone(&ctx),
+                free: Arc::clone(&free),
+            };
+            tracing::subscriber::with_default(
+                tracing_subscriber::registry().with(observer),
+                || {
+                    if precision == Precision::Float32 {
+                        bench_many_real(&device, &graph, &params, footprint.instances).unwrap();
+                    } else {
+                        bench_many(
+                            &device,
+                            &graph,
+                            &params,
+                            KernelKind::Sa,
+                            None,
+                            footprint.instances,
+                        )
+                        .unwrap();
+                    }
+                },
+            );
+            let after = free.load(Ordering::SeqCst);
+            assert_ne!(after, 0);
+            let measured = before.checked_sub(after).unwrap();
+            eprintln!(
+                "sa storage={storage:?} precision={precision:?} measured={measured} footprint={}",
+                footprint.total()
+            );
+            assert!(measured > 0);
+            assert!(measured <= footprint.total());
+            assert!(footprint.total() - measured <= measured / 10 + (64 << 20));
+        }
     }
 }
 

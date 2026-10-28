@@ -154,19 +154,28 @@ pub fn footprint(
 }
 
 /// Storage selected for a model. MSA uses dense storage above degree 62.
-/// SA and Gibbs use sparse storage until their dense paths are available.
+/// SA chooses the smaller footprint. Gibbs uses sparse storage.
 #[must_use]
 pub fn route_storage(
     kernel: KernelKind,
     shape: ModelShape,
-    _precision: Precision,
-    _reads: usize,
-    _betas: usize,
-    _limits: &DeviceLimits,
+    precision: Precision,
+    reads: usize,
+    betas: usize,
+    limits: &DeviceLimits,
 ) -> Storage {
     match kernel {
         KernelKind::Msa if shape.max_degree > MSA_MAX_DEGREE => Storage::Dense,
-        KernelKind::Msa | KernelKind::Sa | KernelKind::Gibbs => Storage::Sparse,
+        KernelKind::Sa => {
+            let dense = sa_footprint(shape, precision, Storage::Dense, reads, betas, limits);
+            let sparse = sa_footprint(shape, precision, Storage::Sparse, reads, betas, limits);
+            if dense.total() <= sparse.total() {
+                Storage::Dense
+            } else {
+                Storage::Sparse
+            }
+        }
+        KernelKind::Msa | KernelKind::Gibbs => Storage::Sparse,
     }
 }
 
@@ -306,13 +315,11 @@ pub(crate) fn msa_footprint_with_shared_cap(
     }
 }
 
-/// SA sparse session allocation bound at full launch width.
+/// SA session allocation bound at full launch width.
 /// Output slots are bounded at 256 reads regardless of the requested count.
 /// Global spins and deltas use one element per launched thread and node.
-/// The fixed mining frame is reserved at resident-thread occupancy.
-///
-/// # Panics
-/// Panics for dense storage until the SA dense path is available.
+/// Sparse mining frames are reserved at resident-thread occupancy.
+/// Dense sessions always use global state.
 #[must_use]
 pub fn sa_footprint(
     shape: ModelShape,
@@ -322,30 +329,36 @@ pub fn sa_footprint(
     betas: usize,
     limits: &DeviceLimits,
 ) -> Footprint {
-    assert_eq!(
-        storage,
-        Storage::Sparse,
-        "SA dense storage is not implemented"
-    );
     let n = shape.nodes;
-    let nnz = shape.couplers.saturating_mul(2).max(1);
+    let nnz = match storage {
+        Storage::Sparse => shape.couplers.saturating_mul(2).max(1),
+        Storage::Dense => n.saturating_mul(n).max(1),
+    };
     let coef_bytes = match precision {
         Precision::Binary | Precision::Int8 => 1,
         Precision::Int32 | Precision::Float32 => 4,
     };
-    let mut shared = n
-        .saturating_add(1)
-        .saturating_add(nnz)
-        .saturating_mul(4)
+    let topology_bytes = match storage {
+        Storage::Sparse => n.saturating_add(1).saturating_add(nnz).saturating_mul(4),
+        Storage::Dense => 8, // Empty CSR arrays each retain one i32 stand-in.
+    };
+    let mut shared = topology_bytes
         .saturating_add(betas.max(1).saturating_mul(4))
         .saturating_add(POOL_ALLOWANCE_BYTES);
-    let delta_bytes = if precision == Precision::Binary { 1 } else { 4 };
-    if precision == Precision::Int8 || precision == Precision::Int32 {
+    // Unit fields can add one to the degree. Above 62, reserve the i32
+    // delta path even when every coupling is binary.
+    let wide_binary = precision == Precision::Binary && shape.max_degree > 62;
+    let delta_bytes = if precision == Precision::Binary && !wide_binary {
+        1
+    } else {
+        4
+    };
+    if precision == Precision::Int8 || precision == Precision::Int32 || wide_binary {
         shared = shared
             .saturating_add(betas.max(1).saturating_mul(12))
             .saturating_add(crate::accept_table::NEGLOG_LEN * 8);
     }
-    if n <= SA_DEFAULT_NODES {
+    if storage == Storage::Sparse && n <= SA_DEFAULT_NODES {
         shared = shared.saturating_add(
             (SA_DEFAULT_NODES + SA_DEFAULT_NODES.div_ceil(8))
                 .saturating_mul(limits.threads_per_sm)
@@ -552,37 +565,29 @@ pub fn max_model(
             } else {
                 high = high.min(46_340);
             }
-            // The local frame disappears above the mining threshold. Search
-            // the global interval first, then the local interval if none fits.
-            let first_global = SA_DEFAULT_NODES + 1;
-            let global_fits = first_global <= high
-                && sa_footprint(
-                    conn.shape(first_global),
+            let at = |n| {
+                let shape = conn.shape(n);
+                let storage = route_storage(
+                    KernelKind::Sa,
+                    shape,
                     precision,
-                    Storage::Sparse,
                     reads,
                     MSA_DEFAULT_BETAS,
                     limits,
-                )
-                .total()
-                    <= limits.usable_bytes();
+                );
+                sa_footprint(shape, precision, storage, reads, MSA_DEFAULT_BETAS, limits).total()
+            };
+            // The local frame disappears above the mining threshold. Search
+            // the global interval first, then the local interval if none fits.
+            let first_global = SA_DEFAULT_NODES + 1;
+            let global_fits = first_global <= high && at(first_global) <= limits.usable_bytes();
             let mut low = if global_fits { first_global } else { 0 };
             if !global_fits {
                 high = high.min(SA_DEFAULT_NODES);
             }
             while low < high {
                 let mid = low + (high - low).div_ceil(2);
-                if sa_footprint(
-                    conn.shape(mid),
-                    precision,
-                    Storage::Sparse,
-                    reads,
-                    MSA_DEFAULT_BETAS,
-                    limits,
-                )
-                .total()
-                    <= limits.usable_bytes()
-                {
+                if at(mid) <= limits.usable_bytes() {
                     low = mid;
                 } else {
                     high = mid - 1;
@@ -878,6 +883,51 @@ mod tests {
     #[test]
     fn sa_instances_follow_sm_count() {
         assert_eq!(instances(KernelKind::Sa, 48), 48);
+    }
+
+    #[test]
+    fn sa_routes_complete_graphs_dense() {
+        let limits = a4000_limits();
+        let shape = Connectivity::Complete.shape(2_000);
+        assert_eq!(
+            route_storage(KernelKind::Sa, shape, Precision::Int8, 256, 64, &limits),
+            Storage::Dense
+        );
+        let sparse = Connectivity::Degree(20).shape(2_000);
+        assert_eq!(
+            route_storage(KernelKind::Sa, sparse, Precision::Int8, 256, 64, &limits),
+            Storage::Sparse
+        );
+    }
+
+    #[test]
+    fn sa_dense_binary_capacity_includes_wide_deltas() {
+        let limits = a4000_limits();
+        let shape = Connectivity::Complete.shape(2_000);
+        assert_eq!(
+            sa_footprint(shape, Precision::Binary, Storage::Dense, 32, 64, &limits),
+            sa_footprint(shape, Precision::Int8, Storage::Dense, 32, 64, &limits),
+        );
+        let model = max_model(
+            KernelKind::Sa,
+            Connectivity::Complete,
+            Precision::Binary,
+            32,
+            &limits,
+        );
+        let at = |n| {
+            sa_footprint(
+                Connectivity::Complete.shape(n),
+                Precision::Binary,
+                Storage::Dense,
+                32,
+                64,
+                &limits,
+            )
+            .total()
+        };
+        assert!(at(model.nodes) <= limits.usable_bytes());
+        assert!(at(model.nodes + 1) > limits.usable_bytes());
     }
 
     #[test]

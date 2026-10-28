@@ -599,23 +599,25 @@ fn session_topology(
         }
     }
     let max_degree = degrees.into_iter().max().unwrap_or(0);
-    let storage = if kernel == KernelKind::Msa {
-        forced.unwrap_or(if max_degree > capacity::MSA_MAX_DEGREE {
-            capacity::Storage::Dense
-        } else {
-            capacity::Storage::Sparse
-        })
-    } else {
-        capacity::Storage::Sparse
+    let shape = capacity::ModelShape {
+        nodes: n,
+        couplers: graph.edges.len(),
+        max_degree,
     };
+    let storage = forced.unwrap_or_else(|| {
+        capacity::route_storage(
+            kernel,
+            shape,
+            capacity::Precision::from_plan(arithmetic.coefficients, true),
+            reads,
+            betas,
+            &device.limits,
+        )
+    });
     check_model_capacity(
         device,
         kernel,
-        capacity::ModelShape {
-            nodes: n,
-            couplers: graph.edges.len(),
-            max_degree,
-        },
+        shape,
         storage,
         reads,
         betas,
@@ -640,7 +642,7 @@ fn session_topology(
         let ji = v * n + u;
         if seen[ij / 8] & (1 << (ij % 8)) != 0 {
             return Err(SampleError::Unsupported(
-                "dense MSA requires unique couplers".into(),
+                "dense storage requires unique couplers".into(),
             ));
         }
         seen[ij / 8] |= 1 << (ij % 8);
@@ -811,8 +813,9 @@ fn sa_global_state(
     stream: &Arc<CudaStream>,
     nodes: usize,
     nonces: usize,
+    dense: bool,
 ) -> Result<Option<CudaSlice<i8>>, SampleError> {
-    if nodes <= capacity::SA_DEFAULT_NODES && !device.sa_force_global {
+    if nodes <= capacity::SA_DEFAULT_NODES && !device.sa_force_global && !dense {
         return Ok(None);
     }
     if device.sa_variants.is_none() {
@@ -829,20 +832,21 @@ fn sa_global_state(
 fn build_sa_state(
     device: &CudaDevice,
     stream: &Arc<CudaStream>,
-    n: usize,
+    topology: &SelfFeedingTopology,
     num_nonces: usize,
     max_num_betas: usize,
     path: CoefficientPath,
 ) -> Result<AlgoState, SampleError> {
+    let n = topology.n;
     let total_threads = num_nonces * 256;
     if path == CoefficientPath::Float32 {
         return Ok(AlgoState::SaReal {
-            d_state: sa_global_state(device, stream, n, num_nonces)?,
+            d_state: sa_global_state(device, stream, n, num_nonces, topology.row_ptr.is_empty())?,
             d_delta_energy: stream.alloc_zeros::<f32>(total_threads * n.max(1))?,
         });
     }
     Ok(AlgoState::SaWide {
-        d_state: sa_global_state(device, stream, n, num_nonces)?,
+        d_state: sa_global_state(device, stream, n, num_nonces, topology.row_ptr.is_empty())?,
         d_delta_energy: stream.alloc_zeros::<i32>(total_threads * n.max(1))?,
         d_beta_fixed: stream.alloc_zeros::<i64>(max_num_betas.max(1))?,
         d_delta_cut: stream.alloc_zeros::<i32>(max_num_betas.max(1))?,
@@ -872,7 +876,13 @@ fn build_algo_state(
         KernelKind::Sa => {
             let total_threads = num_nonces * 256;
             Ok(AlgoState::Sa {
-                d_state: sa_global_state(device, stream, topology.n, num_nonces)?,
+                d_state: sa_global_state(
+                    device,
+                    stream,
+                    topology.n,
+                    num_nonces,
+                    topology.row_ptr.is_empty(),
+                )?,
                 d_delta_energy: stream.alloc_zeros::<i8>(total_threads * topology.n.max(1))?,
             })
         }
@@ -1062,7 +1072,7 @@ impl<'a> SelfFeedingSession<'a> {
             build_sa_state(
                 device,
                 &stream_compute,
-                n,
+                &topology,
                 num_nonces,
                 max_num_betas,
                 plan.path,
@@ -1549,20 +1559,25 @@ impl<'a> SelfFeedingSession<'a> {
             return Err(SampleError::Driver("launch_sa without SA state".into()));
         };
         let global = d_state.is_some();
-        let function = match (self.plan.path, global) {
-            (CoefficientPath::Int8, false) => &self.device.sa,
-            (CoefficientPath::Wide, false) => &self.device.sa_wide,
-            (path, global) => {
+        let dense = self.topology.row_ptr.is_empty();
+        let function = match (self.plan.path, global, dense) {
+            (CoefficientPath::Int8, false, false) => &self.device.sa,
+            (CoefficientPath::Wide, false, false) => &self.device.sa_wide,
+            (path, global, dense) => {
                 let kernels = self.device.sa_variants.as_ref().ok_or_else(|| {
                     SampleError::Unsupported("SA variants require an SA device open".into())
                 })?;
-                match (path, global) {
-                    (CoefficientPath::Int8, _) => &kernels.global,
-                    (CoefficientPath::Wide, _) => &kernels.wide_global,
-                    (CoefficientPath::WeightedInt8, false) => &kernels.int8,
-                    (CoefficientPath::WeightedInt8, true) => &kernels.int8_global,
-                    (CoefficientPath::Float32, false) => &kernels.real,
-                    (CoefficientPath::Float32, true) => &kernels.real_global,
+                match (path, global, dense) {
+                    (CoefficientPath::Int8, _, true) => &kernels.dense,
+                    (CoefficientPath::WeightedInt8, _, true) => &kernels.int8_dense,
+                    (CoefficientPath::Wide, _, true) => &kernels.wide_dense,
+                    (CoefficientPath::Float32, _, true) => &kernels.real_dense,
+                    (CoefficientPath::Int8, _, false) => &kernels.global,
+                    (CoefficientPath::Wide, _, false) => &kernels.wide_global,
+                    (CoefficientPath::WeightedInt8, false, false) => &kernels.int8,
+                    (CoefficientPath::WeightedInt8, true, false) => &kernels.int8_global,
+                    (CoefficientPath::Float32, false, false) => &kernels.real,
+                    (CoefficientPath::Float32, true, false) => &kernels.real_global,
                 }
             }
         };
@@ -2181,7 +2196,7 @@ pub fn sample_one_real(
         .collect())
 }
 
-/// Sample with an explicit MSA storage tier, including dense zero-filled absent couplers.
+/// Sample with an explicit SA or MSA storage tier, including dense zero-filled absent couplers.
 /// Exact graphs retain their coefficients and constant diagonal terms.
 ///
 /// # Errors
@@ -2193,13 +2208,14 @@ pub fn sample_one_real_forced(
     params: &SampleParams,
     storage: capacity::Storage,
 ) -> Result<SampleSet, SampleError> {
-    let plan = if graph.edges.iter().any(|&(u, v)| u == v) {
+    check_real_kernel(device)?;
+    let plan = if device.kernel == KernelKind::Msa && graph.edges.iter().any(|&(u, v)| u == v) {
         // Preserve the exact dense diagonal fixture, whose terms are constant.
         coefficients::plan(KernelKind::Msa, graph).map_err(SampleError::Unsupported)?
     } else {
         real_plan(device, graph)?
     };
-    let reads = sample_one_planned(device, graph, params, KernelKind::Msa, plan, Some(storage))?;
+    let reads = sample_one_planned(device, graph, params, device.kernel, plan, Some(storage))?;
     Ok(reads
         .into_iter()
         .map(|spins| RealSample {
@@ -2210,9 +2226,9 @@ pub fn sample_one_real_forced(
 }
 
 fn record_storage(device: &CudaDevice, kernel: KernelKind, topology: &SelfFeedingTopology) {
-    if kernel == KernelKind::Msa {
+    if kernel == KernelKind::Msa || kernel == KernelKind::Sa {
         *device
-            .last_msa_storage
+            .last_storage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(if topology.row_ptr.is_empty() {
@@ -2223,12 +2239,12 @@ fn record_storage(device: &CudaDevice, kernel: KernelKind, topology: &SelfFeedin
     }
 }
 
-/// Storage tier of the most recently built MSA session on this device.
+/// Storage tier of the most recently built SA or MSA session on this device.
 #[doc(hidden)]
 #[must_use]
 pub fn last_storage(device: &CudaDevice) -> Option<capacity::Storage> {
     *device
-        .last_msa_storage
+        .last_storage
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -3460,20 +3476,35 @@ mod tests {
                 graph.edges.to_vec(),
             );
             let n = graph.num_nodes();
-            for global in [false, true] {
+            for (global, storage) in [
+                (false, capacity::Storage::Sparse),
+                (true, capacity::Storage::Sparse),
+                (true, capacity::Storage::Dense),
+            ] {
                 device.sa_force_global = global;
                 for sweeps in [1, 2, 4] {
+                    let arithmetic = SessionArithmetic {
+                        coefficients: real_plan(&device, &graph).unwrap(),
+                        msa_lane: DEFAULT_MSA_LANE,
+                    };
+                    let topology = session_topology(
+                        &device,
+                        KernelKind::Sa,
+                        &graph,
+                        Some(storage),
+                        256,
+                        1,
+                        arithmetic,
+                    )
+                    .unwrap();
                     let mut session = SelfFeedingSession::build(
                         &device,
                         KernelKind::Sa,
-                        SelfFeedingTopology::build(&graph),
+                        topology,
                         1,
                         256,
                         1,
-                        SessionArithmetic {
-                            coefficients: real_plan(&device, &graph).unwrap(),
-                            msa_lane: DEFAULT_MSA_LANE,
-                        },
+                        arithmetic,
                     )
                     .unwrap();
                     // At beta zero every finite delta must accept a flip.

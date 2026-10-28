@@ -372,6 +372,11 @@ fn fill_converted<T: Copy + Default>(
         if u >= topology.n || v >= topology.n {
             continue;
         }
+        // Dense diagonals stay zero. Self-loops are constant terms included
+        // by host scoring and must not contribute to spin-flip deltas.
+        if u == v && topology.row_ptr.is_empty() {
+            continue;
+        }
         let val = convert(graph.j.get(k).copied().unwrap_or(0.0))?;
         j_csr[pos_ij as usize] = val;
         if u != v {
@@ -507,6 +512,27 @@ mod tests {
         // Self-loop J appears once; (0,1) appears twice.
         assert_eq!(j.iter().filter(|&&v| v == 7).count(), 1);
         assert_eq!(j.iter().filter(|&&v| v == 2).count(), 2);
+    }
+
+    #[test]
+    fn dense_coefficients_leave_diagonal_zero() {
+        let graph = IsingGraph::new(vec![1.0, 0.0], vec![7.0, 2.0], vec![(0, 0), (0, 1)]);
+        let topology = SelfFeedingTopology {
+            n: 2,
+            nnz: 4,
+            row_ptr: vec![],
+            col_ind: vec![],
+            edge_pos: vec![(0, 0), (1, 2)],
+            colors: ColorBlocks {
+                starts: vec![],
+                counts: vec![],
+                nodes: vec![],
+                num_colors: 0,
+            },
+        };
+        let (j, h) = fill_coefficients::<i8>(&topology, &graph, 1000).unwrap();
+        assert_eq!(j, vec![0, 2, 2, 0]);
+        assert_eq!(h, vec![1, 0]);
     }
 
     #[test]

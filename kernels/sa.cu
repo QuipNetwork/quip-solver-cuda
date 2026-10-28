@@ -16,6 +16,12 @@
 // through NVRTC as -D QUIP_MAX_NODES=<n>; the default matches the historical
 // fixed size so a plain compile is unchanged. This array is per thread, so
 // raising it multiplies the local-memory footprint by the thread count.
+#ifdef QUIP_SA_DENSE
+#ifndef QUIP_SA_GLOBAL_STATE
+#define QUIP_SA_GLOBAL_STATE
+#endif
+#endif
+
 #ifndef QUIP_MAX_NODES
 #define QUIP_MAX_NODES 5000
 #endif
@@ -132,8 +138,13 @@ __device__ delta_t get_flip_energy_unpacked(
     , int total_threads, int global_tid
 #endif
 ) {
+#ifdef QUIP_SA_DENSE
+    const int start = var * n;
+    const int end = start + n;
+#else
     const int start = __ldg(&csr_row_ptr[var]);
     const int end = __ldg(&csr_row_ptr[var + 1]);
+#endif
 
 #ifdef QUIP_SA_COEF_F32
     float energy = 0;
@@ -151,7 +162,11 @@ __device__ delta_t get_flip_energy_unpacked(
 
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
+#ifdef QUIP_SA_DENSE
+        const int neighbor = p - start;
+#else
         const int neighbor = __ldg(&csr_col_ind[p]);
+#endif
         const coef_t Jij = __ldg(&csr_J_vals[p]);
 #ifdef QUIP_SA_GLOBAL_STATE
         energy += unpacked_state[(long long)neighbor * total_threads + global_tid] * Jij;
@@ -363,13 +378,22 @@ __global__ void cuda_sa_self_feeding(
 #else
                     (int)__ldg(&my_h[i]) * spin_i;
 #endif
+#ifdef QUIP_SA_DENSE
+                const int start = i * N;
+                const int end = start + N;
+#else
                 const int start =
                     __ldg(&csr_row_ptr[i]);
                 const int end =
                     __ldg(&csr_row_ptr[i + 1]);
+#endif
                 for (int p = start; p < end; ++p) {
+#ifdef QUIP_SA_DENSE
+                    const int j = p - start;
+#else
                     const int j =
                         __ldg(&csr_col_ind[p]);
+#endif
                     if (j > i) {
                         const coef_t Jij =
                             __ldg(&my_J[p]);
@@ -478,6 +502,10 @@ __global__ void cuda_sa_self_feeding(
                             const signed char
                                 multiplier =
                                     4 * var_spin;
+#ifdef QUIP_SA_DENSE
+                            const int start = var * N;
+                            const int end = start + N;
+#else
                             const int start =
                                 __ldg(
                                     &csr_row_ptr[
@@ -486,12 +514,18 @@ __global__ void cuda_sa_self_feeding(
                                 __ldg(
                                     &csr_row_ptr[
                                         var + 1]);
+#endif
                             for (int p = start;
                                  p < end; ++p) {
+#ifdef QUIP_SA_DENSE
+                                const int neighbor = p - start;
+                                if (neighbor == var) continue;
+#else
                                 const int neighbor =
                                     __ldg(
                                         &csr_col_ind[
                                             p]);
+#endif
                                 const coef_t
                                     Jij = __ldg(
                                         &my_J[p]);
