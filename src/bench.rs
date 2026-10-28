@@ -704,11 +704,6 @@ fn run_run(
             "--msa-path requires the MSA kernel".into(),
         ));
     }
-    if uses_real(args) && kernel == KernelKind::Gibbs {
-        return Err(BenchError::Args(
-            "real coefficients require the SA or MSA kernel".into(),
-        ));
-    }
     if args.msa_shared_spins.is_some() && kernel != KernelKind::Msa {
         return Err(BenchError::Args(
             "--msa-shared-spins requires the MSA kernel".into(),

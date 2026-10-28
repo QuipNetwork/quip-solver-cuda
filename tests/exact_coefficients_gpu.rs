@@ -83,6 +83,45 @@ fn params() -> SampleParams {
     }
 }
 
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_wide_reaches_exact_ground_states() {
+    use quip_solver_cuda::coefficients::{plan, CoefficientPath};
+    use quip_solver_cuda::streaming::sample_one;
+
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 4800).unwrap();
+    let graphs = [
+        IsingGraph::new(vec![0.0; 3], vec![1.0, 0.001], vec![(0, 1), (1, 2)]),
+        IsingGraph::new(vec![128.0, -0.001], vec![1.0], vec![(0, 1)]),
+        IsingGraph::new(
+            vec![0.001; 12],
+            vec![-1.0; 12],
+            (0..12).map(|i| (i, (i + 1) % 12)).collect(),
+        ),
+    ];
+    for graph in graphs {
+        assert_eq!(
+            plan(KernelKind::Gibbs, &graph).unwrap().path,
+            CoefficientPath::Wide
+        );
+        for metropolis in [false, true] {
+            device.gibbs_metropolis = metropolis;
+            device.gibbs_shared_spins_cap = None;
+            let baseline = sample_one(&device, &graph, &params(), KernelKind::Gibbs).unwrap();
+            assert_ground_state(KernelKind::Gibbs, &graph, &baseline);
+            for cap in [0, 1, graph.num_nodes()] {
+                device.gibbs_shared_spins_cap = Some(cap);
+                let reads = sample_one(&device, &graph, &params(), KernelKind::Gibbs).unwrap();
+                assert_ground_state(KernelKind::Gibbs, &graph, &reads);
+                for (a, b) in baseline.iter().zip(reads) {
+                    assert_eq!(a.spins, b.spins, "cap={cap} metropolis={metropolis}");
+                }
+            }
+        }
+    }
+}
+
 fn assert_finds_ground_state(kind: KernelKind, g: &IsingGraph) {
     let reads = sample_ising(device(kind), g, &params(), kind).expect("solves");
     assert_ground_state(kind, g, &reads);
@@ -306,7 +345,7 @@ fn msa_routes_k64_on_unit_and_weighted_paths() {
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
 fn non_representable_models_are_refused() {
     let sub_milli = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
-    let wide_gibbs = IsingGraph::new(vec![128.0, 0.0], vec![1.0], vec![(0, 1)]);
+    let wide_gibbs = IsingGraph::new(vec![536_870.911, 0.0], vec![0.001], vec![(0, 1)]);
     for (kind, g) in [
         (KernelKind::Sa, &sub_milli),
         (KernelKind::Gibbs, &sub_milli),

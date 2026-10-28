@@ -23,6 +23,108 @@ const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
 const MSA_SRC: &str = include_str!("../kernels/msa.cu");
 const SCREEN_SRC: &str = include_str!("../kernels/screen.cu");
 
+// Keep the compiled shapes aligned with the device-open variants.
+const KERNEL_VARIANTS: &[(&str, &str, usize, &[&str])] = &[
+    ("sa", SA_SRC, 512, &[]),
+    ("gibbs", GIBBS_SRC, 4800, &[]),
+    ("gibbs-spill", GIBBS_SRC, 4800, &["-DQUIP_GIBBS_SPILL"]),
+    ("gibbs-i32", GIBBS_SRC, 4800, &["-DQUIP_GIBBS_COEF_I32"]),
+    (
+        "gibbs-i32-spill",
+        GIBBS_SRC,
+        4800,
+        &["-DQUIP_GIBBS_COEF_I32", "-DQUIP_GIBBS_SPILL"],
+    ),
+    ("gibbs-f32", GIBBS_SRC, 4800, &["-DQUIP_GIBBS_COEF_F32"]),
+    (
+        "gibbs-f32-spill",
+        GIBBS_SRC,
+        4800,
+        &["-DQUIP_GIBBS_COEF_F32", "-DQUIP_GIBBS_SPILL"],
+    ),
+    (
+        "msa",
+        MSA_SRC,
+        quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
+        &[],
+    ),
+    ("sa-wide", SA_SRC, 512, &[SA_WIDE_DEFINE]),
+    ("sa-dense", SA_SRC, 5000, &["-DQUIP_SA_DENSE"]),
+    (
+        "sa-wi8-dense",
+        SA_SRC,
+        5000,
+        &["-DQUIP_SA_DENSE", "-DQUIP_SA_COEF_I8_DELTA_I32"],
+    ),
+    (
+        "sa-wide-dense",
+        SA_SRC,
+        5000,
+        &["-DQUIP_SA_DENSE", SA_WIDE_DEFINE],
+    ),
+    (
+        "sa-f32-dense",
+        SA_SRC,
+        5000,
+        &["-DQUIP_SA_DENSE", "-DQUIP_SA_COEF_F32"],
+    ),
+    ("sa-global", SA_SRC, 5000, &["-DQUIP_SA_GLOBAL_STATE"]),
+    (
+        "sa-wide-global",
+        SA_SRC,
+        5000,
+        &["-DQUIP_SA_GLOBAL_STATE", SA_WIDE_DEFINE],
+    ),
+    ("sa-wi8", SA_SRC, 5000, &["-DQUIP_SA_COEF_I8_DELTA_I32"]),
+    (
+        "sa-wi8-global",
+        SA_SRC,
+        5000,
+        &["-DQUIP_SA_GLOBAL_STATE", "-DQUIP_SA_COEF_I8_DELTA_I32"],
+    ),
+    ("sa-f32", SA_SRC, 5000, &["-DQUIP_SA_COEF_F32"]),
+    (
+        "sa-f32-global",
+        SA_SRC,
+        5000,
+        &["-DQUIP_SA_GLOBAL_STATE", "-DQUIP_SA_COEF_F32"],
+    ),
+    (
+        "msa-weighted-i32",
+        MSA_SRC,
+        quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
+        &["-DQUIP_MSA_WEIGHTED", "-DQUIP_MSA_LANE_I32"],
+    ),
+    (
+        "msa-weighted-f32",
+        MSA_SRC,
+        quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
+        &["-DQUIP_MSA_WEIGHTED", "-DQUIP_MSA_LANE_F32"],
+    ),
+    (
+        "msa-weighted-int8",
+        MSA_SRC,
+        quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
+        &[
+            "-DQUIP_MSA_WEIGHTED",
+            "-DQUIP_MSA_LANE_I32",
+            "-DQUIP_MSA_COEF_I8",
+        ],
+    ),
+    (
+        "msa-real-f32",
+        MSA_SRC,
+        quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
+        &[
+            "-DQUIP_MSA_WEIGHTED",
+            "-DQUIP_MSA_LANE_F32",
+            "-DQUIP_MSA_COEF_F32",
+        ],
+    ),
+    // The screen sizes its shared memory per launch; the node define is unused.
+    ("screen", SCREEN_SRC, 0, &[]),
+];
+
 /// Reports whether the caller must return without testing anything, and says
 /// so on stderr when it does.
 ///
@@ -112,92 +214,7 @@ fn every_supported_arch_compiles_and_assembles_every_kernel() {
     for &arch in SUPPORTED_ARCHS {
         // Smallest realistic capacity for SA, the compiled-in default for
         // Gibbs — the same shapes `CudaDevice::open_with_nodes` produces.
-        for (name, src, nodes, defines) in [
-            ("sa", SA_SRC, 512, &[][..]),
-            ("gibbs", GIBBS_SRC, 4800, &[][..]),
-            ("gibbs-spill", GIBBS_SRC, 4800, &["-DQUIP_GIBBS_SPILL"][..]),
-            (
-                "msa",
-                MSA_SRC,
-                quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
-                &[][..],
-            ),
-            ("sa-wide", SA_SRC, 512, &[SA_WIDE_DEFINE][..]),
-            ("sa-dense", SA_SRC, 5000, &["-DQUIP_SA_DENSE"][..]),
-            (
-                "sa-wi8-dense",
-                SA_SRC,
-                5000,
-                &["-DQUIP_SA_DENSE", "-DQUIP_SA_COEF_I8_DELTA_I32"][..],
-            ),
-            (
-                "sa-wide-dense",
-                SA_SRC,
-                5000,
-                &["-DQUIP_SA_DENSE", SA_WIDE_DEFINE][..],
-            ),
-            (
-                "sa-f32-dense",
-                SA_SRC,
-                5000,
-                &["-DQUIP_SA_DENSE", "-DQUIP_SA_COEF_F32"][..],
-            ),
-            ("sa-global", SA_SRC, 5000, &["-DQUIP_SA_GLOBAL_STATE"][..]),
-            (
-                "sa-wide-global",
-                SA_SRC,
-                5000,
-                &["-DQUIP_SA_GLOBAL_STATE", SA_WIDE_DEFINE][..],
-            ),
-            ("sa-wi8", SA_SRC, 5000, &["-DQUIP_SA_COEF_I8_DELTA_I32"][..]),
-            (
-                "sa-wi8-global",
-                SA_SRC,
-                5000,
-                &["-DQUIP_SA_GLOBAL_STATE", "-DQUIP_SA_COEF_I8_DELTA_I32"][..],
-            ),
-            ("sa-f32", SA_SRC, 5000, &["-DQUIP_SA_COEF_F32"][..]),
-            (
-                "sa-f32-global",
-                SA_SRC,
-                5000,
-                &["-DQUIP_SA_GLOBAL_STATE", "-DQUIP_SA_COEF_F32"][..],
-            ),
-            (
-                "msa-weighted-i32",
-                MSA_SRC,
-                quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
-                &["-DQUIP_MSA_WEIGHTED", "-DQUIP_MSA_LANE_I32"][..],
-            ),
-            (
-                "msa-weighted-f32",
-                MSA_SRC,
-                quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
-                &["-DQUIP_MSA_WEIGHTED", "-DQUIP_MSA_LANE_F32"][..],
-            ),
-            (
-                "msa-weighted-int8",
-                MSA_SRC,
-                quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
-                &[
-                    "-DQUIP_MSA_WEIGHTED",
-                    "-DQUIP_MSA_LANE_I32",
-                    "-DQUIP_MSA_COEF_I8",
-                ][..],
-            ),
-            (
-                "msa-real-f32",
-                MSA_SRC,
-                quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
-                &[
-                    "-DQUIP_MSA_WEIGHTED",
-                    "-DQUIP_MSA_LANE_F32",
-                    "-DQUIP_MSA_COEF_F32",
-                ][..],
-            ),
-            // The screen sizes its shared memory per launch; the node define is unused.
-            ("screen", SCREEN_SRC, 0, &[][..]),
-        ] {
+        for &(name, src, nodes, defines) in KERNEL_VARIANTS {
             if let Err(e) = compile_and_assemble(name, src, nodes, arch, defines) {
                 failures.push(e);
             }

@@ -22,6 +22,16 @@
 #define QUIP_MAX_NODES 4800
 #endif
 
+// One coefficient type serves both h and J. The default expands to the
+// original spelling so the mining instantiation preprocesses unchanged.
+#if defined(QUIP_GIBBS_COEF_I32)
+typedef int coef_t;
+#elif defined(QUIP_GIBBS_COEF_F32)
+typedef float coef_t;
+#else
+#define coef_t signed char
+#endif
+
 // Spill sessions can have coefficient and sample slots larger than 2 GiB.
 #ifdef QUIP_GIBBS_SPILL
 #define GIBBS_OFFSET unsigned long long
@@ -155,8 +165,8 @@ __device__ float compute_effective_field_shared(
 #endif
     const int* csr_row_ptr, int rp_off,
     const int* csr_col_ind, int ci_off,
-    const signed char* csr_J_vals, GIBBS_OFFSET j_off,
-    const signed char* h_vals, GIBBS_OFFSET h_off
+    const coef_t* csr_J_vals, GIBBS_OFFSET j_off,
+    const coef_t* h_vals, GIBBS_OFFSET h_off
 ) {
     int start = __ldg(&csr_row_ptr[rp_off + var]);
     int end = __ldg(&csr_row_ptr[rp_off + var + 1]);
@@ -166,7 +176,11 @@ __device__ float compute_effective_field_shared(
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
         int neighbor = __ldg(&csr_col_ind[ci_off + p]);
+#ifdef QUIP_GIBBS_COEF_F32
+        float Jij = __ldg(&csr_J_vals[j_off + p]);
+#else
         int Jij = (int)__ldg(&csr_J_vals[j_off + p]);
+#endif
         int neighbor_spin = (int)shared_state[neighbor];
         h_eff += (float)(Jij * neighbor_spin);
     }
@@ -182,7 +196,12 @@ __device__ __forceinline__ int gibbs_sample(
     float h_eff, float beta, Xoshiro128 &rng
 ) {
     float prob_plus =
+#ifdef QUIP_GIBBS_COEF_F32
+        // The admitted field keeps 2*h_eff finite; 2*beta need not fit.
+        1.0f / (1.0f + __expf((2.0f * h_eff) * beta));
+#else
         1.0f / (1.0f + __expf(2.0f * beta * h_eff));
+#endif
     unsigned int rand_val = xoshiro128ss(rng);
     float rand_norm = (float)rand_val / 4294967295.0f;
     return (rand_norm < prob_plus) ? 1 : -1;
@@ -235,9 +254,9 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
 
     // Per-slot flat buffers (stride: see below)
     // J: indexed by (nonce_id * 3 + slot_id) * nnz + p
-    signed char* slot_J_vals,
+    coef_t* slot_J_vals,
     // h: indexed by (nonce_id * 3 + slot_id) * N + var
-    signed char* slot_h_vals,
+    coef_t* slot_h_vals,
     // samples: indexed by (nonce_id * 3 + slot_id)
     //          * reads_per_nonce * max_packed_size
     //          + read_idx * max_packed_size
@@ -378,7 +397,9 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
         GIBBS_OFFSET h_off = slot_idx * N;
         GIBBS_OFFSET sample_base = slot_idx * reads_per_nonce
                           * max_packed_size;
+#ifndef QUIP_GIBBS_COEF_F32
         int energy_base = slot_idx * reads_per_nonce;
+#endif
 
         unsigned int seed =
             base_seed + (unsigned int)(nonce_id * 3
@@ -487,6 +508,9 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
                     }
                 }
 
+                // Real energies are scored from the original f64 graph on
+                // the host. An integer output cannot represent them.
+#ifndef QUIP_GIBBS_COEF_F32
                 // Phase 3: Energy (warp reduction)
                 float thread_energy = 0.0f;
                 for (int var = threadIdx.x; var < N;
@@ -538,6 +562,7 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
                 }
 
                 __syncthreads();
+#endif
 
                 // Phase 4: Bit-pack (thread 0)
                 if (threadIdx.x == 0) {

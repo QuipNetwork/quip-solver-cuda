@@ -38,7 +38,7 @@ const MILLI_TOLERANCE: f64 = 4.0 * f64::EPSILON;
 pub enum CoefficientPath {
     /// Today's kernels: `signed char` coefficients (and an int8 SA delta).
     Int8,
-    /// i32 coefficients: wide SA delta or weighted MSA lane arithmetic.
+    /// i32 coefficients: wide SA delta, Gibbs field, or weighted MSA arithmetic.
     Wide,
     /// Scaled i8 coefficients with wide SA deltas or a weighted MSA lane.
     WeightedInt8,
@@ -193,9 +193,10 @@ pub(crate) fn plan_with_unit(
             }
         }
         KernelKind::Gibbs if max_coef <= INT8_MAX_COEF => Ok(int8),
-        KernelKind::Gibbs => Err(format!(
-            "gibbs: a coefficient is {max_coef} times the model's {scale_milli} milli step, above the int8 limit of {INT8_MAX_COEF}"
+        KernelKind::Gibbs if field > WIDE_MAX_FIELD => Err(format!(
+            "gibbs: local field {field} times the model's {scale_milli} milli step exceeds the wide path's limit of {WIDE_MAX_FIELD}"
         )),
+        KernelKind::Gibbs => Ok(CoefficientPlan { path: CoefficientPath::Wide, scale_milli }),
         KernelKind::Sa if 2 * field <= INT8_MAX_DELTA => Ok(int8),
         KernelKind::Sa if field > WIDE_MAX_FIELD => Err(format!(
             "sa: local field {field} times the model's {scale_milli} milli step exceeds the wide path's limit of {WIDE_MAX_FIELD}"
@@ -210,6 +211,33 @@ mod tests {
     use super::*;
     use crate::KernelKind;
     use quip_solver_core::IsingGraph;
+
+    #[test]
+    fn gibbs_plans_wide_for_wide_coefficients() {
+        let g = graph(vec![0.0; 3], vec![1.0, 0.001], vec![(0, 1), (1, 2)]);
+        assert_eq!(
+            plan(KernelKind::Gibbs, &g).unwrap().path,
+            CoefficientPath::Wide
+        );
+    }
+
+    #[test]
+    fn gibbs_mining_refuses_off_grid() {
+        let g = graph(vec![0.0001, 0.0], vec![1.0], vec![(0, 1)]);
+        assert!(plan(KernelKind::Gibbs, &g).is_err());
+    }
+
+    #[test]
+    fn gibbs_wide_checks_local_field_bound() {
+        let fits = f64::from(i32::try_from(WIDE_MAX_FIELD).unwrap()) / 1000.0 - 0.001;
+        let g = graph(vec![fits, 0.0], vec![0.001], vec![(0, 1)]);
+        assert_eq!(
+            plan(KernelKind::Gibbs, &g).unwrap().path,
+            CoefficientPath::Wide
+        );
+        let g = graph(vec![fits + 0.001, 0.0], vec![0.001], vec![(0, 1)]);
+        assert!(plan(KernelKind::Gibbs, &g).is_err());
+    }
 
     #[test]
     fn sa_plans_weighted_int8_when_field_exceeds_i8_delta() {
@@ -397,11 +425,18 @@ mod tests {
     }
 
     #[test]
-    fn gibbs_accepts_127_scale_units_and_refuses_128() {
+    fn gibbs_uses_int8_at_127_scale_units_and_wide_at_128() {
         let ok = graph(vec![127.0, 0.0], vec![1.0], vec![(0, 1)]);
         assert_eq!(plan(KernelKind::Gibbs, &ok).unwrap().scale_milli, 1000);
-        let bad = graph(vec![128.0, 0.0], vec![1.0], vec![(0, 1)]);
-        assert!(plan(KernelKind::Gibbs, &bad).is_err());
+        assert_eq!(
+            plan(KernelKind::Gibbs, &ok).unwrap().path,
+            CoefficientPath::Int8
+        );
+        let wide = graph(vec![128.0, 0.0], vec![1.0], vec![(0, 1)]);
+        assert_eq!(
+            plan(KernelKind::Gibbs, &wide).unwrap().path,
+            CoefficientPath::Wide
+        );
         // 128 and 2 share the factor 2: scale 2000, values 64 and 1.
         let scaled = graph(vec![128.0, 0.0], vec![2.0], vec![(0, 1)]);
         assert_eq!(plan(KernelKind::Gibbs, &scaled).unwrap().scale_milli, 2000);

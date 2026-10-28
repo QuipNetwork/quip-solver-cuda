@@ -619,6 +619,11 @@ fn session_shape_and_storage(
     betas: usize,
     precision: capacity::Precision,
 ) -> Result<(capacity::ModelShape, capacity::Storage), SampleError> {
+    if kernel == KernelKind::Gibbs && forced == Some(capacity::Storage::Dense) {
+        return Err(SampleError::Unsupported(
+            "Gibbs requires sparse storage".into(),
+        ));
+    }
     let n = graph.num_nodes();
     let mut degrees = vec![0usize; n];
     for &(u, v) in graph.edges.iter() {
@@ -680,7 +685,11 @@ fn session_topology(
         arithmetic.normalized(),
     )?;
     if storage == capacity::Storage::Sparse {
-        return Ok(SelfFeedingTopology::build(graph));
+        let topology = SelfFeedingTopology::build(graph);
+        if kernel == KernelKind::Gibbs && arithmetic.coefficients.path == CoefficientPath::Float32 {
+            check_gibbs_real_fields(&topology, graph)?;
+        }
+        return Ok(topology);
     }
     let nnz = n
         .checked_mul(n)
@@ -1740,6 +1749,116 @@ impl<'a> SelfFeedingSession<'a> {
         Ok(())
     }
 
+    fn launch_gibbs(
+        &self,
+        cfg: LaunchConfig,
+        num_betas: i32,
+        sweeps_per_beta: i32,
+        seed: u32,
+    ) -> Result<(), SampleError> {
+        let AlgoState::Gibbs {
+            d_spill,
+            shared_spins,
+            d_block_starts,
+            d_block_counts,
+            d_color_nodes,
+            num_colors,
+            chunks_per_model,
+            reads_per_chunk,
+        } = &self.algo_state
+        else {
+            return Err(SampleError::Driver(
+                "launch_gibbs without Gibbs state".into(),
+            ));
+        };
+        let dims = &self.dims;
+        let (function, variant) = match (self.plan.path, d_spill.is_some()) {
+            (CoefficientPath::Int8 | CoefficientPath::WeightedInt8, false) => {
+                (&self.device.gibbs, "gibbs")
+            }
+            (path, spill) => {
+                let kernels = self.device.gibbs_variants.as_ref().ok_or_else(|| {
+                    SampleError::Unsupported("Gibbs variants require a Gibbs device".into())
+                })?;
+                match (path, spill) {
+                    (CoefficientPath::Int8 | CoefficientPath::WeightedInt8, _) => {
+                        (&kernels.spill, "gibbs-spill")
+                    }
+                    (CoefficientPath::Wide, false) => (&kernels.i32, "gibbs-i32"),
+                    (CoefficientPath::Wide, true) => (&kernels.i32_spill, "gibbs-i32-spill"),
+                    (CoefficientPath::Float32, false) => (&kernels.f32, "gibbs-f32"),
+                    (CoefficientPath::Float32, true) => (&kernels.f32_spill, "gibbs-f32-spill"),
+                }
+            }
+        };
+        let mut b = self.stream_compute.launch_builder(function);
+        b.arg(&self.d_row_ptr);
+        b.arg(&self.d_col_ind);
+        b.arg(d_block_starts);
+        b.arg(d_block_counts);
+        b.arg(d_color_nodes);
+        b.arg(num_colors);
+        b.arg(&self.d_beta);
+        b.arg(&num_betas);
+        b.arg(&sweeps_per_beta);
+        match &self.coefs {
+            SlotCoefficients::Int8 { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+            SlotCoefficients::Wide { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+            SlotCoefficients::Float32 { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+        }
+        b.arg(&self.d_samples);
+        b.arg(&self.d_energies);
+        b.arg(&self.d_ctrl);
+        b.arg(&dims.num_nonces);
+        // The kernel's `blocks_per_nonce` and `chunks_per_model` are
+        // the same quantity in this driver — a nonce is spread across
+        // `sms_per_nonce` blocks and each block handles exactly one
+        // chunk — so the value `build` already validated serves both.
+        b.arg(chunks_per_model);
+        b.arg(&dims.reads_per_nonce);
+        b.arg(&dims.n);
+        b.arg(&dims.nnz);
+        b.arg(&dims.max_packed);
+        b.arg(chunks_per_model);
+        b.arg(reads_per_chunk);
+        b.arg(&seed);
+        let update_mode = i32::from(self.device.gibbs_metropolis);
+        b.arg(&update_mode);
+        if let Some(spill) = d_spill {
+            b.arg(spill);
+            b.arg(shared_spins);
+        }
+        // SAFETY: the coefficient plan selects matching h/J buffers and types.
+        // The 24 `b.arg`
+        // calls mirror `cuda_gibbs_self_feeding` in `kernels/gibbs.cu`
+        // in order, type and count. The spill variant appends its
+        // buffer and prefix length. `n`, `nnz`, `max_packed`, `num_nonces` and
+        // `reads_per_nonce` are the values `build` sized the slot
+        // buffers from; `num_colors`, `chunks_per_model` and
+        // `reads_per_chunk` likewise bound the color-block arrays
+        // `build` tiled per nonce. Above 4800 nodes the spill
+        // instantiation uses a launch-sized prefix and a tail per block.
+        // The buffers outlive the
+        // launch: `Drop` signals exit and synchronizes
+        // `stream_compute` before any `CudaSlice` field is freed.
+        unsafe { b.launch(cfg) }?;
+        *self
+            .device
+            .last_gibbs_variant
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(variant);
+        Ok(())
+    }
+
     fn launch(
         &mut self,
         active_nonces: usize,
@@ -1782,8 +1901,6 @@ impl<'a> SelfFeedingSession<'a> {
         // ctrl protocol, exactly as documented on `SelfFeedingSession`.
         self.stream_transfer.synchronize()?;
 
-        let dims = &self.dims;
-
         // Buffer args are pushed as shared refs regardless of which side
         // (host driver vs. persistent kernel) mutates them: event tracking
         // is disabled for this device (see `CudaDevice::open`), so
@@ -1800,75 +1917,8 @@ impl<'a> SelfFeedingSession<'a> {
             AlgoState::Sa { .. } | AlgoState::SaWide { .. } | AlgoState::SaReal { .. } => {
                 self.launch_sa(cfg, num_betas, sweeps_per_beta, seed)?;
             }
-            AlgoState::Gibbs {
-                d_spill,
-                shared_spins,
-                d_block_starts,
-                d_block_counts,
-                d_color_nodes,
-                num_colors,
-                chunks_per_model,
-                reads_per_chunk,
-            } => {
-                let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
-                    return Err(SampleError::Driver(
-                        "launch_gibbs without int8 coefficients".into(),
-                    ));
-                };
-                let function = if d_spill.is_some() {
-                    self.device.gibbs_spill.as_ref().ok_or_else(|| {
-                        SampleError::Unsupported("Gibbs spill requires a Gibbs device".into())
-                    })?
-                } else {
-                    &self.device.gibbs
-                };
-                let mut b = self.stream_compute.launch_builder(function);
-                b.arg(&self.d_row_ptr);
-                b.arg(&self.d_col_ind);
-                b.arg(d_block_starts);
-                b.arg(d_block_counts);
-                b.arg(d_color_nodes);
-                b.arg(num_colors);
-                b.arg(&self.d_beta);
-                b.arg(&num_betas);
-                b.arg(&sweeps_per_beta);
-                b.arg(d_j);
-                b.arg(d_h);
-                b.arg(&self.d_samples);
-                b.arg(&self.d_energies);
-                b.arg(&self.d_ctrl);
-                b.arg(&dims.num_nonces);
-                // The kernel's `blocks_per_nonce` and `chunks_per_model` are
-                // the same quantity in this driver — a nonce is spread across
-                // `sms_per_nonce` blocks and each block handles exactly one
-                // chunk — so the value `build` already validated serves both.
-                b.arg(chunks_per_model);
-                b.arg(&dims.reads_per_nonce);
-                b.arg(&dims.n);
-                b.arg(&dims.nnz);
-                b.arg(&dims.max_packed);
-                b.arg(chunks_per_model);
-                b.arg(reads_per_chunk);
-                b.arg(&seed);
-                let update_mode = i32::from(self.device.gibbs_metropolis);
-                b.arg(&update_mode);
-                if let Some(spill) = d_spill {
-                    b.arg(spill);
-                    b.arg(shared_spins);
-                }
-                // SAFETY: same obligation as the SA arm above. The 24 `b.arg`
-                // calls mirror `cuda_gibbs_self_feeding` in `kernels/gibbs.cu`
-                // in order, type and count. The spill variant appends its
-                // buffer and prefix length. `n`, `nnz`, `max_packed`, `num_nonces` and
-                // `reads_per_nonce` are the values `build` sized the slot
-                // buffers from; `num_colors`, `chunks_per_model` and
-                // `reads_per_chunk` likewise bound the color-block arrays
-                // `build` tiled per nonce. Above 4800 nodes the spill
-                // instantiation uses a launch-sized prefix and a tail per block.
-                // The buffers outlive the
-                // launch: `Drop` signals exit and synchronizes
-                // `stream_compute` before any `CudaSlice` field is freed.
-                unsafe { b.launch(cfg) }?;
+            AlgoState::Gibbs { .. } => {
+                self.launch_gibbs(cfg, num_betas, sweeps_per_beta, seed)?;
             }
         }
         self.launched = true;
@@ -2303,7 +2353,7 @@ pub fn sample_one_real(
         .collect())
 }
 
-/// Sample with an explicit SA or MSA storage tier, including dense zero-filled absent couplers.
+/// Sample with an explicit storage tier. SA and MSA also support dense storage.
 /// Exact graphs retain their coefficients and constant diagonal terms.
 ///
 /// # Errors
@@ -2315,7 +2365,6 @@ pub fn sample_one_real_forced(
     params: &SampleParams,
     storage: capacity::Storage,
 ) -> Result<SampleSet, SampleError> {
-    check_real_kernel(device)?;
     let plan = if device.kernel == KernelKind::Msa && graph.edges.iter().any(|&(u, v)| u == v) {
         // Preserve the exact dense diagonal fixture, whose terms are constant.
         coefficients::plan(KernelKind::Msa, graph).map_err(SampleError::Unsupported)?
@@ -2356,13 +2405,14 @@ pub fn last_storage(device: &CudaDevice) -> Option<capacity::Storage> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn check_real_kernel(device: &CudaDevice) -> Result<(), SampleError> {
-    if device.kernel == KernelKind::Gibbs {
-        return Err(SampleError::Unsupported(
-            "real coefficients require the SA or MSA kernel".into(),
-        ));
-    }
-    Ok(())
+/// Kernel variant used by the most recent Gibbs launch on this device.
+#[doc(hidden)]
+#[must_use]
+pub fn last_gibbs_variant(device: &CudaDevice) -> Option<&'static str> {
+    *device
+        .last_gibbs_variant
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn real_plan(device: &CudaDevice, graph: &IsingGraph) -> Result<CoefficientPlan, SampleError> {
@@ -2376,7 +2426,6 @@ fn real_plan(device: &CudaDevice, graph: &IsingGraph) -> Result<CoefficientPlan,
                 .chain(&graph.j)
                 .any(|&v| coefficients::to_milli(v).is_none()) =>
         {
-            check_real_kernel(device)?;
             float_plan(graph)
         }
         Err(error) => Err(SampleError::Unsupported(error)),
@@ -2420,6 +2469,29 @@ pub(crate) fn float_plan(graph: &IsingGraph) -> Result<CoefficientPlan, SampleEr
         path: CoefficientPath::Float32,
         scale_milli: 1000,
     })
+}
+
+fn check_gibbs_real_fields(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+) -> Result<(), SampleError> {
+    let (j, h) = crate::topology::fill_real_coefficients(topology, graph)
+        .map_err(SampleError::Unsupported)?;
+    // Sum absolute f32 coefficients in the kernel's CSR order. This bounds
+    // every signed partial sum, including rounding, before device allocation.
+    for (row, field) in topology.row_ptr.windows(2).zip(h) {
+        let start = usize::try_from(row[0]).expect("validated CSR row");
+        let end = usize::try_from(row[1]).expect("validated CSR row");
+        let bound = j[start..end]
+            .iter()
+            .fold(field.abs(), |sum, value| sum + value.abs());
+        if bound > f32::MAX / 2.0 {
+            return Err(SampleError::Unsupported(
+                "real Gibbs local field exceeds the finite f32 delta range after rounding".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn real_energy(spins: &[i8], graph: &IsingGraph) -> f64 {
@@ -2568,7 +2640,6 @@ pub fn bench_many_real(
     params: &SampleParams,
     num_nonces: usize,
 ) -> Result<(SampleSet, DeviceTimings), SampleError> {
-    check_real_kernel(device)?;
     let plan = float_plan(graph)?;
     let (reads, timing) =
         bench_many_planned(device, graph, params, device.kernel, None, num_nonces, plan)?;
@@ -3560,6 +3631,21 @@ mod tests {
     }
 
     #[test]
+    fn gibbs_refuses_forced_dense_storage() {
+        let graph = IsingGraph::new(vec![0.1; 2], vec![-0.5], vec![(0, 1)]);
+        let result = session_shape_and_storage(
+            &routing_limits(),
+            KernelKind::Gibbs,
+            &graph,
+            Some(capacity::Storage::Dense),
+            128,
+            64,
+            capacity::Precision::Float32,
+        );
+        assert!(matches!(result, Err(SampleError::Unsupported(_))));
+    }
+
+    #[test]
     fn pair_scan_skips_large_sparse_models() {
         let n = 200_000;
         let mut edges = Vec::with_capacity(n * 10);
@@ -3672,6 +3758,25 @@ mod tests {
         // Two such bonds at an interior node exceed the existing field bound.
         let chain = IsingGraph::new(vec![0.0; 3], vec![1e38; 2], vec![(0, 1), (1, 2)]);
         assert!(float_plan(&chain).is_err());
+    }
+
+    #[test]
+    fn gibbs_real_fields_include_f32_accumulation_rounding() {
+        let half_max = f32::MAX / 2.0;
+        let h = f32::from_bits(half_max.to_bits() - 2);
+        let coupling = (half_max - h) * 0.3;
+        let graph = IsingGraph::new(
+            vec![f64::from(h), 0.0, 0.0, 0.0],
+            vec![f64::from(coupling); 3],
+            vec![(0, 1), (0, 2), (0, 3)],
+        );
+        // The f64 bound fits, but three rounded additions exceed half_max.
+        assert!(float_plan(&graph).is_ok());
+        let field = ((h + coupling) + coupling) + coupling;
+        assert!((2.0 * field).is_infinite());
+        assert!(check_gibbs_real_fields(&SelfFeedingTopology::build(&graph), &graph).is_err());
+        let bond = IsingGraph::new(vec![0.0; 2], vec![1e38], vec![(0, 1)]);
+        assert!(check_gibbs_real_fields(&SelfFeedingTopology::build(&bond), &bond).is_ok());
     }
 
     #[test]

@@ -9,6 +9,128 @@ use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 
 #[test]
 #[ignore = "requires a CUDA GPU"]
+fn gibbs_bench_model_serves_real_coefficients() {
+    use quip_solver_cuda::model_file::{write_model, RealModel};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("real.qmodel");
+    let graph = IsingGraph::new(vec![0.100_000_01, -0.200_000_01], vec![-0.5], vec![(0, 1)]);
+    let ground = energy(&[1, 1], &graph) + 12.5;
+    write_model(
+        &path,
+        &RealModel {
+            graph,
+            offset: 12.5,
+        },
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_quip-cuda-gibbs"))
+        .args(["bench", "run", "--model"])
+        .arg(path)
+        .args(["--out"])
+        .arg(dir.path())
+        .args([
+            "--reads",
+            "128",
+            "--sweeps",
+            "1024",
+            "--warmup",
+            "0",
+            "--repeats",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let records = std::fs::read_to_string(dir.path().join("cuda-gibbs_n2_s1024.jsonl")).unwrap();
+    let record: serde_json::Value = serde_json::from_str(records.trim()).unwrap();
+    assert_eq!(record["backend"], "cuda-gibbs");
+    let best = record["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|metric| metric["name"] == "best_energy")
+        .unwrap()["value"]
+        .as_f64()
+        .unwrap();
+    assert!((best - ground).abs() < 1e-10, "{best} != {ground}");
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_real_route_reaches_planted_ground_state() {
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 4800).unwrap();
+    let edges: Vec<_> = (0..64)
+        .flat_map(|u| (1..=10).map(move |d| (u, (u + d) % 64)))
+        .collect();
+    let graph = IsingGraph::new(
+        vec![0.125_000_01; 64],
+        vec![-1.000_000_1; edges.len()],
+        edges,
+    );
+    // The fractional bond overcomes opposing fields. Truncating J to zero
+    // would instead favor [-1, +1].
+    let fractional = IsingGraph::new(vec![0.100_000_01, -0.200_000_01], vec![-0.5], vec![(0, 1)]);
+    for (graph, planted) in [(graph, vec![-1; 64]), (fractional, vec![1; 2])] {
+        let ground = energy(&planted, &graph);
+        assert!(sample_one(&device, &graph, &params(), KernelKind::Gibbs).is_err());
+        for metropolis in [false, true] {
+            device.gibbs_metropolis = metropolis;
+            let mut baseline = None;
+            for cap in [None, Some(0), Some(1), Some(64)] {
+                device.gibbs_shared_spins_cap = cap;
+                let reads = sample_one_real(&device, &graph, &params()).unwrap();
+                assert_eq!(reads.len(), params().num_reads);
+                assert!(reads.iter().any(|read| read.spins == planted));
+                assert!(reads
+                    .iter()
+                    .any(|read| (read.energy - ground).abs() < 1e-10));
+                let spins: Vec<_> = reads.iter().map(|read| read.spins.clone()).collect();
+                if let Some(expected) = &baseline {
+                    assert_eq!(&spins, expected);
+                } else {
+                    baseline = Some(spins);
+                }
+                for read in reads {
+                    assert!((read.energy - energy(&read.spins, &graph)).abs() < 1e-10);
+                }
+            }
+        }
+        bench_many_real(&device, &graph, &params(), 1).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_real_large_coefficients_keep_finite_fields() {
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 4800).unwrap();
+    let graph = IsingGraph::new(vec![1.0e37; 3], vec![-6.0e37; 2], vec![(0, 1), (1, 2)]);
+    let params = SampleParams {
+        beta_range: Some((1.0e-38, 1.0e-36)),
+        ..params()
+    };
+    for metropolis in [false, true] {
+        device.gibbs_metropolis = metropolis;
+        for cap in [None, Some(0)] {
+            device.gibbs_shared_spins_cap = cap;
+            let reads = sample_one_real(&device, &graph, &params).unwrap();
+            assert!(reads.iter().any(|read| read.spins == vec![-1; 3]));
+            assert!(reads.iter().all(|read| read.energy.is_finite()));
+        }
+    }
+    let overflow = IsingGraph::new(vec![0.0; 3], vec![1.0e38; 2], vec![(0, 1), (1, 2)]);
+    let error = sample_one_real(&device, &overflow, &params).unwrap_err();
+    assert!(
+        matches!(error, SampleError::Unsupported(message) if message.contains("finite f32 delta"))
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
 fn sa_real_route_reaches_planted_ground_state() {
     let mut device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 5000).unwrap();
     let edges: Vec<_> = (0..64)

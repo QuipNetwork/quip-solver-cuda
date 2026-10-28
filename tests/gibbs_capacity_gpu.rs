@@ -85,10 +85,14 @@ fn gibbs_spill_matches_all_shared_at_every_cap() {
 #[ignore = "requires a CUDA GPU"]
 fn gibbs_threshold_selects_instantiation_and_runs() {
     let device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 4801).unwrap();
-    for n in [4800, 4801] {
+    for (n, variant) in [(4800, "gibbs"), (4801, "gibbs-spill")] {
         let graph = circulant(n);
         let reads = sample_one(&device, &graph, &params(), KernelKind::Gibbs).unwrap();
         check_energies(&graph, &reads);
+        assert_eq!(
+            quip_solver_cuda::streaming::last_gibbs_variant(&device),
+            Some(variant)
+        );
     }
     let device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 1000).unwrap();
     assert!(matches!(
