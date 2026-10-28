@@ -34,7 +34,6 @@ use quip_solver_core::SampleError as WireSampleError;
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome, StreamResult,
 };
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::error::TryRecvError;
@@ -577,6 +576,75 @@ impl AlgoState {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static PAIR_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn has_repeated_pairs(graph: &IsingGraph) -> Result<bool, SampleError> {
+    #[cfg(test)]
+    PAIR_SCAN_COUNT.set(PAIR_SCAN_COUNT.get() + 1);
+    let n = graph.num_nodes();
+    let nnz = n
+        .checked_mul(n)
+        .ok_or_else(|| SampleError::Unsupported("dense matrix size overflow".into()))?;
+    to_kernel_i32("dense matrix elements", nnz)?;
+    let mut seen = vec![0u8; nnz.div_ceil(8)];
+    for &(u, v) in graph.edges.iter() {
+        if u >= n || v >= n {
+            return Err(SampleError::Unsupported(
+                "dense edge endpoint is outside the graph".into(),
+            ));
+        }
+        let pair = u.min(v) * n + u.max(v);
+        if seen[pair / 8] & (1 << (pair % 8)) != 0 {
+            return Ok(true);
+        }
+        seen[pair / 8] |= 1 << (pair % 8);
+    }
+    Ok(false)
+}
+
+fn session_shape_and_storage(
+    limits: &capacity::DeviceLimits,
+    kernel: KernelKind,
+    graph: &IsingGraph,
+    forced: Option<capacity::Storage>,
+    reads: usize,
+    betas: usize,
+    precision: capacity::Precision,
+) -> Result<(capacity::ModelShape, capacity::Storage), SampleError> {
+    let n = graph.num_nodes();
+    let mut degrees = vec![0usize; n];
+    for &(u, v) in graph.edges.iter() {
+        if let Some(degree) = degrees.get_mut(u) {
+            *degree += 1;
+        }
+        if v != u {
+            if let Some(degree) = degrees.get_mut(v) {
+                *degree += 1;
+            }
+        }
+    }
+    let max_degree = degrees.into_iter().max().unwrap_or(0);
+    let shape = capacity::ModelShape {
+        nodes: n,
+        couplers: graph.edges.len(),
+        max_degree,
+    };
+    let mut storage = forced
+        .unwrap_or_else(|| capacity::route_storage(kernel, shape, precision, reads, betas, limits));
+    // Only automatic dense SA/Gibbs candidates can change storage on repeats.
+    if forced.is_none()
+        && kernel != KernelKind::Msa
+        && storage == capacity::Storage::Dense
+        && has_repeated_pairs(graph)?
+    {
+        storage = capacity::Storage::Sparse;
+    }
+    Ok((shape, storage))
+}
+
 /// Dense matrices use direct row-major positions and no CSR or colouring.
 fn session_topology(
     device: &CudaDevice,
@@ -588,42 +656,15 @@ fn session_topology(
     arithmetic: SessionArithmetic,
 ) -> Result<SelfFeedingTopology, SampleError> {
     let n = graph.num_nodes();
-    let mut degrees = vec![0usize; n];
-    let mut pairs = HashSet::with_capacity(graph.edges.len());
-    let mut repeated_pair = false;
-    for &(u, v) in graph.edges.iter() {
-        repeated_pair |= !pairs.insert((u.min(v), u.max(v)));
-        if let Some(degree) = degrees.get_mut(u) {
-            *degree += 1;
-        }
-        if v != u {
-            if let Some(degree) = degrees.get_mut(v) {
-                *degree += 1;
-            }
-        }
-    }
-    drop(pairs);
-    let max_degree = degrees.into_iter().max().unwrap_or(0);
-    let shape = capacity::ModelShape {
-        nodes: n,
-        couplers: graph.edges.len(),
-        max_degree,
-    };
-    let storage = forced.unwrap_or_else(|| {
-        // SA and Gibbs keep repeated terms in CSR. A dense matrix has only
-        // one coefficient per pair, regardless of edge orientation.
-        if repeated_pair && kernel != KernelKind::Msa {
-            return capacity::Storage::Sparse;
-        }
-        capacity::route_storage(
-            kernel,
-            shape,
-            capacity::Precision::from_plan(arithmetic.coefficients, true),
-            reads,
-            betas,
-            &device.limits,
-        )
-    });
+    let (shape, storage) = session_shape_and_storage(
+        &device.limits,
+        kernel,
+        graph,
+        forced,
+        reads,
+        betas,
+        capacity::Precision::from_plan(arithmetic.coefficients, true),
+    )?;
     check_model_capacity(
         device,
         kernel,
@@ -636,15 +677,13 @@ fn session_topology(
     if storage == capacity::Storage::Sparse {
         return Ok(SelfFeedingTopology::build(graph));
     }
-    if repeated_pair {
-        return Err(SampleError::Unsupported(
-            "dense storage requires unique couplers".into(),
-        ));
-    }
     let nnz = n
         .checked_mul(n)
         .ok_or_else(|| SampleError::Unsupported("dense matrix size overflow".into()))?;
     to_kernel_i32("dense matrix elements", nnz)?;
+    // Automatic dense SA/Gibbs routes already passed the pair scan.
+    let mut seen =
+        (kernel == KernelKind::Msa || forced.is_some()).then(|| vec![0u8; nnz.div_ceil(8)]);
     let mut edge_pos = Vec::with_capacity(graph.edges.len());
     for &(u, v) in graph.edges.iter() {
         if u >= n || v >= n {
@@ -654,6 +693,15 @@ fn session_topology(
         }
         let ij = u * n + v;
         let ji = v * n + u;
+        if let Some(seen) = &mut seen {
+            if seen[ij / 8] & (1 << (ij % 8)) != 0 {
+                return Err(SampleError::Unsupported(
+                    "dense storage requires unique couplers".into(),
+                ));
+            }
+            seen[ij / 8] |= 1 << (ij % 8);
+            seen[ji / 8] |= 1 << (ji % 8);
+        }
         edge_pos.push((u32::try_from(ij).unwrap(), u32::try_from(ji).unwrap()));
     }
     Ok(SelfFeedingTopology {
@@ -3448,6 +3496,116 @@ mod tests {
 
     use super::*;
     use tokio::sync::mpsc::channel;
+
+    fn routing_limits() -> capacity::DeviceLimits {
+        capacity::DeviceLimits {
+            shared_bytes_per_block: 49_152,
+            shared_bytes_per_block_optin: 101_376,
+            free_bytes: 15 << 30,
+            sm_count: 48,
+            threads_per_sm: 1536,
+        }
+    }
+
+    #[test]
+    fn pair_scan_skips_large_sparse_models() {
+        let n = 200_000;
+        let mut edges = Vec::with_capacity(n * 10);
+        for u in 0..n {
+            for offset in 1..=10 {
+                edges.push((u, (u + offset) % n));
+            }
+        }
+        let graph = IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges);
+        for kernel in [KernelKind::Sa, KernelKind::Gibbs, KernelKind::Msa] {
+            PAIR_SCAN_COUNT.set(0);
+            let (shape, storage) = session_shape_and_storage(
+                &routing_limits(),
+                kernel,
+                &graph,
+                None,
+                128,
+                64,
+                capacity::Precision::Binary,
+            )
+            .unwrap();
+            assert_eq!(shape, capacity::Connectivity::Degree(20).shape(n));
+            assert_eq!(storage, capacity::Storage::Sparse);
+            assert_eq!(PAIR_SCAN_COUNT.get(), 0, "kernel={kernel:?}");
+        }
+    }
+
+    #[test]
+    fn pair_scan_skips_msa_dense_admission() {
+        let n = 64;
+        let mut edges = Vec::new();
+        for u in 0..n {
+            for v in (u + 1)..n {
+                edges.push((u, v));
+            }
+        }
+        // MSA leaves duplicate refusal to the dense builder.
+        edges.push((1, 0));
+        let graph = IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges);
+        for forced in [None, Some(capacity::Storage::Dense)] {
+            PAIR_SCAN_COUNT.set(0);
+            let (_, storage) = session_shape_and_storage(
+                &routing_limits(),
+                KernelKind::Msa,
+                &graph,
+                forced,
+                128,
+                64,
+                capacity::Precision::Binary,
+            )
+            .unwrap();
+            assert_eq!(storage, capacity::Storage::Dense);
+            assert_eq!(PAIR_SCAN_COUNT.get(), 0);
+        }
+    }
+
+    #[test]
+    fn pair_scan_only_refines_automatic_dense_candidates() {
+        for edges in [vec![(0, 1)], vec![(0, 1), (0, 1)], vec![(0, 1), (1, 0)]] {
+            let repeated = edges.len() == 2;
+            let graph = IsingGraph::new(vec![0.0; 2], vec![1.0; edges.len()], edges);
+            for forced in [
+                None,
+                Some(capacity::Storage::Sparse),
+                Some(capacity::Storage::Dense),
+            ] {
+                PAIR_SCAN_COUNT.set(0);
+                let (shape, storage) = session_shape_and_storage(
+                    &routing_limits(),
+                    KernelKind::Sa,
+                    &graph,
+                    forced,
+                    256,
+                    64,
+                    capacity::Precision::Binary,
+                )
+                .unwrap();
+                assert_eq!(
+                    capacity::route_storage(
+                        KernelKind::Sa,
+                        shape,
+                        capacity::Precision::Binary,
+                        256,
+                        64,
+                        &routing_limits(),
+                    ),
+                    capacity::Storage::Dense,
+                );
+                let expected = forced.unwrap_or(if repeated {
+                    capacity::Storage::Sparse
+                } else {
+                    capacity::Storage::Dense
+                });
+                assert_eq!(storage, expected);
+                assert_eq!(PAIR_SCAN_COUNT.get(), usize::from(forced.is_none()));
+            }
+        }
+    }
 
     #[test]
     fn float_plan_refuses_overflowing_local_fields() {
