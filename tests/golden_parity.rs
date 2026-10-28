@@ -13,6 +13,7 @@
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::wire::{decode_spins, encode_spins};
 use quip_solver_conformance::GOLDEN_VECTORS;
+use quip_solver_cuda::capacity::default_nodes;
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::sampler::sample_ising;
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
@@ -34,7 +35,7 @@ fn device(kind: KernelKind) -> &'static CudaDevice {
         KernelKind::Gibbs => &GIBBS,
     };
     cell.get_or_init(|| {
-        CudaDevice::open_with_nodes(0, kind, 0).unwrap_or_else(|e| {
+        CudaDevice::open_with_nodes(0, kind, default_nodes(kind)).unwrap_or_else(|e| {
             panic!("CUDA device 0 required for golden_parity tests: {e}");
         })
     })

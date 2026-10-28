@@ -802,7 +802,7 @@ pub fn advertised_nodes(
     let want = requested.max(default_nodes(kernel));
     match kernel {
         KernelKind::Sa => limits.map_or(0, |limits| {
-            want.min(
+            requested.min(
                 max_model(
                     KernelKind::Sa,
                     Connectivity::Degree(0),
@@ -822,9 +822,9 @@ pub fn advertised_nodes(
 
 /// Resolve a requested capacity against the kernel and the device.
 ///
-/// A request below the default is raised to the default. A request above a
-/// Gibbs or MSA bound is an error. SA checks memory per model, so this
-/// function only resolves its optional lower node cap.
+/// Gibbs and MSA raise requests below their defaults and reject requests
+/// above their device bounds. SA preserves the requested cap independently
+/// of its fixed local frame and checks memory per model.
 ///
 /// # Errors
 ///
@@ -838,7 +838,7 @@ pub fn resolve(
     let floor = default_nodes(kernel);
     let want = requested.max(floor);
     let (budget, resource) = match kernel {
-        KernelKind::Sa => return Ok(want),
+        KernelKind::Sa => return Ok(requested),
         KernelKind::Msa => (
             msa_max_nodes(limits, msa_device_reads(limits)),
             BudgetResource::DeviceMemory,
@@ -1420,12 +1420,29 @@ mod tests {
         );
     }
 
-    /// A request below the default would shrink the kernel array for no
-    /// gain, so the default is a floor.
     #[test]
-    fn resolve_raises_a_small_request_to_the_default() {
+    fn sa_explicit_cap_below_the_local_frame_is_preserved() {
+        let limits = a4000_limits();
+        assert_eq!(resolve(KernelKind::Sa, 1000, &limits), Ok(1000));
+        assert_eq!(advertised_nodes(KernelKind::Sa, 1000, Some(&limits)), 1000);
+        let memory_limit = max_model(
+            KernelKind::Sa,
+            Connectivity::Degree(0),
+            Precision::Binary,
+            256,
+            &limits,
+        )
+        .nodes;
+        assert_eq!(
+            advertised_nodes(KernelKind::Sa, usize::MAX, Some(&limits)),
+            memory_limit
+        );
+    }
+
+    /// Gibbs and MSA retain their default node floors.
+    #[test]
+    fn resolve_gibbs_and_msa_raise_small_requests_to_the_default() {
         let limits = a4000(A4000_FREE);
-        assert_eq!(resolve(KernelKind::Sa, 64, &limits), Ok(SA_DEFAULT_NODES));
         assert_eq!(resolve(KernelKind::Msa, 64, &limits), Ok(MSA_DEFAULT_NODES));
         assert_eq!(
             resolve(KernelKind::Gibbs, 64, &limits),

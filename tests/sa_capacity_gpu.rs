@@ -1,7 +1,6 @@
 //! SA global-state parity and device-memory admission.
 
 use cudarc::driver::CudaContext;
-use quip_protocol::scoring::energy_milli;
 use quip_solver_cuda::capacity::{max_model, Connectivity, Precision};
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::sampler::SampleError;
@@ -61,16 +60,37 @@ fn sa_global_matches_local_samples() {
 #[ignore = "requires a CUDA GPU"]
 fn sa_threshold_selects_instantiation_and_runs() {
     let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 5001).unwrap();
+    let params = SampleParams {
+        num_sweeps: 8192,
+        sweeps_per_beta: 128,
+        ..params()
+    };
     for n in [5000, 5001] {
-        let graph = circulant(n, false);
-        let reads = sample_one(&device, &graph, &params(), KernelKind::Sa).unwrap();
+        let mut graph = circulant(n, false);
+        graph.j.fill(-1.0);
+        let reads = sample_one(&device, &graph, &params, KernelKind::Sa).unwrap();
         assert_eq!(reads.len(), 256);
+        // Each of the N * 10 edges contributes at least -1. Aligned spins attain it.
+        let ground_milli = -i64::try_from(n).unwrap() * 10 * 1000;
+        let mut reached_ground = false;
         for r in reads {
-            assert_eq!(
-                r.energy_milli,
-                energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
-            );
+            assert_eq!(r.spins.len(), n);
+            assert!(r.spins.iter().all(|&spin| spin == -1 || spin == 1));
+            let host_energy: i64 = graph
+                .edges
+                .iter()
+                .map(|&(u, v)| -i64::from(r.spins[u]) * i64::from(r.spins[v]) * 1000)
+                .sum();
+            assert_eq!(r.energy_milli, host_energy);
+            if host_energy == ground_milli {
+                assert!(r.spins.iter().all(|&spin| spin == r.spins[0]));
+                reached_ground = true;
+            }
         }
+        assert!(
+            reached_ground,
+            "N={n} did not reach the ferromagnetic ground state"
+        );
     }
 }
 

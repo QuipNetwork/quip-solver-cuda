@@ -223,6 +223,64 @@ fn sa_capabilities_report_device_memory_limits() {
     }
 }
 
+/// The admission cap can be smaller than the fixed local SA frame.
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU"]
+fn sa_cap_below_local_frame_advertises_and_refuses() {
+    ensure_built(&["quip-cuda-sa"]);
+    let out = Command::new(profile_bin("quip-cuda-sa"))
+        .args(["--max-nodes", "1000", "--capabilities"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(caps["maxNodes"], 1000);
+
+    for nodes in ["1000", "1001"] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = Command::new(profile_bin("quip-cuda-sa"))
+            .args([
+                "--max-nodes",
+                "1000",
+                "bench",
+                "run",
+                "--nodes",
+                nodes,
+                "--reads",
+                "8",
+                "--sweeps",
+                "4",
+                "--warmup",
+                "0",
+                "--repeats",
+                "1",
+                "--out",
+            ])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if nodes == "1000" {
+            assert!(out.status.success(), "{stderr}");
+        } else {
+            assert!(
+                !out.status.success(),
+                "1001 nodes must exceed the explicit cap"
+            );
+            // GraphTooLarge's Display message distinguishes the node cap from memory admission.
+            assert!(
+                stderr.contains("graph N=1001 exceeds self-feeding kernel limit 1000"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
 /// MSA capabilities use the selected device's memory snapshot.
 #[test]
 #[serial]
