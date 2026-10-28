@@ -339,7 +339,8 @@ pub fn sa_footprint(
         .saturating_mul(4)
         .saturating_add(betas.max(1).saturating_mul(4))
         .saturating_add(POOL_ALLOWANCE_BYTES);
-    if coef_bytes == 4 {
+    let delta_bytes = if precision == Precision::Binary { 1 } else { 4 };
+    if precision == Precision::Int8 || precision == Precision::Int32 {
         shared = shared
             .saturating_add(betas.max(1).saturating_mul(12))
             .saturating_add(crate::accept_table::NEGLOG_LEN * 8);
@@ -366,7 +367,7 @@ pub fn sa_footprint(
         .saturating_add(
             n.max(1)
                 .saturating_mul(SA_THREADS_PER_NONCE)
-                .saturating_mul(coef_bytes + 1),
+                .saturating_mul(delta_bytes + 1),
         );
     Footprint {
         shared_bytes: shared,

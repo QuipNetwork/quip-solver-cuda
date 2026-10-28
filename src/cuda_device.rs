@@ -3,6 +3,7 @@
 //! One process owns one device (`[cuda.N]` → device N / miner id `cuda-N`).
 
 use crate::capacity;
+use crate::coefficients::CoefficientPath;
 use crate::jit_cache;
 use crate::kernel::KernelKind;
 use crate::stream_pool::StreamPool;
@@ -19,6 +20,10 @@ const SA_SRC: &str = include_str!("../kernels/sa.cu");
 pub const SA_WIDE_DEFINE: &str = "-DQUIP_SA_WIDE";
 /// NVRTC define selecting global SA spin and delta storage.
 pub const SA_GLOBAL_DEFINE: &str = "-DQUIP_SA_GLOBAL_STATE";
+/// NVRTC define selecting i8 SA coefficients with wide integer deltas.
+pub const SA_COEF_I8_DEFINE: &str = "-DQUIP_SA_COEF_I8_DELTA_I32";
+/// NVRTC define selecting real SA coefficients and deltas.
+pub const SA_COEF_F32_DEFINE: &str = "-DQUIP_SA_COEF_F32";
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
 /// Multi-spin coded SA, see `kernels/msa.cu`.
 const MSA_SRC: &str = include_str!("../kernels/msa.cu");
@@ -294,8 +299,17 @@ fn compile_all_kernels(
     Ok((sa, sa_wide, msa, gibbs, msa_weighted))
 }
 
-/// Compile global SA variants only for an SA device open.
-fn compile_sa_global(ctx: &Arc<CudaContext>) -> Result<(CudaFunction, CudaFunction), CudaError> {
+pub(crate) struct SaVariants {
+    pub global: CudaFunction,
+    pub wide_global: CudaFunction,
+    pub int8: CudaFunction,
+    pub int8_global: CudaFunction,
+    pub real: CudaFunction,
+    pub real_global: CudaFunction,
+}
+
+/// Compile additional SA variants only for an SA device open.
+fn compile_sa_variants(ctx: &Arc<CudaContext>) -> Result<SaVariants, CudaError> {
     let arch = device_arch(ctx);
     let arch_name = format!("sm_{arch}");
     let driver = driver_version()?;
@@ -313,10 +327,14 @@ fn compile_sa_global(ctx: &Arc<CudaContext>) -> Result<(CudaFunction, CudaFuncti
         .load_function("cuda_sa_self_feeding")
         .map_err(CudaError::from)
     };
-    Ok((
-        compile("sa-global", &[SA_GLOBAL_DEFINE])?,
-        compile("sa-wide-global", &[SA_GLOBAL_DEFINE, SA_WIDE_DEFINE])?,
-    ))
+    Ok(SaVariants {
+        global: compile("sa-global", &[SA_GLOBAL_DEFINE])?,
+        wide_global: compile("sa-wide-global", &[SA_GLOBAL_DEFINE, SA_WIDE_DEFINE])?,
+        int8: compile("sa-wi8", &[SA_COEF_I8_DEFINE])?,
+        int8_global: compile("sa-wi8-global", &[SA_GLOBAL_DEFINE, SA_COEF_I8_DEFINE])?,
+        real: compile("sa-f32", &[SA_COEF_F32_DEFINE])?,
+        real_global: compile("sa-f32-global", &[SA_GLOBAL_DEFINE, SA_COEF_F32_DEFINE])?,
+    })
 }
 
 /// Verify the loaded msa kernel declares no more static shared
@@ -382,7 +400,8 @@ pub struct CudaDevice {
     pub(crate) sa: CudaFunction,
     /// Wide `cuda_sa_self_feeding`, compiled with [`SA_WIDE_DEFINE`].
     pub(crate) sa_wide: CudaFunction,
-    pub(crate) sa_global: Option<(CudaFunction, CudaFunction)>,
+    pub(crate) sa_variants: Option<SaVariants>,
+    pub(crate) kernel: KernelKind,
     /// `cuda_gibbs_self_feeding` — persistent kernel, `sms_per_nonce` blocks
     /// per nonce.
     pub(crate) gibbs: CudaFunction,
@@ -409,6 +428,8 @@ pub struct CudaDevice {
     pub max_nodes: usize,
     /// Force the global SA instantiation for parity tests. Defaults to false.
     pub sa_force_global: bool,
+    /// Force an exact SA coefficient path for parity tests. Defaults to None.
+    pub sa_force_path: Option<CoefficientPath>,
     _sa_mod: Arc<CudaModule>,
     _sa_wide_mod: Arc<CudaModule>,
     _gibbs_mod: Arc<CudaModule>,
@@ -425,6 +446,8 @@ impl fmt::Debug for CudaDevice {
             .field("max_sms", &self.max_sms)
             .field("max_nodes", &self.max_nodes)
             .field("sa_force_global", &self.sa_force_global)
+            .field("sa_force_path", &self.sa_force_path)
+            .field("kernel", &self.kernel)
             .field("msa_dynamic_shared_bytes", &self.msa_dynamic_shared_bytes)
             .finish_non_exhaustive()
     }
@@ -544,8 +567,8 @@ impl CudaDevice {
             }
         };
         let sa_nodes = capacity::SA_DEFAULT_NODES;
-        let sa_global = if kernel == KernelKind::Sa {
-            Some(compile_sa_global(&ctx)?)
+        let sa_variants = if kernel == KernelKind::Sa {
+            Some(compile_sa_variants(&ctx)?)
         } else {
             None
         };
@@ -615,7 +638,9 @@ impl CudaDevice {
             limits,
             max_nodes: resolved,
             sa_force_global: false,
-            sa_global,
+            sa_variants,
+            kernel,
+            sa_force_path: None,
             _sa_mod: sa_mod,
             _sa_wide_mod: sa_wide_mod,
             _gibbs_mod: gibbs_mod,

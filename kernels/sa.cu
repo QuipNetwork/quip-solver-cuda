@@ -64,8 +64,22 @@
 // below names the type the line used before. -DQUIP_SA_WIDE builds the
 // exact fixed-point fallback (src/coefficients.rs, src/accept_table.rs):
 // i32 coefficients and delta, and an integer-only Metropolis test.
-#ifdef QUIP_SA_WIDE
+#ifdef QUIP_SA_COEF_I8_DELTA_I32
+#define QUIP_SA_WIDE
+#endif
+#if defined(QUIP_SA_COEF_F32) && defined(QUIP_SA_WIDE)
+#error "SA float and integer coefficient defines are mutually exclusive"
+#endif
+#ifdef QUIP_SA_COEF_F32
+typedef float coef_t;
+typedef float delta_t;
+typedef float energy_t;
+#elif defined(QUIP_SA_WIDE)
+#ifdef QUIP_SA_COEF_I8_DELTA_I32
+typedef signed char coef_t;
+#else
 typedef int coef_t;
+#endif
 typedef int delta_t;
 typedef long long energy_t;
 #define NEGLOG_MASK 65535
@@ -74,7 +88,7 @@ typedef signed char coef_t;
 typedef signed char delta_t;
 typedef int energy_t;
 #endif
-#ifdef QUIP_SA_WIDE
+#if defined(QUIP_SA_WIDE) && !defined(QUIP_SA_COEF_I8_DELTA_I32)
 static_assert(sizeof(coef_t) == 4, "wide build uses i32 coefficients");
 #endif
 
@@ -121,10 +135,18 @@ __device__ delta_t get_flip_energy_unpacked(
     const int start = __ldg(&csr_row_ptr[var]);
     const int end = __ldg(&csr_row_ptr[var + 1]);
 
+#ifdef QUIP_SA_COEF_F32
+    float energy = 0;
+#else
     int energy = 0;
+#endif
 
     if (h != NULL) {
+#ifdef QUIP_SA_COEF_F32
+        energy += __ldg(&h[var]);
+#else
         energy += (int)__ldg(&h[var]);
+#endif
     }
 
     #pragma unroll 20
@@ -336,7 +358,11 @@ __global__ void cuda_sa_self_feeding(
                 signed char spin_i = unpacked_state[i];
 #endif
                 current_energy +=
+#ifdef QUIP_SA_COEF_F32
+                    __ldg(&my_h[i]) * spin_i;
+#else
                     (int)__ldg(&my_h[i]) * spin_i;
+#endif
                 const int start =
                     __ldg(&csr_row_ptr[i]);
                 const int end =
@@ -376,7 +402,9 @@ __global__ void cuda_sa_self_feeding(
 #else
                 float beta = __ldg(
                     &beta_schedule[beta_idx]);
+#ifndef QUIP_SA_COEF_F32
                 float threshold = 22.18f / beta;
+#endif
 #endif
 
                 for (int sweep = 0;
@@ -402,6 +430,15 @@ __global__ void cuda_sa_self_feeding(
                             flip_spin =
                                 (long long)de * rung_beta
                                 < __ldg(&neglog_table[r & NEGLOG_MASK]);
+                        }
+#elif defined(QUIP_SA_COEF_F32)
+                        // Match the real MSA acceptance with this thread's draw.
+                        // 23 bits keep k + 0.5f exact and the uniform below 1.
+                        bool flip_spin = de <= 0;
+                        if (!flip_spin) {
+                            const unsigned int draw = xorshift32(rng_state);
+                            const float u = ((float)(draw >> 9) + 0.5f) * 1.1920929e-7f;
+                            flip_spin = u < __expf(-beta * de);
                         }
 #else
                         if (de >= threshold) {

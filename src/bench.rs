@@ -122,7 +122,7 @@ pub struct RunArgs {
     /// Coefficient tier (default: binary). Redraws fields and couplings at the selected precision.
     #[arg(long, value_enum)]
     pub precision: Option<BenchPrecision>,
-    /// Real-valued `.qmodel` file. Uses the MSA f32 coefficient path.
+    /// Real-valued `.qmodel` file. Uses the selected kernel's f32 coefficient path.
     #[arg(long, conflicts_with_all = ["source", "degree", "shuffle", "precision"])]
     pub model: Option<PathBuf>,
     /// Complete synthetic graph with N nodes and the selected precision.
@@ -704,9 +704,9 @@ fn run_run(
             "--msa-path requires the MSA kernel".into(),
         ));
     }
-    if uses_real(args) && kernel != KernelKind::Msa {
+    if uses_real(args) && kernel == KernelKind::Gibbs {
         return Err(BenchError::Args(
-            "real coefficients require the MSA kernel".into(),
+            "real coefficients require the SA or MSA kernel".into(),
         ));
     }
     if args.msa_shared_spins.is_some() && kernel != KernelKind::Msa {

@@ -545,6 +545,10 @@ enum AlgoState {
         d_state: Option<CudaSlice<i8>>,
         d_delta_energy: CudaSlice<i8>,
     },
+    SaReal {
+        d_state: Option<CudaSlice<i8>>,
+        d_delta_energy: CudaSlice<f32>,
+    },
     SaWide {
         d_state: Option<CudaSlice<i8>>,
         d_delta_energy: CudaSlice<i32>,
@@ -567,7 +571,7 @@ impl AlgoState {
         match self {
             Self::Msa(msa) | Self::MsaWeighted { msa, .. } => msa.shared_bytes,
             Self::MsaDense { shared_bytes, .. } => *shared_bytes,
-            Self::Sa { .. } | Self::SaWide { .. } | Self::Gibbs { .. } => 0,
+            Self::Sa { .. } | Self::SaWide { .. } | Self::SaReal { .. } | Self::Gibbs { .. } => 0,
         }
     }
 }
@@ -811,7 +815,7 @@ fn sa_global_state(
     if nodes <= capacity::SA_DEFAULT_NODES && !device.sa_force_global {
         return Ok(None);
     }
-    if device.sa_global.is_none() {
+    if device.sa_variants.is_none() {
         return Err(SampleError::Unsupported(
             "global SA requires an SA device open".into(),
         ));
@@ -821,15 +825,22 @@ fn sa_global_state(
     )?))
 }
 
-/// Allocate the wide SA workspace and its fixed-point acceptance buffers.
-fn build_sa_wide_state(
+/// Allocate wide SA deltas and, for integer paths, fixed-point acceptance buffers.
+fn build_sa_state(
     device: &CudaDevice,
     stream: &Arc<CudaStream>,
     n: usize,
     num_nonces: usize,
     max_num_betas: usize,
+    path: CoefficientPath,
 ) -> Result<AlgoState, SampleError> {
     let total_threads = num_nonces * 256;
+    if path == CoefficientPath::Float32 {
+        return Ok(AlgoState::SaReal {
+            d_state: sa_global_state(device, stream, n, num_nonces)?,
+            d_delta_energy: stream.alloc_zeros::<f32>(total_threads * n.max(1))?,
+        });
+    }
     Ok(AlgoState::SaWide {
         d_state: sa_global_state(device, stream, n, num_nonces)?,
         d_delta_energy: stream.alloc_zeros::<i32>(total_threads * n.max(1))?,
@@ -1023,18 +1034,11 @@ impl<'a> SelfFeedingSession<'a> {
         let stream_compute = Arc::clone(&streams.compute);
         let stream_transfer = Arc::clone(&streams.transfer);
 
-        let row_ptr = if topology.row_ptr.is_empty() {
-            vec![0i32]
-        } else {
-            topology.row_ptr.clone()
-        };
-        let col_ind = if topology.col_ind.is_empty() {
-            vec![0i32]
-        } else {
-            topology.col_ind.clone()
-        };
-        let d_row_ptr = stream_compute.clone_htod(&row_ptr)?;
-        let d_col_ind = stream_compute.clone_htod(&col_ind)?;
+        let (row, col) = (&topology.row_ptr[..], &topology.col_ind[..]);
+        let row = if row.is_empty() { &[0][..] } else { row };
+        let col = if col.is_empty() { &[0][..] } else { col };
+        let d_row_ptr = stream_compute.clone_htod(row)?;
+        let d_col_ind = stream_compute.clone_htod(col)?;
 
         let coefs =
             SlotCoefficients::allocate(&stream_compute, plan.path, total_slots, nnz_alloc, n)?;
@@ -1054,8 +1058,15 @@ impl<'a> SelfFeedingSession<'a> {
                 max_num_betas,
                 arithmetic,
             )?
-        } else if kernel == KernelKind::Sa && plan.path == CoefficientPath::Wide {
-            build_sa_wide_state(device, &stream_compute, n, num_nonces, max_num_betas)?
+        } else if kernel == KernelKind::Sa && plan.path != CoefficientPath::Int8 {
+            build_sa_state(
+                device,
+                &stream_compute,
+                n,
+                num_nonces,
+                max_num_betas,
+                plan.path,
+            )?
         } else if kernel == KernelKind::Msa && plan.path != CoefficientPath::Int8 {
             build_msa_weighted_state(
                 device,
@@ -1531,36 +1542,48 @@ impl<'a> SelfFeedingSession<'a> {
         sweeps_per_beta: i32,
         seed: u32,
     ) -> Result<(), SampleError> {
-        let AlgoState::Sa {
-            d_state,
-            d_delta_energy,
-        } = &self.algo_state
+        let (AlgoState::Sa { d_state, .. }
+        | AlgoState::SaWide { d_state, .. }
+        | AlgoState::SaReal { d_state, .. }) = &self.algo_state
         else {
             return Err(SampleError::Driver("launch_sa without SA state".into()));
         };
+        let global = d_state.is_some();
+        let function = match (self.plan.path, global) {
+            (CoefficientPath::Int8, false) => &self.device.sa,
+            (CoefficientPath::Wide, false) => &self.device.sa_wide,
+            (path, global) => {
+                let kernels = self.device.sa_variants.as_ref().ok_or_else(|| {
+                    SampleError::Unsupported("SA variants require an SA device open".into())
+                })?;
+                match (path, global) {
+                    (CoefficientPath::Int8, _) => &kernels.global,
+                    (CoefficientPath::Wide, _) => &kernels.wide_global,
+                    (CoefficientPath::WeightedInt8, false) => &kernels.int8,
+                    (CoefficientPath::WeightedInt8, true) => &kernels.int8_global,
+                    (CoefficientPath::Float32, false) => &kernels.real,
+                    (CoefficientPath::Float32, true) => &kernels.real_global,
+                }
+            }
+        };
         let dims = &self.dims;
-        let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
-            return Err(SampleError::Driver(
-                "launch_sa without int8 coefficients".into(),
-            ));
-        };
-        let function = if d_state.is_some() {
-            &self
-                .device
-                .sa_global
-                .as_ref()
-                .ok_or_else(|| {
-                    SampleError::Unsupported("global SA requires an SA device open".into())
-                })?
-                .0
-        } else {
-            &self.device.sa
-        };
         let mut b = self.stream_compute.launch_builder(function);
         b.arg(&self.d_row_ptr);
         b.arg(&self.d_col_ind);
-        b.arg(d_j);
-        b.arg(d_h);
+        match &self.coefs {
+            SlotCoefficients::Int8 { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+            SlotCoefficients::Wide { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+            SlotCoefficients::Float32 { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+        }
         b.arg(&self.d_samples);
         b.arg(&self.d_energies);
         b.arg(&self.d_beta);
@@ -1573,84 +1596,37 @@ impl<'a> SelfFeedingSession<'a> {
         b.arg(&dims.nnz);
         b.arg(&dims.max_packed);
         b.arg(&seed);
-        b.arg(d_delta_energy);
+        match &self.algo_state {
+            AlgoState::Sa { d_delta_energy, .. } => {
+                b.arg(d_delta_energy);
+            }
+            AlgoState::SaWide { d_delta_energy, .. } => {
+                b.arg(d_delta_energy);
+            }
+            AlgoState::SaReal { d_delta_energy, .. } => {
+                b.arg(d_delta_energy);
+            }
+            _ => unreachable!("SA state checked above"),
+        }
         b.arg(&dims.n);
         if let Some(state) = d_state {
             b.arg(state);
         }
-        // SAFETY: arguments match the selected SA signature. The global
-        // variant adds its state pointer after max_N. The local variant
-        // only receives N <= SA_DEFAULT_NODES. Buffers use these launch
-        // dimensions and remain alive until Drop synchronizes.
-        unsafe { b.launch(cfg) }?;
-        Ok(())
-    }
-
-    fn launch_sa_wide(
-        &self,
-        cfg: LaunchConfig,
-        num_betas: i32,
-        sweeps_per_beta: i32,
-        seed: u32,
-    ) -> Result<(), SampleError> {
-        let AlgoState::SaWide {
-            d_state,
-            d_delta_energy,
+        if let AlgoState::SaWide {
             d_beta_fixed,
             d_delta_cut,
             d_neglog,
+            ..
         } = &self.algo_state
-        else {
-            return Err(SampleError::Driver(
-                "launch_sa_wide without wide SA state".into(),
-            ));
-        };
-        let dims = &self.dims;
-        let SlotCoefficients::Wide { d_j, d_h, .. } = &self.coefs else {
-            return Err(SampleError::Driver(
-                "launch_sa_wide without wide coefficients".into(),
-            ));
-        };
-        let function = if d_state.is_some() {
-            &self
-                .device
-                .sa_global
-                .as_ref()
-                .ok_or_else(|| {
-                    SampleError::Unsupported("global SA requires an SA device open".into())
-                })?
-                .1
-        } else {
-            &self.device.sa_wide
-        };
-        let mut b = self.stream_compute.launch_builder(function);
-        b.arg(&self.d_row_ptr);
-        b.arg(&self.d_col_ind);
-        b.arg(d_j);
-        b.arg(d_h);
-        b.arg(&self.d_samples);
-        b.arg(&self.d_energies);
-        b.arg(&self.d_beta);
-        b.arg(&num_betas);
-        b.arg(&sweeps_per_beta);
-        b.arg(&self.d_ctrl);
-        b.arg(&dims.num_nonces);
-        b.arg(&dims.reads_per_nonce);
-        b.arg(&dims.n);
-        b.arg(&dims.nnz);
-        b.arg(&dims.max_packed);
-        b.arg(&seed);
-        b.arg(d_delta_energy);
-        b.arg(&dims.n);
-        if let Some(state) = d_state {
-            b.arg(state);
+        {
+            b.arg(d_beta_fixed);
+            b.arg(d_delta_cut);
+            b.arg(d_neglog);
         }
-        b.arg(d_beta_fixed);
-        b.arg(d_delta_cut);
-        b.arg(d_neglog);
-        // SAFETY: arguments match the selected local or global wide signature.
-        // Global state adds one pointer before the acceptance tables. All buffers
-        // use the launch dimensions and remain alive until Drop synchronizes.
+        // SAFETY: the coefficient plan selects matching buffers and kernel types.
+        // Global state adds one pointer before the integer acceptance tables.
+        // Local variants receive N <= SA_DEFAULT_NODES. All buffers remain alive
+        // until Drop synchronizes the compute stream.
         unsafe { b.launch(cfg) }?;
         Ok(())
     }
@@ -1712,9 +1688,8 @@ impl<'a> SelfFeedingSession<'a> {
             AlgoState::MsaWeighted { .. } => {
                 self.launch_msa_weighted(cfg, num_betas, sweeps_per_beta, seed)?;
             }
-            AlgoState::Sa { .. } => self.launch_sa(cfg, num_betas, sweeps_per_beta, seed)?,
-            AlgoState::SaWide { .. } => {
-                self.launch_sa_wide(cfg, num_betas, sweeps_per_beta, seed)?;
+            AlgoState::Sa { .. } | AlgoState::SaWide { .. } | AlgoState::SaReal { .. } => {
+                self.launch_sa(cfg, num_betas, sweeps_per_beta, seed)?;
             }
             AlgoState::Gibbs {
                 d_block_starts,
@@ -2085,7 +2060,21 @@ pub fn sample_one(
     params: &SampleParams,
     kernel: KernelKind,
 ) -> Result<Vec<SamplerResult>, SampleError> {
-    let plan = coefficients::plan(kernel, graph).map_err(SampleError::Unsupported)?;
+    let mut plan = coefficients::plan(kernel, graph).map_err(SampleError::Unsupported)?;
+    if kernel == KernelKind::Sa {
+        if let Some(forced) = device.sa_force_path {
+            if forced == plan.path
+                || forced == CoefficientPath::Wide
+                || (forced == CoefficientPath::WeightedInt8 && plan.path == CoefficientPath::Int8)
+            {
+                plan.path = forced;
+            } else {
+                return Err(SampleError::Unsupported(
+                    "forced SA path cannot hold exact coefficients".into(),
+                ));
+            }
+        }
+    }
     Ok(
         sample_one_planned(device, graph, params, kernel, plan, None)?
             .into_iter()
@@ -2170,7 +2159,7 @@ pub struct RealSample {
 /// Real-valued reads returned by [`sample_one_real`].
 pub type SampleSet = Vec<RealSample>;
 
-/// Sample an MSA graph, trying exact coefficients before real f32 storage.
+/// Sample a graph on the device kernel, trying exact coefficients before real f32 storage.
 ///
 /// # Errors
 /// Returns the same device and capacity errors as [`sample_one`].
@@ -2181,8 +2170,8 @@ pub fn sample_one_real(
     graph: &IsingGraph,
     params: &SampleParams,
 ) -> Result<SampleSet, SampleError> {
-    let plan = real_plan(graph)?;
-    let reads = sample_one_planned(device, graph, params, KernelKind::Msa, plan, None)?;
+    let plan = real_plan(device, graph)?;
+    let reads = sample_one_planned(device, graph, params, device.kernel, plan, None)?;
     Ok(reads
         .into_iter()
         .map(|read| RealSample {
@@ -2208,7 +2197,7 @@ pub fn sample_one_real_forced(
         // Preserve the exact dense diagonal fixture, whose terms are constant.
         coefficients::plan(KernelKind::Msa, graph).map_err(SampleError::Unsupported)?
     } else {
-        real_plan(graph)?
+        real_plan(device, graph)?
     };
     let reads = sample_one_planned(device, graph, params, KernelKind::Msa, plan, Some(storage))?;
     Ok(reads
@@ -2244,9 +2233,18 @@ pub fn last_storage(device: &CudaDevice) -> Option<capacity::Storage> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn real_plan(graph: &IsingGraph) -> Result<CoefficientPlan, SampleError> {
+fn check_real_kernel(device: &CudaDevice) -> Result<(), SampleError> {
+    if device.kernel == KernelKind::Gibbs {
+        return Err(SampleError::Unsupported(
+            "real coefficients require the SA or MSA kernel".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn real_plan(device: &CudaDevice, graph: &IsingGraph) -> Result<CoefficientPlan, SampleError> {
     validate_real_graph(graph)?;
-    match coefficients::plan(KernelKind::Msa, graph) {
+    match coefficients::plan(device.kernel, graph) {
         Ok(plan) => Ok(plan),
         Err(_)
             if graph
@@ -2255,6 +2253,7 @@ fn real_plan(graph: &IsingGraph) -> Result<CoefficientPlan, SampleError> {
                 .chain(&graph.j)
                 .any(|&v| coefficients::to_milli(v).is_none()) =>
         {
+            check_real_kernel(device)?;
             float_plan(graph)
         }
         Err(error) => Err(SampleError::Unsupported(error)),
@@ -2434,7 +2433,7 @@ pub fn bench_many(
     ))
 }
 
-/// Time real f32 MSA coefficients with `num_nonces` concurrent models.
+/// Time real f32 coefficients with `num_nonces` concurrent models.
 /// Returned energies use the original f64 graph and exclude any file offset.
 ///
 /// # Errors
@@ -2446,16 +2445,10 @@ pub fn bench_many_real(
     params: &SampleParams,
     num_nonces: usize,
 ) -> Result<(SampleSet, DeviceTimings), SampleError> {
+    check_real_kernel(device)?;
     let plan = float_plan(graph)?;
-    let (reads, timing) = bench_many_planned(
-        device,
-        graph,
-        params,
-        KernelKind::Msa,
-        Some(MsaLane::F32),
-        num_nonces,
-        plan,
-    )?;
+    let (reads, timing) =
+        bench_many_planned(device, graph, params, device.kernel, None, num_nonces, plan)?;
     Ok((
         reads
             .into_iter()

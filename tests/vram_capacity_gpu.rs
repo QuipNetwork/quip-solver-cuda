@@ -201,7 +201,12 @@ fn sa_allocation_cases() {
     let nodes = 20_000;
     let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, nodes).unwrap();
     let ctx = CudaContext::new(0).unwrap();
-    for precision in [Precision::Binary, Precision::Int32] {
+    for precision in [
+        Precision::Binary,
+        Precision::Int8,
+        Precision::Int32,
+        Precision::Float32,
+    ] {
         let graph = circulant(nodes, 20, precision);
         let params = SampleParams {
             num_reads: 256,
@@ -228,15 +233,19 @@ fn sa_allocation_cases() {
             free: Arc::clone(&free),
         };
         tracing::subscriber::with_default(tracing_subscriber::registry().with(observer), || {
-            bench_many(
-                &device,
-                &graph,
-                &params,
-                KernelKind::Sa,
-                None,
-                footprint.instances,
-            )
-            .unwrap();
+            if precision == Precision::Float32 {
+                bench_many_real(&device, &graph, &params, footprint.instances).unwrap();
+            } else {
+                bench_many(
+                    &device,
+                    &graph,
+                    &params,
+                    KernelKind::Sa,
+                    None,
+                    footprint.instances,
+                )
+                .unwrap();
+            }
         });
         let after = free.load(Ordering::SeqCst);
         assert_ne!(after, 0);

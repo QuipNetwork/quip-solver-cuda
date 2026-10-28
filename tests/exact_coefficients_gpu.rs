@@ -11,6 +11,32 @@ use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 use serial_test::serial;
 use std::sync::OnceLock;
 
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn sa_weighted_int8_matches_wide_samples() {
+    use quip_solver_cuda::coefficients::CoefficientPath;
+    use quip_solver_cuda::streaming::sample_one;
+
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 5000).unwrap();
+    let edges: Vec<_> = (0..70)
+        .flat_map(|u| (u + 1..70).map(move |v| (u, v)))
+        .collect();
+    let graph = IsingGraph::new(vec![0.0; 70], vec![1.0; edges.len()], edges);
+    for global in [false, true] {
+        device.sa_force_global = global;
+        device.sa_force_path = Some(CoefficientPath::Wide);
+        let wide = sample_one(&device, &graph, &params(), KernelKind::Sa).unwrap();
+        device.sa_force_path = Some(CoefficientPath::WeightedInt8);
+        let narrow = sample_one(&device, &graph, &params(), KernelKind::Sa).unwrap();
+        assert_eq!(wide.len(), narrow.len());
+        for (a, b) in wide.iter().zip(narrow) {
+            assert_eq!(a.spins, b.spins, "global={global}");
+            assert_eq!(a.energy_milli, b.energy_milli);
+        }
+    }
+}
+
 fn device(kind: KernelKind) -> &'static CudaDevice {
     static SA: OnceLock<CudaDevice> = OnceLock::new();
     static GIBBS: OnceLock<CudaDevice> = OnceLock::new();
@@ -366,7 +392,7 @@ fn assert_stream_separates_scales(kind: KernelKind) {
 #[test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
-fn sa_stream_mixes_unit_wide_refused_and_unit_jobs() {
+fn sa_stream_mixes_unit_weighted_wide_refused_and_unit_jobs() {
     assert_stream_mixes_paths_and_refusal(KernelKind::Sa);
 }
 
@@ -388,7 +414,7 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
     // Field 66 exceeds SA's int8 delta bound and MSA's unit coefficients.
     let mut fields = vec![0.0; 12];
     fields[0] = 64.0;
-    let wide = IsingGraph::new(
+    let weighted = IsingGraph::new(
         fields,
         vec![1.0; 12],
         (0..12).map(|i| (i, (i + 1) % 12)).collect(),
@@ -397,17 +423,16 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
     let dev = device(kind);
     assert_eq!(plan(kind, &unit).unwrap().path, CoefficientPath::Int8);
     assert_eq!(
-        plan(kind, &wide).unwrap().path,
-        if kind == KernelKind::Msa {
-            CoefficientPath::WeightedInt8
-        } else {
-            CoefficientPath::Wide
-        }
+        plan(kind, &weighted).unwrap().path,
+        CoefficientPath::WeightedInt8
     );
 
-    let mut graphs = vec![unit.clone()];
+    let mut wide = weighted.clone();
+    wide.h[0] = 64.001;
+    assert_eq!(plan(kind, &wide).unwrap().path, CoefficientPath::Wide);
+    let mut graphs = vec![unit.clone(), wide];
     // Fill cold-start admission so the refusal reaches the running session's pump.
-    graphs.extend((0..stream_width(dev, kind)).map(|_| wide.clone()));
+    graphs.extend((0..stream_width(dev, kind)).map(|_| weighted.clone()));
     let refused_id = graphs.len();
     graphs.extend([refused, unit]);
     let (job_tx, job_rx) = channel::<StreamJob>(graphs.len());

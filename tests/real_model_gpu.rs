@@ -7,6 +7,31 @@ use quip_solver_cuda::sampler::SampleError;
 use quip_solver_cuda::streaming::{bench_many_real, bench_one, sample_one, sample_one_real};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_real_route_reaches_planted_ground_state() {
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 5000).unwrap();
+    let edges: Vec<_> = (0..64)
+        .flat_map(|u| (1..=10).map(move |d| (u, (u + d) % 64)))
+        .collect();
+    let graph = IsingGraph::new(
+        vec![0.125_000_01; 64],
+        vec![-1.000_000_1; edges.len()],
+        edges,
+    );
+    let ground = energy(&[-1; 64], &graph);
+    assert!(sample_one(&device, &graph, &params(), KernelKind::Sa).is_err());
+    for global in [false, true] {
+        device.sa_force_global = global;
+        let reads = sample_one_real(&device, &graph, &params()).unwrap();
+        assert_eq!(reads.len(), params().num_reads);
+        assert!(reads.iter().any(|read| read.spins == vec![-1; 64]));
+        assert!(reads
+            .iter()
+            .any(|read| (read.energy - ground).abs() < 1e-10));
+    }
+}
+
 fn device() -> CudaDevice {
     CudaDevice::open_with_nodes(0, KernelKind::Msa, 50_000).unwrap()
 }

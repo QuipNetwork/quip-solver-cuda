@@ -129,6 +129,20 @@ fn every_supported_arch_compiles_and_assembles_every_kernel() {
                 5000,
                 &["-DQUIP_SA_GLOBAL_STATE", SA_WIDE_DEFINE][..],
             ),
+            ("sa-wi8", SA_SRC, 5000, &["-DQUIP_SA_COEF_I8_DELTA_I32"][..]),
+            (
+                "sa-wi8-global",
+                SA_SRC,
+                5000,
+                &["-DQUIP_SA_GLOBAL_STATE", "-DQUIP_SA_COEF_I8_DELTA_I32"][..],
+            ),
+            ("sa-f32", SA_SRC, 5000, &["-DQUIP_SA_COEF_F32"][..]),
+            (
+                "sa-f32-global",
+                SA_SRC,
+                5000,
+                &["-DQUIP_SA_GLOBAL_STATE", "-DQUIP_SA_COEF_F32"][..],
+            ),
             (
                 "msa-weighted-i32",
                 MSA_SRC,

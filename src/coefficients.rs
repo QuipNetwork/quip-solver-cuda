@@ -40,9 +40,9 @@ pub enum CoefficientPath {
     Int8,
     /// i32 coefficients: wide SA delta or weighted MSA lane arithmetic.
     Wide,
-    /// Scaled i8 coefficients on a weighted MSA lane.
+    /// Scaled i8 coefficients with wide SA deltas or a weighted MSA lane.
     WeightedInt8,
-    /// Real f32 coefficients on the MSA f32 lane, never selected for mining.
+    /// Real f32 coefficients, never selected for mining.
     Float32,
 }
 
@@ -200,7 +200,7 @@ pub(crate) fn plan_with_unit(
         KernelKind::Sa if field > WIDE_MAX_FIELD => Err(format!(
             "sa: local field {field} times the model's {scale_milli} milli step exceeds the wide path's limit of {WIDE_MAX_FIELD}"
         )),
-        KernelKind::Sa => Ok(CoefficientPlan { path: CoefficientPath::Wide, scale_milli }),
+        KernelKind::Sa => Ok(CoefficientPlan { path: if max_coef <= INT8_MAX_COEF { CoefficientPath::WeightedInt8 } else { CoefficientPath::Wide }, scale_milli }),
     };
     plan.map(|plan| (plan, unit_mining))
 }
@@ -210,6 +210,32 @@ mod tests {
     use super::*;
     use crate::KernelKind;
     use quip_solver_core::IsingGraph;
+
+    #[test]
+    fn sa_plans_weighted_int8_when_field_exceeds_i8_delta() {
+        // Unit J on K_70: every coefficient fits i8, and 2 * 69 > INT8_MAX_DELTA.
+        let g = complete(70, 0.0);
+        assert_eq!(
+            plan(KernelKind::Sa, &g).unwrap().path,
+            CoefficientPath::WeightedInt8
+        );
+    }
+
+    #[test]
+    fn sa_plans_wide_only_for_wide_coefficients() {
+        // gcd 1 milli, so J = 1.0 is 1,000 steps: above the i8 limit.
+        let g = graph(vec![0.0; 3], vec![1.0, 0.001], vec![(0, 1), (1, 2)]);
+        assert_eq!(
+            plan(KernelKind::Sa, &g).unwrap().path,
+            CoefficientPath::Wide
+        );
+    }
+
+    #[test]
+    fn sa_mining_refuses_off_grid() {
+        let g = graph(vec![0.0001, 0.0], vec![1.0], vec![(0, 1)]);
+        assert!(plan(KernelKind::Sa, &g).is_err());
+    }
 
     fn graph(h: Vec<f64>, j: Vec<f64>, edges: Vec<(usize, usize)>) -> IsingGraph {
         IsingGraph::new(h, j, edges)
@@ -316,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn sa_int8_holds_k64_without_field_and_k65_goes_wide() {
+    fn sa_int8_holds_k64_without_field_and_k65_needs_wide_delta() {
         // K_64, h = 0: field 63, delta 126 <= 127.
         assert_eq!(
             plan(KernelKind::Sa, &complete(64, 0.0)).unwrap().path,
@@ -325,16 +351,16 @@ mod tests {
         // K_64, h = 1: field 64, delta 128 > 127.
         assert_eq!(
             plan(KernelKind::Sa, &complete(64, 1.0)).unwrap().path,
-            CoefficientPath::Wide
+            CoefficientPath::WeightedInt8
         );
         // K_65, h = 0: field 64.
         assert_eq!(
             plan(KernelKind::Sa, &complete(65, 0.0)).unwrap().path,
-            CoefficientPath::Wide
+            CoefficientPath::WeightedInt8
         );
         assert_eq!(
             plan(KernelKind::Sa, &complete(200, 0.0)).unwrap().path,
-            CoefficientPath::Wide
+            CoefficientPath::WeightedInt8
         );
         assert_eq!(
             plan(KernelKind::Sa, &complete(16, 1.0)).unwrap().path,
@@ -520,13 +546,13 @@ mod tests {
         let g = graph(vec![0.0], vec![2.0; 32], vec![(0, 0); 32]);
         assert_eq!(
             plan(KernelKind::Sa, &g).unwrap().path,
-            CoefficientPath::Wide
+            CoefficientPath::WeightedInt8
         );
         // A duplicate edge counts once per copy on each endpoint.
         let g = graph(vec![0.0, 0.0], vec![1.0; 64], vec![(0, 1); 64]);
         assert_eq!(
             plan(KernelKind::Sa, &g).unwrap().path,
-            CoefficientPath::Wide
+            CoefficientPath::WeightedInt8
         );
     }
 }
