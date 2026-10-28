@@ -34,6 +34,7 @@ use quip_solver_core::SampleError as WireSampleError;
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome, StreamResult,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::error::TryRecvError;
@@ -588,7 +589,10 @@ fn session_topology(
 ) -> Result<SelfFeedingTopology, SampleError> {
     let n = graph.num_nodes();
     let mut degrees = vec![0usize; n];
+    let mut pairs = HashSet::with_capacity(graph.edges.len());
+    let mut repeated_pair = false;
     for &(u, v) in graph.edges.iter() {
+        repeated_pair |= !pairs.insert((u.min(v), u.max(v)));
         if let Some(degree) = degrees.get_mut(u) {
             *degree += 1;
         }
@@ -598,6 +602,7 @@ fn session_topology(
             }
         }
     }
+    drop(pairs);
     let max_degree = degrees.into_iter().max().unwrap_or(0);
     let shape = capacity::ModelShape {
         nodes: n,
@@ -605,6 +610,11 @@ fn session_topology(
         max_degree,
     };
     let storage = forced.unwrap_or_else(|| {
+        // SA and Gibbs keep repeated terms in CSR. A dense matrix has only
+        // one coefficient per pair, regardless of edge orientation.
+        if repeated_pair && kernel != KernelKind::Msa {
+            return capacity::Storage::Sparse;
+        }
         capacity::route_storage(
             kernel,
             shape,
@@ -626,11 +636,15 @@ fn session_topology(
     if storage == capacity::Storage::Sparse {
         return Ok(SelfFeedingTopology::build(graph));
     }
+    if repeated_pair {
+        return Err(SampleError::Unsupported(
+            "dense storage requires unique couplers".into(),
+        ));
+    }
     let nnz = n
         .checked_mul(n)
         .ok_or_else(|| SampleError::Unsupported("dense matrix size overflow".into()))?;
     to_kernel_i32("dense matrix elements", nnz)?;
-    let mut seen = vec![0u8; nnz.div_ceil(8)];
     let mut edge_pos = Vec::with_capacity(graph.edges.len());
     for &(u, v) in graph.edges.iter() {
         if u >= n || v >= n {
@@ -640,13 +654,6 @@ fn session_topology(
         }
         let ij = u * n + v;
         let ji = v * n + u;
-        if seen[ij / 8] & (1 << (ij % 8)) != 0 {
-            return Err(SampleError::Unsupported(
-                "dense storage requires unique couplers".into(),
-            ));
-        }
-        seen[ij / 8] |= 1 << (ij % 8);
-        seen[ji / 8] |= 1 << (ji % 8);
         edge_pos.push((u32::try_from(ij).unwrap(), u32::try_from(ji).unwrap()));
     }
     Ok(SelfFeedingTopology {

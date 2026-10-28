@@ -5,7 +5,9 @@ use quip_solver_cuda::capacity::{max_model, Connectivity, Precision, Storage};
 use quip_solver_cuda::coefficients::{self, CoefficientPath};
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::sampler::SampleError;
-use quip_solver_cuda::streaming::{last_storage, sample_one, sample_one_real_forced};
+use quip_solver_cuda::streaming::{
+    last_storage, sample_one, sample_one_real, sample_one_real_forced,
+};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 
 fn random(state: &mut u64) -> u64 {
@@ -60,6 +62,101 @@ fn params() -> SampleParams {
         sweeps_per_beta: 1,
         seed: 42,
         ..SampleParams::default()
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_repeated_couplers_match_sparse_samples() {
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 2).unwrap();
+    for edges in [vec![(0, 1), (0, 1)], vec![(0, 1), (1, 0)]] {
+        let graph = IsingGraph::new(vec![0.0; 2], vec![1.0; 2], edges);
+        let sparse = sample_one_real_forced(&device, &graph, &params(), Storage::Sparse).unwrap();
+        let automatic = sample_one(&device, &graph, &params(), KernelKind::Sa).unwrap();
+        assert_eq!(last_storage(&device), Some(Storage::Sparse));
+        let real = sample_one_real(&device, &graph, &params()).unwrap();
+        assert_eq!(last_storage(&device), Some(Storage::Sparse));
+        assert_eq!(automatic.len(), 256);
+        assert_eq!(automatic.len(), sparse.len());
+        assert_eq!(real.len(), sparse.len());
+        for ((exact, real), sparse) in automatic.iter().zip(&real).zip(&sparse) {
+            assert_eq!(exact.spins, sparse.spins);
+            assert_eq!(real.spins, sparse.spins);
+            assert_eq!(real.energy.to_bits(), sparse.energy.to_bits());
+            assert_eq!(
+                exact.energy_milli,
+                quip_protocol::scoring::energy_milli(
+                    &sparse.spins,
+                    &graph.h,
+                    &graph.j,
+                    &graph.edges,
+                )
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_repeated_couplers_refuse_forced_dense() {
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 2).unwrap();
+    for edges in [vec![(0, 1), (0, 1)], vec![(0, 1), (1, 0)]] {
+        let graph = IsingGraph::new(vec![0.0; 2], vec![1.0; 2], edges);
+        let error = sample_one_real_forced(&device, &graph, &params(), Storage::Dense).unwrap_err();
+        assert!(matches!(error, SampleError::Unsupported(_)), "{error}");
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_repeated_couplers_use_sparse_capacity_check() {
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 2).unwrap();
+    let limits = quip_solver_cuda::capacity::DeviceLimits {
+        free_bytes: 64 << 20,
+        ..device.limits
+    };
+    let shape = quip_solver_cuda::capacity::ModelShape {
+        nodes: 2,
+        couplers: 2,
+        max_degree: 2,
+    };
+    let dense = quip_solver_cuda::capacity::sa_footprint(
+        shape,
+        Precision::Binary,
+        Storage::Dense,
+        256,
+        64,
+        &limits,
+    );
+    let sparse = quip_solver_cuda::capacity::sa_footprint(
+        shape,
+        Precision::Binary,
+        Storage::Sparse,
+        256,
+        64,
+        &limits,
+    );
+    assert!(dense.total() <= limits.usable_bytes());
+    assert!(sparse.total() > limits.usable_bytes());
+    let device = device.with_limits_for_test(limits);
+    for edges in [vec![(0, 1), (0, 1)], vec![(0, 1), (1, 0)]] {
+        let graph = IsingGraph::new(vec![0.0; 2], vec![1.0; 2], edges);
+        for error in [
+            sample_one(&device, &graph, &params(), KernelKind::Sa).unwrap_err(),
+            sample_one_real(&device, &graph, &params()).unwrap_err(),
+            sample_one_real_forced(&device, &graph, &params(), Storage::Sparse).unwrap_err(),
+        ] {
+            let SampleError::ModelExceedsDeviceMemory {
+                required_bytes,
+                available_bytes,
+                ..
+            } = error
+            else {
+                panic!("expected sparse memory refusal, got {error}");
+            };
+            assert_eq!(required_bytes, sparse.total());
+            assert_eq!(available_bytes, limits.usable_bytes());
+        }
     }
 }
 
