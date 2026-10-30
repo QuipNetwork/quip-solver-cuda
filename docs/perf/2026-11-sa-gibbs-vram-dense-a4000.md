@@ -8,12 +8,12 @@ The tables show both how much fits and how long it runs.
 
 - Physical GPU: 1, NVIDIA RTX A4000, 48 SMs.
 - Container: `quip-solver-cuda-ci`, CUDA 12.9.1.
-- Benchmark revision: `1b8108a309a9d3c4ef543858af3ac4ddf13ebc6c`.
+- Grid binaries: `1b8108a309a9d3c4ef543858af3ac4ddf13ebc6c` with the probe calibration edits. No kernel or benchmark code differs.
 - Reads: 256 per nonce. Concurrency: full instance count and one nonce.
 - Each sweep point uses one warm-up and four measured repeats.
 - Sweep pairs: 64/256, or 8/32 when earlier cells predict more than 900 seconds for 64/256.
-- The benchmark stops any launch that runs longer than 10 minutes.
-  When earlier cells predict that the longer 8/32 launch needs more than 300 seconds, the cell uses 2/8. When 2/8 also exceeds 300 seconds, the cell uses 1/4.
+- The grid binaries stopped any benchmark launch after 10 minutes. This change removes that limit, see Retried cells.
+  To let the grid finish, a cell uses 2/8 when earlier cells predict more than 300 seconds for the longer 8/32 launch. When 2/8 also exceeds 300 seconds, the cell uses 1/4.
 - The 64/256 and 8/32 pairs use four sweeps per beta rung. The 2/8 and 1/4 pairs use one sweep per beta rung, so each launch runs the requested sweep count.
 - Each GPU run ends before the next starts. Each run records compute processes on physical GPU 1.
 
@@ -30,13 +30,27 @@ Slowdown uses the degree-20 Binary baseline at the same nonce count.
 SA uses N = 5,000. Gibbs uses N = 4,800.
 The sparse models use circulant graphs. These runs keep the node order.
 
+## Timed range and projections
+
+Timed cells stop where the slowdown curve is clear in the full-spill regime.
+SA uses its global-state variant for models larger than 5,000 nodes. Gibbs keeps most spins in the global tail for models much larger than 4,800 nodes.
+The timed range is 200,000 nodes for sparse models and 4,000 nodes for complete models.
+Larger cells are smoke runs. A smoke run passes when it ends with a result, or runs for one hour with no error.
+
+Each larger probe-limit cell gets a projected slowdown from the last timed cell in its series:
+
+- Sparse models keep the last timed value. At a fixed degree, the work per lane-update does not depend on N.
+- Complete models scale the last timed value by N. Each lane-update reads N - 1 couplers.
+
+Every projected value has the label projected in the tables, the plots, and `src/slowdown_a4000.rs`.
+
 ## Runtime capacity grids
 
 Free device memory can change between runs. Each probe snapshot fixes the limit cells for its kernel.
 Each precision tier covers both fields and couplings.
 Using one nonce keeps the same node limit.
 
-All 274 preflight records show no compute processes on GPU 1.
+All 277 preflight records show no compute processes on GPU 1.
 
 ### `sa`
 
@@ -45,18 +59,18 @@ Each of 48 instances has a budget of 277,032,686 bytes.
 
 | Connectivity | Precision | Nodes | Couplers | Tier | Bytes per instance | Slowdown |
 |---|---|---:|---:|---|---:|---:|
-| degree 20 | Binary | 410,747 | 4,107,470 | global | 275,614,821 | 0.4548× |
+| degree 20 | Binary | 410,747 | 4,107,470 | global | 275,614,821 | 0.4464× (projected) |
 | degree 20 | Int8 | 191,788 | 1,917,880 | global | 275,986,420 | 0.2329× |
 | degree 20 | Int32 | 169,546 | 1,695,460 | global | 276,024,568 | 0.2282× |
 | degree 20 | Float32 | 169,553 | 1,695,530 | global | 276,036,060 | 0.1609× |
-| degree 60 | Binary | 347,112 | 10,413,360 | global | 274,568,696 | 1.0023× |
+| degree 60 | Binary | 347,112 | 10,413,360 | global | 274,568,696 | 0.9939× (projected) |
 | degree 60 | Int8 | 176,665 | 5,299,950 | global | 275,424,511 | 1.3056× |
 | degree 60 | Int32 | 130,765 | 3,922,950 | global | 275,656,012 | 1.2839× |
 | degree 60 | Float32 | 130,771 | 3,923,130 | global | 275,668,852 | 0.4591× |
-| complete | Binary | 9,370 | 43,893,765 | dense | 276,315,610 | 677.6269× |
-| complete | Int8 | 9,370 | 43,893,765 | dense | 276,315,610 | 568.5705× |
-| complete | Int32 | 4,741 | 11,236,170 | dense | 276,308,872 | 172.1529× |
-| complete | Float32 | 4,741 | 11,236,170 | dense | 276,308,872 | 124.5328× |
+| complete | Binary | 9,370 | 43,893,765 | dense | 276,315,610 | 676.0332× (projected) |
+| complete | Int8 | 9,370 | 43,893,765 | dense | 276,315,610 | 358.2948× (projected) |
+| complete | Int32 | 4,741 | 11,236,170 | dense | 276,308,872 | 170.0646× (projected) |
+| complete | Float32 | 4,741 | 11,236,170 | dense | 276,308,872 | 123.6501× (projected) |
 
 ### `gibbs`
 
@@ -65,24 +79,24 @@ Each of 12 instances has a budget of 1,108,130,747 bytes.
 
 | Connectivity | Precision | Nodes | Couplers | Tier | Bytes per instance | Slowdown |
 |---|---|---:|---:|---|---:|---:|
-| degree 20 | Binary | 6,491,600 | 64,916,000 | spill | 1,057,728,632 | 4.1576× |
-| degree 20 | Int8 | 6,491,600 | 64,916,000 | spill | 1,057,728,632 | 4.9561× |
-| degree 20 | Int32 | 3,077,188 | 30,771,880 | spill | 1,082,768,392 | 4.8424× |
-| degree 20 | Float32 | 3,077,188 | 30,771,880 | spill | 1,082,768,392 | 4.8829× |
-| degree 60 | Binary | 3,641,281 | 109,238,430 | spill | 1,030,081,347 | 17.2960× |
-| degree 60 | Int8 | 3,641,281 | 109,238,430 | spill | 1,030,081,347 | 17.9549× |
-| degree 60 | Int32 | 1,296,797 | 38,903,910 | spill | 1,078,533,544 | 18.1866× |
-| degree 60 | Float32 | 1,296,797 | 38,903,910 | spill | 1,078,533,544 | 16.1180× |
-| complete | Binary | 19,177 | 183,869,076 | dense | 1,105,327,703 | 1398.0027× |
-| complete | Int8 | 19,177 | 183,869,076 | dense | 1,105,327,703 | 1398.2126× |
-| complete | Int32 | 9,592 | 45,998,436 | dense | 1,105,193,345 | 764.4557× |
-| complete | Float32 | 9,592 | 45,998,436 | dense | 1,105,193,345 | 798.4681× |
+| degree 20 | Binary | 6,491,600 | 64,916,000 | spill | 1,057,728,632 | 3.4278× (projected) |
+| degree 20 | Int8 | 6,491,600 | 64,916,000 | spill | 1,057,728,632 | 3.6443× (projected) |
+| degree 20 | Int32 | 3,077,188 | 30,771,880 | spill | 1,082,768,392 | 3.6973× (projected) |
+| degree 20 | Float32 | 3,077,188 | 30,771,880 | spill | 1,082,768,392 | 3.8183× (projected) |
+| degree 60 | Binary | 3,641,281 | 109,238,430 | spill | 1,030,081,347 | 12.3145× (projected) |
+| degree 60 | Int8 | 3,641,281 | 109,238,430 | spill | 1,030,081,347 | 13.0756× (projected) |
+| degree 60 | Int32 | 1,296,797 | 38,903,910 | spill | 1,078,533,544 | 15.8278× (projected) |
+| degree 60 | Float32 | 1,296,797 | 38,903,910 | spill | 1,078,533,544 | 13.9336× (projected) |
+| complete | Binary | 19,177 | 183,869,076 | dense | 1,105,327,703 | 1598.2570× (projected) |
+| complete | Int8 | 19,177 | 183,869,076 | dense | 1,105,327,703 | 1600.3476× (projected) |
+| complete | Int32 | 9,592 | 45,998,436 | dense | 1,105,193,345 | 821.1391× (projected) |
+| complete | Float32 | 9,592 | 45,998,436 | dense | 1,105,193,345 | 864.9393× (projected) |
 
 ## Timing tables
 
 Sweep time is in milliseconds. Throughput is in billions of lane-updates per second.
 Each slowdown uses the baseline with the same kernel and nonce count.
-Failed cells appear in the final section.
+The tables hold the timed range only, and the Smoke runs section lists the larger cells. Failed cells appear in the final section.
 
 ### `sa`
 
@@ -92,12 +106,10 @@ Failed cells appear in the final section.
 | degree 20 | binary | 16,000 | 48 | 64/256 | 44.291067 | 4.43900 | 0.3865× |
 | degree 20 | binary | 64,000 | 48 | 64/256 | 181.080416 | 4.34300 | 0.3950× |
 | degree 20 | binary | 200,000 | 48 | 8/32 | 639.438334 | 3.84337 | 0.4464× |
-| degree 20 | binary | 410,747 | 48 | 8/32 | 1338.054159 | 3.77209 | 0.4548× |
 | degree 20 | binary | 5,000 | 1 | 64/256 | 16.431101 | 0.07790 | 1.0000× |
 | degree 20 | binary | 16,000 | 1 | 64/256 | 42.141366 | 0.09720 | 0.8015× |
 | degree 20 | binary | 64,000 | 1 | 64/256 | 174.413254 | 0.09394 | 0.8293× |
 | degree 20 | binary | 200,000 | 1 | 8/32 | 600.437449 | 0.08527 | 0.9136× |
-| degree 20 | binary | 410,747 | 1 | 8/32 | 1239.101644 | 0.08486 | 0.9180× |
 | degree 20 | int8 | 5,000 | 48 | 64/256 | 23.484748 | 2.61617 | 0.6557× |
 | degree 20 | int8 | 16,000 | 48 | 64/256 | 27.440793 | 7.16481 | 0.2394× |
 | degree 20 | int8 | 64,000 | 48 | 64/256 | 108.934326 | 7.21932 | 0.2376× |
@@ -126,12 +138,10 @@ Failed cells appear in the final section.
 | degree 60 | binary | 16,000 | 48 | 64/256 | 99.853388 | 1.96897 | 0.8713× |
 | degree 60 | binary | 64,000 | 48 | 64/256 | 422.836792 | 1.85989 | 0.9224× |
 | degree 60 | binary | 200,000 | 48 | 8/32 | 1423.747559 | 1.72615 | 0.9939× |
-| degree 60 | binary | 347,112 | 48 | 8/32 | 2492.024536 | 1.71159 | 1.0023× |
 | degree 60 | binary | 5,000 | 1 | 64/256 | 44.427551 | 0.02881 | 2.7039× |
 | degree 60 | binary | 16,000 | 1 | 64/256 | 76.041826 | 0.05387 | 1.4462× |
 | degree 60 | binary | 64,000 | 1 | 64/256 | 300.405874 | 0.05454 | 1.4283× |
 | degree 60 | binary | 200,000 | 1 | 8/32 | 1382.215719 | 0.03704 | 2.1030× |
-| degree 60 | binary | 347,112 | 1 | 8/32 | 2404.496257 | 0.03696 | 2.1079× |
 | degree 60 | int8 | 5,000 | 48 | 64/256 | 69.745257 | 0.88092 | 1.9474× |
 | degree 60 | int8 | 16,000 | 48 | 64/256 | 127.660962 | 1.54008 | 1.1139× |
 | degree 60 | int8 | 64,000 | 48 | 8/32 | 595.274089 | 1.32113 | 1.2985× |
@@ -161,51 +171,41 @@ Failed cells appear in the final section.
 | complete | binary | 1,000 | 48 | 64/256 | 462.956848 | 0.02654 | 64.6341× |
 | complete | binary | 2,000 | 48 | 8/32 | 2056.994588 | 0.01195 | 143.5900× |
 | complete | binary | 4,000 | 48 | 8/32 | 8268.513428 | 0.00594 | 288.5948× |
-| complete | binary | 9,370 | 48 | 1/4 | 45478.825847 | 0.00253 | 677.6269× |
 | complete | binary | 64 | 1 | 64/256 | 0.253771 | 0.06456 | 1.2066× |
 | complete | binary | 256 | 1 | 64/256 | 9.534551 | 0.00687 | 11.3335× |
 | complete | binary | 1,000 | 1 | 64/256 | 143.589788 | 0.00178 | 43.6945× |
 | complete | binary | 2,000 | 1 | 8/32 | 652.602559 | 0.00078 | 99.2938× |
 | complete | binary | 4,000 | 1 | 8/32 | 5539.553955 | 0.00018 | 421.4229× |
-| complete | binary | 9,370 | 1 | 2/8 | 30155.634115 | 0.00008 | 979.3371× |
 | complete | int8 | 64 | 48 | 64/256 | 0.291588 | 2.69706 | 0.6361× |
 | complete | int8 | 256 | 48 | 64/256 | 15.923478 | 0.19755 | 8.6840× |
 | complete | int8 | 1,000 | 48 | 64/256 | 246.069483 | 0.04994 | 34.3541× |
 | complete | int8 | 2,000 | 48 | 8/32 | 1085.807393 | 0.02263 | 75.7956× |
 | complete | int8 | 4,000 | 48 | 8/32 | 4382.277507 | 0.01122 | 152.9540× |
-| complete | int8 | 9,370 | 48 | 2/8 | 38159.519531 | 0.00302 | 568.5705× |
 | complete | int8 | 64 | 1 | 64/256 | 0.178592 | 0.09174 | 0.8492× |
 | complete | int8 | 256 | 1 | 64/256 | 5.048844 | 0.01298 | 6.0014× |
 | complete | int8 | 1,000 | 1 | 64/256 | 75.526843 | 0.00339 | 22.9829× |
 | complete | int8 | 2,000 | 1 | 64/256 | 311.304204 | 0.00164 | 47.3651× |
 | complete | int8 | 4,000 | 1 | 8/32 | 2876.709717 | 0.00036 | 218.8464× |
-| complete | int8 | 9,370 | 1 | 2/8 | 25960.780599 | 0.00009 | 843.1046× |
 | complete | int32 | 64 | 48 | 64/256 | 0.292085 | 2.69247 | 0.6372× |
 | complete | int32 | 256 | 48 | 64/256 | 13.754685 | 0.22870 | 7.5012× |
 | complete | int32 | 1,000 | 48 | 64/256 | 214.523791 | 0.05728 | 29.9500× |
 | complete | int32 | 2,000 | 48 | 8/32 | 1020.416361 | 0.02408 | 71.2309× |
 | complete | int32 | 4,000 | 48 | 8/32 | 4110.956787 | 0.01196 | 143.4841× |
-| complete | int32 | 4,741 | 48 | 8/32 | 5846.059245 | 0.00997 | 172.1529× |
 | complete | int32 | 64 | 1 | 64/256 | 0.140523 | 0.11659 | 0.6681× |
 | complete | int32 | 256 | 1 | 64/256 | 4.375096 | 0.01498 | 5.2006× |
 | complete | int32 | 1,000 | 1 | 64/256 | 75.453946 | 0.00339 | 22.9607× |
 | complete | int32 | 2,000 | 1 | 64/256 | 302.018326 | 0.00170 | 45.9522× |
 | complete | int32 | 4,000 | 1 | 8/32 | 2774.781494 | 0.00037 | 211.0922× |
-| complete | int32 | 4,741 | 1 | 8/32 | 3887.986165 | 0.00031 | 249.5503× |
 | complete | float | 64 | 48 | 64/256 | 0.198220 | 3.96748 | 0.4324× |
 | complete | float | 256 | 48 | 64/256 | 11.149643 | 0.28214 | 6.0805× |
 | complete | float | 1,000 | 48 | 64/256 | 145.030741 | 0.08473 | 20.2480× |
 | complete | float | 2,000 | 48 | 8/32 | 724.754313 | 0.03391 | 50.5920× |
 | complete | float | 4,000 | 48 | 8/32 | 2988.983968 | 0.01644 | 104.3241× |
-| complete | float | 4,741 | 48 | 8/32 | 4228.950033 | 0.01378 | 124.5328× |
 | complete | float | 64 | 1 | 64/256 | 0.124264 | 0.13185 | 0.5908× |
 | complete | float | 256 | 1 | 64/256 | 3.698568 | 0.01772 | 4.3964× |
 | complete | float | 1,000 | 1 | 64/256 | 52.594143 | 0.00487 | 16.0044× |
 | complete | float | 2,000 | 1 | 64/256 | 192.265986 | 0.00266 | 29.2534× |
 | complete | float | 4,000 | 1 | 8/32 | 2011.958415 | 0.00051 | 153.0602× |
-| complete | float | 4,741 | 1 | 8/32 | 2835.692383 | 0.00043 | 182.0088× |
-| family b | float | 4,741 | 48 | 8/32 | 2552.526367 | 0.02282 | 75.1660× |
-| family b | float | 4,741 | 1 | 8/32 | 1722.569743 | 0.00070 | 110.5631× |
 
 ### `gibbs`
 
@@ -215,132 +215,106 @@ Failed cells appear in the final section.
 | degree 20 | binary | 16,000 | 12 | 64/256 | 59.107871 | 0.83156 | 3.2254× |
 | degree 20 | binary | 64,000 | 12 | 64/256 | 121.000988 | 1.62485 | 1.6507× |
 | degree 20 | binary | 200,000 | 12 | 64/256 | 785.232310 | 0.78244 | 3.4278× |
-| degree 20 | binary | 6,491,600 | 12 | 2/8 | 30913.268229 | 0.64510 | 4.1576× |
 | degree 20 | binary | 4,800 | 1 | 64/256 | 4.355447 | 0.28213 | 1.0000× |
 | degree 20 | binary | 16,000 | 1 | 64/256 | 33.069009 | 0.12386 | 2.2778× |
 | degree 20 | binary | 64,000 | 1 | 64/256 | 95.880447 | 0.17088 | 1.6510× |
 | degree 20 | binary | 200,000 | 1 | 64/256 | 640.133464 | 0.07998 | 3.5274× |
-| degree 20 | binary | 6,491,600 | 1 | 2/8 | 22769.147135 | 0.07299 | 3.8655× |
 | degree 20 | int8 | 4,800 | 12 | 64/256 | 4.876751 | 3.02365 | 0.8870× |
 | degree 20 | int8 | 16,000 | 12 | 64/256 | 64.472672 | 0.76237 | 3.5181× |
 | degree 20 | int8 | 64,000 | 12 | 64/256 | 132.074389 | 1.48862 | 1.8017× |
 | degree 20 | int8 | 200,000 | 12 | 64/256 | 834.823792 | 0.73596 | 3.6443× |
-| degree 20 | int8 | 6,491,600 | 12 | 2/8 | 36850.464844 | 0.54117 | 4.9561× |
 | degree 20 | int8 | 4,800 | 1 | 64/256 | 4.169994 | 0.29468 | 0.9574× |
 | degree 20 | int8 | 16,000 | 1 | 64/256 | 34.378634 | 0.11914 | 2.3680× |
 | degree 20 | int8 | 64,000 | 1 | 64/256 | 96.974417 | 0.16895 | 1.6699× |
 | degree 20 | int8 | 200,000 | 1 | 64/256 | 644.113057 | 0.07949 | 3.5493× |
-| degree 20 | int8 | 6,491,600 | 1 | 2/8 | 22678.813802 | 0.07328 | 3.8501× |
 | degree 20 | int32 | 4,800 | 12 | 64/256 | 6.591677 | 2.23700 | 1.1990× |
 | degree 20 | int32 | 16,000 | 12 | 64/256 | 64.388643 | 0.76336 | 3.5135× |
 | degree 20 | int32 | 64,000 | 12 | 64/256 | 143.389852 | 1.37114 | 1.9561× |
 | degree 20 | int32 | 200,000 | 12 | 64/256 | 846.958211 | 0.72542 | 3.6973× |
-| degree 20 | int32 | 3,077,188 | 12 | 2/8 | 17067.217448 | 0.55388 | 4.8424× |
 | degree 20 | int32 | 4,800 | 1 | 64/256 | 4.462780 | 0.27534 | 1.0246× |
 | degree 20 | int32 | 16,000 | 1 | 64/256 | 36.212374 | 0.11311 | 2.4943× |
 | degree 20 | int32 | 64,000 | 1 | 64/256 | 100.856597 | 0.16245 | 1.7367× |
 | degree 20 | int32 | 200,000 | 1 | 64/256 | 640.668803 | 0.07992 | 3.5303× |
-| degree 20 | int32 | 3,077,188 | 1 | 2/8 | 11096.410482 | 0.07099 | 3.9741× |
 | degree 20 | float | 4,800 | 12 | 64/256 | 6.922325 | 2.13015 | 1.2591× |
 | degree 20 | float | 16,000 | 12 | 64/256 | 65.859039 | 0.74632 | 3.5938× |
 | degree 20 | float | 64,000 | 12 | 64/256 | 148.860469 | 1.32075 | 2.0307× |
 | degree 20 | float | 200,000 | 12 | 64/256 | 874.675883 | 0.70243 | 3.8183× |
-| degree 20 | float | 3,077,188 | 12 | 2/8 | 17209.909180 | 0.54928 | 4.8829× |
 | degree 20 | float | 4,800 | 1 | 64/256 | 4.607019 | 0.26672 | 1.0578× |
 | degree 20 | float | 16,000 | 1 | 64/256 | 34.747630 | 0.11788 | 2.3934× |
 | degree 20 | float | 64,000 | 1 | 64/256 | 105.292745 | 0.15560 | 1.8131× |
 | degree 20 | float | 200,000 | 1 | 64/256 | 670.847280 | 0.07632 | 3.6966× |
-| degree 20 | float | 3,077,188 | 1 | 2/8 | 11235.063802 | 0.07012 | 4.0237× |
 | degree 60 | binary | 4,800 | 12 | 64/256 | 21.173981 | 0.69640 | 3.8514× |
 | degree 60 | binary | 16,000 | 12 | 64/256 | 192.520414 | 0.25531 | 10.5053× |
 | degree 60 | binary | 64,000 | 12 | 8/32 | 357.520569 | 0.54992 | 4.8772× |
 | degree 60 | binary | 200,000 | 12 | 8/32 | 2820.936808 | 0.21780 | 12.3145× |
-| degree 60 | binary | 3,641,281 | 12 | 1/4 | 72135.360677 | 0.15507 | 17.2960× |
 | degree 60 | binary | 4,800 | 1 | 64/256 | 13.805791 | 0.08901 | 3.1698× |
 | degree 60 | binary | 16,000 | 1 | 64/256 | 164.052882 | 0.02497 | 11.2998× |
 | degree 60 | binary | 64,000 | 1 | 8/32 | 285.496480 | 0.05739 | 4.9162× |
 | degree 60 | binary | 200,000 | 1 | 8/32 | 1973.534871 | 0.02594 | 10.8749× |
-| degree 60 | binary | 3,641,281 | 1 | 1/4 | 40549.738281 | 0.02299 | 12.2728× |
 | degree 60 | int8 | 4,800 | 12 | 64/256 | 20.511592 | 0.71889 | 3.7309× |
 | degree 60 | int8 | 16,000 | 12 | 64/256 | 190.038981 | 0.25864 | 10.3699× |
 | degree 60 | int8 | 64,000 | 12 | 8/32 | 359.585180 | 0.54676 | 4.9054× |
 | degree 60 | int8 | 200,000 | 12 | 8/32 | 2995.287638 | 0.20512 | 13.0756× |
-| degree 60 | int8 | 3,641,281 | 12 | 1/4 | 74883.117188 | 0.14938 | 17.9549× |
 | degree 60 | int8 | 4,800 | 1 | 64/256 | 13.895509 | 0.08843 | 3.1904× |
 | degree 60 | int8 | 16,000 | 1 | 64/256 | 164.178396 | 0.02495 | 11.3085× |
 | degree 60 | int8 | 64,000 | 1 | 8/32 | 289.290273 | 0.05664 | 4.9815× |
 | degree 60 | int8 | 200,000 | 1 | 8/32 | 1976.587687 | 0.02590 | 10.8917× |
-| degree 60 | int8 | 3,641,281 | 1 | 1/4 | 40639.528646 | 0.02294 | 12.2999× |
 | degree 60 | int32 | 4,800 | 12 | 64/256 | 23.980204 | 0.61491 | 4.3618× |
 | degree 60 | int32 | 16,000 | 12 | 64/256 | 199.684644 | 0.24615 | 10.8963× |
 | degree 60 | int32 | 64,000 | 12 | 8/32 | 399.051504 | 0.49269 | 5.4438× |
 | degree 60 | int32 | 200,000 | 12 | 8/32 | 3625.759562 | 0.16945 | 15.8278× |
-| degree 60 | int32 | 1,296,797 | 12 | 2/8 | 27012.888672 | 0.14748 | 18.1866× |
 | degree 60 | int32 | 4,800 | 1 | 64/256 | 14.148421 | 0.08685 | 3.2484× |
 | degree 60 | int32 | 16,000 | 1 | 64/256 | 164.286069 | 0.02493 | 11.3159× |
 | degree 60 | int32 | 64,000 | 1 | 8/32 | 306.641230 | 0.05343 | 5.2803× |
 | degree 60 | int32 | 200,000 | 1 | 8/32 | 2000.955933 | 0.02559 | 11.0259× |
-| degree 60 | int32 | 1,296,797 | 1 | 2/8 | 14135.089844 | 0.02349 | 12.0125× |
 | degree 60 | float | 4,800 | 12 | 64/256 | 26.281795 | 0.56106 | 4.7804× |
 | degree 60 | float | 16,000 | 12 | 8/32 | 201.672900 | 0.24372 | 11.0048× |
 | degree 60 | float | 64,000 | 12 | 8/32 | 415.801290 | 0.47284 | 5.6723× |
 | degree 60 | float | 200,000 | 12 | 8/32 | 3191.826904 | 0.19249 | 13.9336× |
-| degree 60 | float | 1,296,797 | 12 | 2/8 | 23940.385417 | 0.16640 | 16.1180× |
 | degree 60 | float | 4,800 | 1 | 64/256 | 14.633248 | 0.08397 | 3.3598× |
 | degree 60 | float | 16,000 | 1 | 64/256 | 169.963450 | 0.02410 | 11.7070× |
 | degree 60 | float | 64,000 | 1 | 8/32 | 315.331406 | 0.05196 | 5.4299× |
 | degree 60 | float | 200,000 | 1 | 8/32 | 2040.884196 | 0.02509 | 11.2460× |
-| degree 60 | float | 1,296,797 | 1 | 2/8 | 14415.047852 | 0.02303 | 12.2505× |
 | complete | binary | 64 | 12 | 64/256 | 2.588320 | 0.07596 | 35.3094× |
 | complete | binary | 256 | 12 | 64/256 | 11.189041 | 0.07029 | 38.1598× |
 | complete | binary | 1,000 | 12 | 64/256 | 132.589101 | 0.02317 | 115.7605× |
 | complete | binary | 2,000 | 12 | 64/256 | 435.714462 | 0.01410 | 190.2062× |
 | complete | binary | 4,000 | 12 | 8/32 | 1527.331238 | 0.00805 | 333.3696× |
-| complete | binary | 19,177 | 12 | 1/4 | 30706.901042 | 0.00192 | 1398.0027× |
 | complete | binary | 64 | 1 | 64/256 | 2.526528 | 0.00648 | 43.5063× |
 | complete | binary | 256 | 1 | 64/256 | 10.369216 | 0.00632 | 44.6390× |
 | complete | binary | 1,000 | 1 | 64/256 | 81.794095 | 0.00313 | 90.1427× |
 | complete | binary | 2,000 | 1 | 64/256 | 257.268951 | 0.00199 | 141.7640× |
 | complete | binary | 4,000 | 1 | 8/32 | 1484.435303 | 0.00069 | 408.9872× |
-| complete | binary | 19,177 | 1 | 1/4 | 29934.136719 | 0.00016 | 1720.2618× |
 | complete | int8 | 64 | 12 | 64/256 | 2.581835 | 0.07615 | 35.2210× |
 | complete | int8 | 256 | 12 | 64/256 | 10.632496 | 0.07396 | 36.2617× |
 | complete | int8 | 1,000 | 12 | 64/256 | 134.406471 | 0.02286 | 117.3472× |
 | complete | int8 | 2,000 | 12 | 64/256 | 435.814931 | 0.01410 | 190.2501× |
 | complete | int8 | 4,000 | 12 | 8/32 | 1529.329061 | 0.00803 | 333.8056× |
-| complete | int8 | 19,177 | 12 | 1/4 | 30711.510417 | 0.00192 | 1398.2126× |
 | complete | int8 | 64 | 1 | 64/256 | 2.567251 | 0.00638 | 44.2076× |
 | complete | int8 | 256 | 1 | 64/256 | 10.558637 | 0.00621 | 45.4544× |
 | complete | int8 | 1,000 | 1 | 64/256 | 82.478690 | 0.00310 | 90.8971× |
 | complete | int8 | 2,000 | 1 | 64/256 | 258.656240 | 0.00198 | 142.5284× |
 | complete | int8 | 4,000 | 1 | 8/32 | 1481.296590 | 0.00069 | 408.1225× |
-| complete | int8 | 19,177 | 1 | 1/4 | 29951.160807 | 0.00016 | 1721.2401× |
 | complete | int32 | 64 | 12 | 64/256 | 2.574459 | 0.07637 | 35.1203× |
 | complete | int32 | 256 | 12 | 64/256 | 12.075400 | 0.06513 | 41.1826× |
 | complete | int32 | 1,000 | 12 | 64/256 | 138.647242 | 0.02216 | 121.0498× |
 | complete | int32 | 2,000 | 12 | 8/32 | 451.203257 | 0.01362 | 196.9677× |
 | complete | int32 | 4,000 | 12 | 8/32 | 1568.826355 | 0.00783 | 342.4267× |
-| complete | int32 | 9,592 | 12 | 2/8 | 8398.637044 | 0.00351 | 764.4557× |
 | complete | int32 | 64 | 1 | 64/256 | 2.593779 | 0.00632 | 44.6644× |
 | complete | int32 | 256 | 1 | 64/256 | 12.003857 | 0.00546 | 51.6761× |
 | complete | int32 | 1,000 | 1 | 64/256 | 87.369921 | 0.00293 | 96.2876× |
 | complete | int32 | 2,000 | 1 | 64/256 | 450.192027 | 0.00114 | 248.0712× |
 | complete | int32 | 4,000 | 1 | 8/32 | 1578.442952 | 0.00065 | 434.8879× |
-| complete | int32 | 9,592 | 1 | 2/8 | 8078.347656 | 0.00030 | 928.1578× |
 | complete | float | 64 | 12 | 64/256 | 2.657272 | 0.07399 | 36.2501× |
 | complete | float | 256 | 12 | 64/256 | 12.561307 | 0.06261 | 42.8398× |
 | complete | float | 1,000 | 12 | 64/256 | 142.549367 | 0.02155 | 124.4566× |
 | complete | float | 2,000 | 12 | 8/32 | 477.867757 | 0.01286 | 208.6077× |
 | complete | float | 4,000 | 12 | 8/32 | 1652.508667 | 0.00744 | 360.6919× |
-| complete | float | 9,592 | 12 | 2/8 | 8772.311686 | 0.00336 | 798.4681× |
 | complete | float | 64 | 1 | 64/256 | 2.681346 | 0.00611 | 46.1723× |
 | complete | float | 256 | 1 | 64/256 | 12.425445 | 0.00527 | 53.4910× |
 | complete | float | 1,000 | 1 | 64/256 | 91.191933 | 0.00281 | 100.4997× |
 | complete | float | 2,000 | 1 | 64/256 | 457.305364 | 0.00112 | 251.9908× |
 | complete | float | 4,000 | 1 | 8/32 | 1604.728841 | 0.00064 | 442.1302× |
-| complete | float | 9,592 | 1 | 2/8 | 8711.016927 | 0.00028 | 1000.8481× |
-| family b | float | 9,592 | 12 | 2/8 | 8792.272787 | 0.00335 | 800.2850× |
-| family b | float | 9,592 | 1 | 2/8 | 8682.673665 | 0.00028 | 997.5916× |
 
 ## Observations
 
@@ -348,16 +322,74 @@ SA keeps spin state in a fixed local frame through 5,000 nodes and in global mem
 Gibbs uses its spill instantiation for models larger than 4,800 nodes. Both baselines run the mining-size kernels.
 At 48 nonces, SA degree-20 Binary cells larger than 5,000 nodes take 0.39× to 0.45× the baseline time per lane-update.
 At this concurrency, the mining-size SA kernel is slower per lane-update than the global-memory SA kernel.
-At 12 nonces, Gibbs degree-20 Binary cells larger than 4,800 nodes take 1.65× to 4.16× the baseline time per lane-update.
+At 12 nonces, Gibbs degree-20 Binary cells larger than 4,800 nodes take 1.65× to 3.43× the baseline time per lane-update.
 
 ## Full-concurrency curves
 
-The plots use logarithmic axes. Lines connect measured points.
+The plots use logarithmic axes. Solid lines connect timed points.
+Dashed lines with open markers lead to projected values at the probe limit. The sweep-time plot shows timed points only.
 Each kernel uses its full instance count at 256 reads.
 
 ![RTX A4000 SA and Gibbs sweep time](img/a4000-sa-gibbs-sweep_ns.png)
 
 ![RTX A4000 SA and Gibbs slowdown per lane-update](img/a4000-sa-gibbs-slowdown.png)
+
+## Smoke runs
+
+The grid ran every cell larger than the timed range with a reduced sweep pair, and every one ended with a result.
+The reduced-sweep slowdown below checks the projection, and the calibration does not use it.
+
+| Cell | Sweeps | Wall seconds | Result | Reduced-sweep slowdown | Projected slowdown |
+|---|---|---:|---|---:|---:|
+| `sa-degree-20-binary-m48-n410747` | 8/32 | 357.7 | completed with a result | 0.4548× | 0.4464× |
+| `gibbs-degree-20-binary-m12-n6491600` | 2/8 | 3207.8 | completed with a result | 4.1576× | 3.4278× |
+| `sa-degree-20-binary-m1-n410747` | 8/32 | 322.3 | completed with a result | 0.9180× | none |
+| `gibbs-degree-20-binary-m1-n6491600` | 2/8 | 2761.0 | completed with a result | 3.8655× | none |
+| `gibbs-degree-20-int8-m12-n6491600` | 2/8 | 3538.0 | completed with a result | 4.9561× | 3.6443× |
+| `gibbs-degree-20-int8-m1-n6491600` | 2/8 | 2791.3 | completed with a result | 3.8501× | none |
+| `gibbs-degree-20-int32-m12-n3077188` | 2/8 | 1632.8 | completed with a result | 4.8424× | 3.6973× |
+| `gibbs-degree-20-int32-m1-n3077188` | 2/8 | 1334.4 | completed with a result | 3.9741× | none |
+| `gibbs-degree-20-float-m12-n3077188` | 2/8 | 1256.9 | completed with a result | 4.8829× | 3.8183× |
+| `gibbs-degree-20-float-m1-n3077188` | 2/8 | 972.5 | completed with a result | 4.0237× | none |
+| `sa-degree-60-binary-m48-n347112` | 8/32 | 676.7 | completed with a result | 1.0023× | 0.9939× |
+| `gibbs-degree-60-binary-m12-n3641281` | 1/4 | 3653.0 | completed with a result | 17.2960× | 12.3145× |
+| `sa-degree-60-binary-m1-n347112` | 8/32 | 641.4 | completed with a result | 2.1079× | none |
+| `gibbs-degree-60-binary-m1-n3641281` | 1/4 | 2920.4 | completed with a result | 12.2728× | none |
+| `gibbs-degree-60-int8-m12-n3641281` | 1/4 | 3814.4 | completed with a result | 17.9549× | 13.0756× |
+| `gibbs-degree-60-int8-m1-n3641281` | 1/4 | 3011.8 | completed with a result | 12.2999× | none |
+| `gibbs-degree-60-int32-m12-n1296797` | 2/8 | 2563.4 | completed with a result | 18.1866× | 15.8278× |
+| `gibbs-degree-60-int32-m1-n1296797` | 2/8 | 1466.8 | completed with a result | 12.0125× | none |
+| `gibbs-degree-60-float-m12-n1296797` | 2/8 | 1547.0 | completed with a result | 16.1180× | 13.9336× |
+| `gibbs-degree-60-float-m1-n1296797` | 2/8 | 967.3 | completed with a result | 12.2505× | none |
+| `sa-complete-binary-m48-n9370` | 1/4 | 1499.2 | completed with a result | 677.6269× | 676.0332× |
+| `gibbs-complete-binary-m12-n19177` | 1/4 | 3385.9 | completed with a result | 1398.0027× | 1598.2570× |
+| `sa-complete-binary-m1-n9370` | 2/8 | 1852.3 | completed with a result | 979.3371× | none |
+| `gibbs-complete-binary-m1-n19177` | 1/4 | 3263.6 | completed with a result | 1720.2618× | none |
+| `sa-complete-int8-m48-n9370` | 2/8 | 2950.9 | completed with a result | 568.5705× | 358.2948× |
+| `gibbs-complete-int8-m12-n19177` | 1/4 | 3495.0 | completed with a result | 1398.2126× | 1600.3476× |
+| `sa-complete-int8-m1-n9370` | 2/8 | 2023.6 | completed with a result | 843.1046× | none |
+| `gibbs-complete-int8-m1-n19177` | 1/4 | 3296.7 | completed with a result | 1721.2401× | none |
+| `sa-complete-int32-m48-n4741` | 8/32 | 1816.2 | completed with a result | 172.1529× | 170.0646× |
+| `gibbs-complete-int32-m12-n9592` | 2/8 | 1124.9 | completed with a result | 764.4557× | 821.1391× |
+| `sa-complete-int32-m1-n4741` | 8/32 | 1216.2 | completed with a result | 249.5503× | none |
+| `gibbs-complete-int32-m1-n9592` | 2/8 | 1167.2 | completed with a result | 928.1578× | none |
+| `sa-complete-float-m48-n4741` | 8/32 | 1505.6 | completed with a result | 124.5328× | 123.6501× |
+| `gibbs-complete-float-m12-n9592` | 2/8 | 607.1 | completed with a result | 798.4681× | 864.9393× |
+| `sa-complete-float-m1-n4741` | 8/32 | 996.5 | completed with a result | 182.0088× | none |
+| `gibbs-complete-float-m1-n9592` | 2/8 | 560.1 | completed with a result | 1000.8481× | none |
+| `sa-family-b-float-m48-n4741` | 8/32 | 1042.0 | completed with a result | 75.1660× | none |
+| `gibbs-family-b-float-m12-n9592` | 2/8 | 610.2 | completed with a result | 800.2850× | none |
+| `sa-family-b-float-m1-n4741` | 8/32 | 679.9 | completed with a result | 110.5631× | none |
+| `gibbs-family-b-float-m1-n9592` | 2/8 | 560.9 | completed with a result | 997.5916× | none |
+
+The rows with a projected value are the probe-limit cells at full concurrency, so they also show how close each projection is.
+
+These at-limit runs use the build without the 10-minute launch limit and a driver-side one-hour cap.
+Each run asks for 256 reads and 256 sweeps at one sweep per beta rung, with one repeat and no warm-up.
+
+| Cell | Start | End | Exit code | Result |
+|---|---|---|---:|---|
+| `gibbs-degree-20-binary-m12-n6491600` | 2026-10-30T17:02:23Z | 2026-10-30T18:02:24Z | 124 | ran 1 h, no error |
 
 ## Grid wall time
 
@@ -518,7 +550,7 @@ Rows that exceed the bound repeat once. Each try appears below.
 
 ## Probe calibration
 
-The lookup uses synthetic cells that pass at full concurrency and 256 reads for SA and Gibbs.
+The lookup uses timed synthetic cells at full concurrency and 256 reads for SA and Gibbs, plus the projected probe-limit values.
 The lookup interpolates linearly in log N. Each kernel, connectivity, and precision has its own series.
 Measured nodes keep their recorded value. Other read counts and nodes outside the measured range return unknown.
 MSA keeps its existing 128-read measurements and lookup behavior.
@@ -526,9 +558,11 @@ The output names RTX A4000 as the reference card, including on other GPUs.
 
 ## Retried cells
 
-The first grid pass ran these cells at 8/32. Each run stopped at the 10-minute launch limit.
+The first grid pass ran these cells at 8/32. Each run failed with `self-feeding kernel timed out`.
+The cause was a fixed 10-minute deadline on each benchmark launch. Neither the model size nor the probe caused the failure.
+This change removes that deadline and the 2-minute deadline on single-job sampling. Only a driver sets a time cap now.
 Their logs are in `grid/<cell>.timeout-8-32/`, and their records are in `manifest-timeouts-8-32.json`.
-The second pass ran each cell again with the smaller pair that the test setup rule selects.
+The second pass, still with the old binaries, ran each cell again with the smaller pair that the test setup rule selects.
 
 - `sa-complete-binary-m48-n9370`
 - `sa-complete-binary-m1-n9370`
