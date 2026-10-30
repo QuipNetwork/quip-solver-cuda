@@ -2219,8 +2219,6 @@ pub(crate) fn bench_plan(
 ///   caller should reject the job rather than retry it.
 /// - [`SampleError::Unsupported`] if no exact coefficient path can run this graph.
 ///   MSA routes degrees above `capacity::MSA_MAX_DEGREE` to dense storage.
-/// - [`SampleError::KernelTimeout`] if the kernel has not marked slot 0
-///   COMPLETE within 120 seconds of launch.
 /// - [`SampleError::Cuda`] or [`SampleError::Driver`] for a CUDA driver
 ///   fault at any stage: creating the session's streams and device buffers,
 ///   uploading the beta schedule or the job's `h`/`J`, launching the kernel,
@@ -2321,15 +2319,9 @@ fn sample_one_planned(
     let seed = kernel_seed(params.seed);
     sess.launch(1, beta.len(), sweeps_per_beta, seed)?;
 
-    let deadline = Instant::now() + Duration::from_mins(2);
-    loop {
-        let ctrl = sess.poll_ctrl()?;
-        if ctrl[0] == SLOT_COMPLETE {
-            break;
-        }
-        if Instant::now() > deadline {
-            return Err(SampleError::KernelTimeout);
-        }
+    // No deadline: a model at the probed limit can anneal for days, and only
+    // the caller decides when to stop waiting.
+    while sess.poll_ctrl()?[0] != SLOT_COMPLETE {
         std::thread::sleep(Duration::from_millis(1));
     }
     let reads = sess.download_slot(0, 0)?;
@@ -2585,20 +2577,17 @@ fn timing_event(device: &CudaDevice) -> Result<CudaEvent, SampleError> {
 
 /// Poll `sess`'s first `num_nonces` ctrl mailboxes until all are
 /// `SLOT_COMPLETE`, returning the host wall time spent waiting. Extracted from
-/// [`bench_many`] to keep it under the crate's complexity cap.
+/// [`bench_many`] to keep it under the crate's complexity cap. It has no
+/// deadline; the driver of a benchmark sets any time cap.
 fn poll_until_complete(
     sess: &SelfFeedingSession<'_>,
     num_nonces: usize,
-    deadline: Instant,
 ) -> Result<u64, SampleError> {
     let poll_start = Instant::now();
     loop {
         let ctrl = sess.poll_ctrl()?;
         if (0..num_nonces).all(|n| ctrl[n * CTRL_STRIDE] == SLOT_COMPLETE) {
             return Ok(u64::try_from(poll_start.elapsed().as_nanos()).unwrap_or(u64::MAX));
-        }
-        if Instant::now() > deadline {
-            return Err(SampleError::KernelTimeout);
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -2619,8 +2608,7 @@ fn poll_until_complete(
 ///
 /// Same set as [`sample_one`]: [`SampleError::GraphTooLarge`] for an oversized
 /// graph, [`SampleError::Unsupported`] for a graph the kernel cannot run,
-/// [`SampleError::KernelTimeout`] if the slot never completes within
-/// the deadline, and [`SampleError::Cuda`]/[`SampleError::Driver`] for any
+/// and [`SampleError::Cuda`]/[`SampleError::Driver`] for any
 /// driver fault while building the session, creating events, uploading,
 /// launching, polling, or downloading.
 pub fn bench_one(
@@ -2763,8 +2751,7 @@ fn bench_many_planned(
     k1.record(&sess.stream_compute)?;
 
     // --- Poll to completion (host wall), then timed download. ---
-    let deadline = Instant::now() + Duration::from_mins(10);
-    let poll_wait_ns = poll_until_complete(&sess, num_nonces, deadline)?;
+    let poll_wait_ns = poll_until_complete(&sess, num_nonces)?;
     let kernel_ns = ms_to_ns(k0.elapsed_ms(&k1)?);
 
     let dl0 = timing_event(device)?;
@@ -2950,9 +2937,8 @@ fn send_reject(out: &Sender<StreamResult>, job: StreamJob, err: WireSampleError)
 /// A failed download is reported as a `DeviceFault` rather than banked as an
 /// empty success: telling the coordinator a job succeeded with zero reads
 /// loses the work permanently, and a slot that downloads COMPLETE samples
-/// wrong is the same device condition [`SampleError::KernelTimeout`] and a
-/// ctrl-mailbox read failure already end the session over (see
-/// `scan_completions`).
+/// wrong is the same device condition a ctrl-mailbox read failure already
+/// ends the session over (see `scan_completions`).
 ///
 /// Returns `false` once the result channel has closed.
 fn emit_completion(
@@ -3384,7 +3370,7 @@ fn pump_session(
             // rejecting the held jobs refunds their credits, so the coordinator
             // refills the pipeline, and the next seed launches a fresh kernel.
             //
-            // `DeviceBusy`, not `KernelTimeout.into()` (`DeviceFault`): the
+            // `DeviceBusy`, not `DeviceFault`: the
             // in-process rebuild below IS the recovery, and a fault would end
             // the whole session before it runs. If the device is genuinely
             // gone, the rebuild itself fails and that error is the

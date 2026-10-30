@@ -64,14 +64,6 @@ pub enum SampleError {
     /// [`quip_solver_core::SampleError::Capacity`] like `GraphTooLarge`.
     #[error("graph unsupported by the kernel: {0}")]
     Unsupported(String),
-    /// The persistent kernel never marked the slot COMPLETE before the
-    /// driver's deadline: the device is wedged. Maps to
-    /// [`quip_solver_core::SampleError::DeviceFault`] (see the `From` impl
-    /// below), which ends the session for a supervisor restart rather than
-    /// rejecting jobs one at a time against a device that will keep failing
-    /// the same way.
-    #[error("self-feeding kernel timed out")]
-    KernelTimeout,
 }
 
 impl SampleError {
@@ -120,9 +112,7 @@ impl From<SampleError> for quip_solver_core::SampleError {
             | SampleError::ModelExceedsDeviceMemory { .. }
             | SampleError::Unsupported(_) => Self::Capacity,
             SampleError::OutOfMemory(_) => Self::DeviceBusy,
-            SampleError::KernelTimeout | SampleError::Cuda(_) | SampleError::Driver(_) => {
-                Self::DeviceFault(e.to_string())
-            }
+            SampleError::Cuda(_) | SampleError::Driver(_) => Self::DeviceFault(e.to_string()),
         }
     }
 }
@@ -137,8 +127,6 @@ impl From<SampleError> for quip_solver_core::SampleError {
 ///   usable device memory read at open. Refused before device allocation.
 /// - [`SampleError::Unsupported`] if no path holds the coefficients exactly.
 ///   MSA routes degrees above [`crate::capacity::MSA_MAX_DEGREE`] to dense storage.
-/// - [`SampleError::KernelTimeout`] if the persistent kernel never marks the
-///   slot complete before the driver's deadline.
 /// - [`SampleError::Cuda`] if opening the device or compiling its kernels failed.
 /// - [`SampleError::OutOfMemory`] if the driver could not allocate device
 ///   memory — transient VRAM pressure, rejected per-job.
