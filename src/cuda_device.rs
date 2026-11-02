@@ -535,6 +535,12 @@ pub struct CudaDevice {
     pub sa_force_global: bool,
     /// Force an exact SA coefficient path for parity tests. Defaults to None.
     pub sa_force_path: Option<CoefficientPath>,
+    /// Longest wait for one single-shot launch (`sample_one`, `bench_*`) to
+    /// complete. `None`, the default, waits until the kernel finishes, which
+    /// can take days at the probed limit. Only a driver sets it: a test,
+    /// `bench run --launch-timeout-secs`, or an operator. The mining stream
+    /// does not read it; it has its own stall check.
+    pub launch_timeout: Option<std::time::Duration>,
     _sa_mod: Arc<CudaModule>,
     _sa_wide_mod: Arc<CudaModule>,
     _gibbs_mod: Arc<CudaModule>,
@@ -552,6 +558,7 @@ impl fmt::Debug for CudaDevice {
             .field("max_nodes", &self.max_nodes)
             .field("sa_force_global", &self.sa_force_global)
             .field("sa_force_path", &self.sa_force_path)
+            .field("launch_timeout", &self.launch_timeout)
             .field("kernel", &self.kernel)
             .field("msa_dynamic_shared_bytes", &self.msa_dynamic_shared_bytes)
             .finish_non_exhaustive()
@@ -753,6 +760,7 @@ impl CudaDevice {
             sa_variants,
             kernel,
             sa_force_path: None,
+            launch_timeout: None,
             _sa_mod: sa_mod,
             _sa_wide_mod: sa_wide_mod,
             _gibbs_mod: gibbs_mod,

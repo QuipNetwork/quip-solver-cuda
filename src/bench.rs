@@ -158,6 +158,10 @@ pub struct RunArgs {
     /// msa only: hold at most this many spins in shared memory.
     #[arg(long)]
     pub msa_shared_spins: Option<usize>,
+    /// Fail a launch that has not completed after this many seconds. Absent
+    /// by default: each launch runs until the kernel finishes.
+    #[arg(long)]
+    pub launch_timeout_secs: Option<u64>,
     /// Corpus JSONL to bench real models (one `{"nonce":"<64hex>", ...}`
     /// line per model, unknown fields ignored); requires `--topology`.
     /// Redraws each nonce's real `(h, J)` and benches that graph instead of
@@ -190,6 +194,14 @@ pub struct RunArgs {
     /// Metadata passthrough for `BenchRecord.topology_hash`.
     #[arg(long = "topology-hash")]
     pub topology_hash: Option<String>,
+}
+
+impl RunArgs {
+    /// The driver-set launch wait limit; `None` when `--launch-timeout-secs` is absent.
+    #[must_use]
+    pub fn launch_timeout(&self) -> Option<std::time::Duration> {
+        self.launch_timeout_secs.map(std::time::Duration::from_secs)
+    }
 }
 
 /// Arguments for `bench fold`.
@@ -751,6 +763,7 @@ fn run_run(
                 crate::capacity::advertised_nodes(kernel, usize::MAX, Some(&device.limits));
         }
         device.msa_shared_spins_cap = args.msa_shared_spins;
+        device.launch_timeout = args.launch_timeout();
         check_reads(kernel, args.reads, &device.limits)?;
         let width = stream_width(&device, kernel);
         let nonces = usize::try_from(args.nonces).unwrap_or(usize::MAX);
@@ -1001,6 +1014,23 @@ mod tests {
     struct RunCli {
         #[command(flatten)]
         args: super::RunArgs,
+    }
+
+    #[test]
+    fn launch_timeout_is_absent_by_default() {
+        use clap::Parser;
+        let args = RunCli::try_parse_from(["bench", "--out", "unused"])
+            .unwrap()
+            .args;
+        assert_eq!(args.launch_timeout(), None);
+        let args =
+            RunCli::try_parse_from(["bench", "--out", "unused", "--launch-timeout-secs", "3600"])
+                .unwrap()
+                .args;
+        assert_eq!(
+            args.launch_timeout(),
+            Some(std::time::Duration::from_hours(1))
+        );
     }
 
     #[test]
