@@ -8,12 +8,15 @@ The tables show both how much fits and how long it runs.
 
 - Physical GPU: 1, NVIDIA RTX A4000, 48 SMs.
 - Container: `quip-solver-cuda-ci`, CUDA 12.9.1.
-- Grid binaries: `1b8108a309a9d3c4ef543858af3ac4ddf13ebc6c` with the probe calibration edits. No kernel or benchmark code differs.
+- Grid binaries: the first 260 cells used `1b8108a309a9d3c4ef543858af3ac4ddf13ebc6c` with the probe calibration edits.
+  The 16 Gibbs full-spill cells at 400,000 and 1,000,000 nodes used the `a6d0769` build, `target/grid-a6d0769/quip-cuda-gibbs`.
+  Kernel code is the same in both builds. The later build also has no fixed launch time limit.
 - Reads: 256 per nonce. Concurrency: full instance count and one nonce.
 - Each sweep point uses one warm-up and four measured repeats.
 - Sweep pairs: 64/256, or 8/32 when earlier cells predict more than 900 seconds for 64/256.
 - The 64/256 and 8/32 pairs use four sweeps per beta rung.
 - Some cells larger than the timed range ran with 2/8 or 1/4 sweeps at one sweep per beta rung. Those runs are smoke runs, and the report does not use their timing.
+- The timed range includes the eight Gibbs degree-60 cells at 400,000 and 1,000,000 nodes. They use 2/8 sweeps at one sweep per beta rung.
 - Each GPU run ends before the next starts. Each run records compute processes on physical GPU 1.
 
 Raw records, commands, generation logs, and scripts are in
@@ -36,7 +39,7 @@ SA keeps all spin state in global memory for sparse models larger than 5,000 nod
 Gibbs switches to its spill variant for sparse models larger than 4,800 nodes, but that switch alone does not mean full spill.
 The spill variant keeps the first 101,360 spins in shared memory on the A4000, so most spins move to the global tail only past 202,720 nodes.
 The timed range is 200,000 nodes for SA sparse models, 1,000,000 nodes for Gibbs sparse models, and 4,000 nodes for complete models.
-At 400,000 and 1,000,000 nodes, 75% and 90% of the Gibbs spins are in the global tail. The Spilled column in the timing tables gives the fraction at each point.
+At 400,000 and 1,000,000 nodes, 74.7% and 89.9% of the Gibbs spins are in the global tail. The Spilled column in the timing tables gives the fraction at each point.
 Larger cells are smoke runs. A smoke run passes when it ends with a result, or runs for one hour with no error.
 
 Each larger probe-limit cell gets a projected slowdown from the last timed cell in its series:
