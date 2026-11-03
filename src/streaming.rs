@@ -2219,8 +2219,6 @@ pub(crate) fn bench_plan(
 ///   caller should reject the job rather than retry it.
 /// - [`SampleError::Unsupported`] if no exact coefficient path can run this graph.
 ///   MSA routes degrees above `capacity::MSA_MAX_DEGREE` to dense storage.
-/// - [`SampleError::KernelTimeout`] if slot 0 is not COMPLETE within the
-///   driver-set `CudaDevice::launch_timeout`. Without one it waits until done.
 /// - [`SampleError::Cuda`] or [`SampleError::Driver`] for a CUDA driver
 ///   fault at any stage: creating the session's streams and device buffers,
 ///   uploading the beta schedule or the job's `h`/`J`, launching the kernel,
@@ -2321,11 +2319,9 @@ fn sample_one_planned(
     let seed = kernel_seed(params.seed);
     sess.launch(1, beta.len(), sweeps_per_beta, seed)?;
 
-    let started = Instant::now();
+    // No deadline: a model at the probed limit can anneal for days, and only
+    // the caller decides when to stop waiting.
     while sess.poll_ctrl()?[0] != SLOT_COMPLETE {
-        if launch_expired(started, device.launch_timeout) {
-            return Err(SampleError::KernelTimeout);
-        }
         std::thread::sleep(Duration::from_millis(1));
     }
     let reads = sess.download_slot(0, 0)?;
@@ -2581,12 +2577,11 @@ fn timing_event(device: &CudaDevice) -> Result<CudaEvent, SampleError> {
 
 /// Poll `sess`'s first `num_nonces` ctrl mailboxes until all are
 /// `SLOT_COMPLETE`, returning the host wall time spent waiting. Extracted from
-/// [`bench_many`] to keep it under the crate's complexity cap. `timeout` is
-/// the driver's limit; `None` waits until the kernel finishes.
+/// [`bench_many`] to keep it under the crate's complexity cap. It has no
+/// deadline; the driver of a benchmark sets any time cap.
 fn poll_until_complete(
     sess: &SelfFeedingSession<'_>,
     num_nonces: usize,
-    timeout: Option<Duration>,
 ) -> Result<u64, SampleError> {
     let poll_start = Instant::now();
     loop {
@@ -2594,17 +2589,8 @@ fn poll_until_complete(
         if (0..num_nonces).all(|n| ctrl[n * CTRL_STRIDE] == SLOT_COMPLETE) {
             return Ok(u64::try_from(poll_start.elapsed().as_nanos()).unwrap_or(u64::MAX));
         }
-        if launch_expired(poll_start, timeout) {
-            return Err(SampleError::KernelTimeout);
-        }
         std::thread::sleep(Duration::from_millis(1));
     }
-}
-
-/// Whether a launch that began at `started` has outlived the driver-set
-/// `timeout`. Without a timeout a launch never expires.
-fn launch_expired(started: Instant, timeout: Option<Duration>) -> bool {
-    timeout.is_some_and(|limit| started.elapsed() > limit)
 }
 
 /// Run ONE model through an isolated, non-persistent single-shot launch and
@@ -2622,8 +2608,7 @@ fn launch_expired(started: Instant, timeout: Option<Duration>) -> bool {
 ///
 /// Same set as [`sample_one`]: [`SampleError::GraphTooLarge`] for an oversized
 /// graph, [`SampleError::Unsupported`] for a graph the kernel cannot run,
-/// [`SampleError::KernelTimeout`] if the slot outlives the driver-set
-/// `CudaDevice::launch_timeout`, and [`SampleError::Cuda`]/[`SampleError::Driver`] for any
+/// and [`SampleError::Cuda`]/[`SampleError::Driver`] for any
 /// driver fault while building the session, creating events, uploading,
 /// launching, polling, or downloading.
 pub fn bench_one(
@@ -2766,7 +2751,7 @@ fn bench_many_planned(
     k1.record(&sess.stream_compute)?;
 
     // --- Poll to completion (host wall), then timed download. ---
-    let poll_wait_ns = poll_until_complete(&sess, num_nonces, device.launch_timeout)?;
+    let poll_wait_ns = poll_until_complete(&sess, num_nonces)?;
     let kernel_ns = ms_to_ns(k0.elapsed_ms(&k1)?);
 
     let dl0 = timing_event(device)?;
@@ -3655,14 +3640,6 @@ mod tests {
 
     use super::*;
     use tokio::sync::mpsc::channel;
-
-    #[test]
-    fn launch_without_timeout_never_expires() {
-        let started = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
-        assert!(!launch_expired(started, None));
-        assert!(launch_expired(started, Some(Duration::from_secs(1))));
-        assert!(!launch_expired(started, Some(Duration::from_hours(1))));
-    }
 
     fn routing_limits() -> capacity::DeviceLimits {
         capacity::DeviceLimits {
