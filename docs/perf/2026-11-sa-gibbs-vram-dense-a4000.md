@@ -49,7 +49,7 @@ Free device memory can change between runs. Each probe snapshot fixes the limit 
 Each precision tier covers both fields and couplings.
 Using one nonce keeps the same node limit.
 
-All 277 preflight records show no compute processes on GPU 1.
+All 279 preflight records show no compute processes on GPU 1.
 
 ### `sa`
 
@@ -597,10 +597,12 @@ The output names RTX A4000 as the reference card, including on other GPUs.
 
 The first grid pass ran these cells at 8/32. Each run failed with `self-feeding kernel timed out`.
 A bug in the benchmark caused these failures. It stopped each launch after a fixed 10 minutes, even when the model fit the probe limit.
-Now the benchmark and single-job sampling wait for the kernel unless a driver passes `bench run --launch-timeout-secs`.
+Now the benchmark and single-job sampling wait until the kernel finishes. A driver caps a run with a process-level timeout.
 The logs for these failures are in `grid/<cell>.timeout-8-32/`. The matching records are in `manifest-timeouts-8-32.json`.
 
-A second grid pass ran each cell again with a smaller sweep pair. The Smoke runs section repeats each cell at 8/32 with the current build.
+A second grid pass ran each cell again with a smaller sweep pair.
+The Smoke runs section repeats five of them at 8/32 with the current build.
+These five are SA complete Binary and Int8 at 9,370 nodes with 48 and 1 nonces, and Gibbs degree-20 Binary at 6,491,600 nodes with 12 nonces.
 
 - `sa-complete-binary-m48-n9370`
 - `sa-complete-binary-m1-n9370`
