@@ -907,6 +907,27 @@ pub fn advertised_nodes(
     }
 }
 
+/// Binary coupler limit that an SA or Gibbs identity advertises: the complete
+/// model, the fewest nodes for its coupler count, at the full read count.
+/// Node and coupler limits are independent bounds, and each model still
+/// passes admission at its own precision, reads, and schedule length.
+#[must_use]
+pub fn advertised_couplers(kernel: KernelKind, limits: &DeviceLimits) -> usize {
+    match kernel {
+        KernelKind::Sa | KernelKind::Gibbs => {
+            max_model(
+                kernel,
+                Connectivity::Complete,
+                Precision::Binary,
+                256,
+                limits,
+            )
+            .couplers
+        }
+        KernelKind::Msa => msa_max_couplers(limits, msa_device_reads(limits)),
+    }
+}
+
 /// Resolve a requested capacity against the kernel and the device.
 ///
 /// MSA raises requests below its default and rejects requests above its
@@ -995,6 +1016,25 @@ mod tests {
             free_bytes: 15 << 30,
             sm_count: 48,
             threads_per_sm: 1536,
+        }
+    }
+
+    #[test]
+    fn advertised_couplers_follow_the_complete_binary_footprint() {
+        for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
+            for limits in [a4000_limits(), a4000(512 << 20)] {
+                let bound = max_model(
+                    kernel,
+                    Connectivity::Complete,
+                    Precision::Binary,
+                    256,
+                    &limits,
+                )
+                .couplers;
+                assert_eq!(advertised_couplers(kernel, &limits), bound, "{kernel:?}");
+            }
+            // complete:1415 has 1,000,405 couplers, past the old fixed 1,000,000.
+            assert!(advertised_couplers(kernel, &a4000_limits()) > 1_000_405);
         }
     }
 

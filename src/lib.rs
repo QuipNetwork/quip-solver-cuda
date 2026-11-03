@@ -157,8 +157,6 @@ impl Sampler for MsaSampler {
     }
 }
 
-const DEFAULT_MAX_EDGES: u32 = 1_000_000;
-
 /// Features every kernel advertises: a real `sample_stream` override, the NVML
 /// governor, exact coefficient uploads, and a host-built ladder that honours
 /// `SampleParams::schedule`.
@@ -196,25 +194,27 @@ const CUDA_ADAPT: quip_solver_core::adapt::AdaptBounds = quip_solver_core::adapt
     reads_solution_floor_factor: 0,
 };
 
-/// Narrow a resolved capacity to the wire type.
+/// Narrow a resolved node or coupler limit to the wire type.
 ///
-/// Saturating is safe: every value reaching here has passed
-/// [`capacity::resolve`], which bounds it by kernel index widths or the
-/// device memory budget, below `u32::MAX`.
-fn identity_max_nodes(max_nodes: usize) -> u32 {
-    u32::try_from(max_nodes).unwrap_or(u32::MAX)
+/// Saturating is safe: every value reaching here comes from the capacity
+/// model ([`capacity::resolve`], [`capacity::advertised_couplers`]), which
+/// bounds it by kernel index widths or the device memory budget, below
+/// `u32::MAX`.
+fn identity_limit(limit: usize) -> u32 {
+    u32::try_from(limit).unwrap_or(u32::MAX)
 }
 
 /// Backend identity for `quip-cuda-sa` at its device-memory node limit,
-/// optionally reduced by `--max-nodes`. Each model also passes admission
+/// optionally reduced by `--max-nodes`, and its device-memory coupler limit
+/// ([`capacity::advertised_couplers`]). Each model also passes admission
 /// with its own topology, coefficient width, and beta schedule.
 #[must_use]
-pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
+pub fn cuda_sa_identity(max_nodes: usize, max_edges: usize) -> BackendIdentity {
     BackendIdentity {
         backend: Backend::Cuda,
         algorithm: KernelKind::Sa.algorithm(),
-        max_nodes: identity_max_nodes(max_nodes),
-        max_edges: DEFAULT_MAX_EDGES,
+        max_nodes: identity_limit(max_nodes),
+        max_edges: identity_limit(max_edges),
         features: FEATURES,
         adapt: CUDA_ADAPT,
         // SA has no degree bound (`Some(0)` is unbounded).
@@ -268,7 +268,7 @@ pub fn cuda_msa_identity(max_nodes: usize, max_edges: usize) -> BackendIdentity 
     BackendIdentity {
         backend: Backend::Cuda,
         algorithm: KernelKind::Msa.algorithm(),
-        max_nodes: identity_max_nodes(max_nodes),
+        max_nodes: identity_limit(max_nodes),
         max_edges: u32::try_from(max_edges).unwrap_or(u32::MAX),
         features: FEATURES,
         adapt: cuda_msa_adapt(u32::try_from(capacity::MSA_MAX_READS).unwrap_or(u32::MAX)),
@@ -285,16 +285,17 @@ pub fn cuda_msa_identity(max_nodes: usize, max_edges: usize) -> BackendIdentity 
     }
 }
 
-/// Backend identity for `quip-cuda-gibbs` at a resolved capacity. `max_nodes`
-/// is the self-feeding Gibbs kernel's `shared_state` size in
-/// `kernels/gibbs.cu`.
+/// Backend identity for `quip-cuda-gibbs` at its device-memory node and
+/// coupler limits ([`capacity::advertised_nodes`],
+/// [`capacity::advertised_couplers`]), the node limit optionally reduced by
+/// `--max-nodes`. Each model also passes admission on its own footprint.
 #[must_use]
-pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
+pub fn cuda_gibbs_identity(max_nodes: usize, max_edges: usize) -> BackendIdentity {
     BackendIdentity {
         backend: Backend::Cuda,
         algorithm: KernelKind::Gibbs.algorithm(),
-        max_nodes: identity_max_nodes(max_nodes),
-        max_edges: DEFAULT_MAX_EDGES,
+        max_nodes: identity_limit(max_nodes),
+        max_edges: identity_limit(max_edges),
         features: FEATURES,
         adapt: CUDA_ADAPT,
         // The int8 bound is per coefficient at the model's own scale, which no

@@ -44,7 +44,8 @@ Gibbs keeps its static shared array for sparse models through 4,800 nodes.
 Other Gibbs models keep a shared spin prefix. The rest of the spins use device memory.
 
 Both kernels choose the sparse or dense route that needs less memory.
-Their node limits describe Binary models with no edges. These limits use the default read count and 64 beta entries.
+Their node limits describe Binary models with no edges. Their coupler limits describe complete Binary models.
+These limits use the default read count and 64 beta entries.
 Each model must fit with its own edges, precision, and beta count.
 Use `--max-nodes` to set a lower node limit.
 

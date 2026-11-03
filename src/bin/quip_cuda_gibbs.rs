@@ -6,7 +6,7 @@
 use clap::{Parser, Subcommand};
 use quip_solver_core::{run, CommonArgs};
 use quip_solver_cuda::bench::{run_bench, BenchAction};
-use quip_solver_cuda::capacity::advertised_nodes;
+use quip_solver_cuda::capacity::{advertised_couplers, advertised_nodes};
 use quip_solver_cuda::cuda_device::{device_label_mismatch, CudaDevice};
 use quip_solver_cuda::nvml_gov::UtilGovernor;
 use quip_solver_cuda::{cuda_gibbs_identity, CudaSampler, KernelKind};
@@ -120,7 +120,8 @@ fn main() -> ExitCode {
         Some(&device.limits),
     );
     device.max_nodes = nodes;
-    run(cuda_gibbs_identity(nodes), &cli.common, || {
+    let edges = advertised_couplers(KernelKind::Gibbs, &device.limits);
+    run(cuda_gibbs_identity(nodes, edges), &cli.common, || {
         // The governor binds by PCI bus id, not by ordinal: NVML's index
         // space is PCI-ordered and does not track the CUDA ordinal this
         // process opened. Taking it from the opened device means both

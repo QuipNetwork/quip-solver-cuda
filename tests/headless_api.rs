@@ -29,20 +29,20 @@ fn max_reads_is_the_kernel_read_cap() {
 /// what the compiled kernel accepts.
 #[test]
 fn identities_report_the_resolved_capacity() {
-    let sa = cuda_sa_identity(SA_DEFAULT_NODES);
+    let sa = cuda_sa_identity(SA_DEFAULT_NODES, 1);
     assert_eq!(backend_name(sa.backend), "cuda");
     assert_eq!(algorithm_name(sa.algorithm), "sa");
     assert_eq!(sa.max_nodes, 5000);
 
-    let gibbs = cuda_gibbs_identity(GIBBS_DEFAULT_NODES);
+    let gibbs = cuda_gibbs_identity(GIBBS_DEFAULT_NODES, 1);
     assert_eq!(backend_name(gibbs.backend), "cuda");
     assert_eq!(algorithm_name(gibbs.algorithm), "gibbs");
     assert_eq!(gibbs.max_nodes, 4800);
 
     // A raised capacity must show through, or a coordinator would keep
     // rejecting jobs the kernel can now accept.
-    assert_eq!(cuda_sa_identity(8192).max_nodes, 8192);
-    assert_eq!(cuda_gibbs_identity(32768).max_nodes, 32768);
+    assert_eq!(cuda_sa_identity(8192, 1).max_nodes, 8192);
+    assert_eq!(cuda_gibbs_identity(32768, 1).max_nodes, 32768);
 }
 
 /// The msa identity pins reads at the kernel's cap; the two must not drift.
@@ -59,6 +59,16 @@ fn msa_identity_reads_match_the_kernel_read_cap() {
         MSA_MAX_READS
     );
     assert_eq!(max_reads(KernelKind::Msa), msa.adapt.max_reads);
+}
+
+#[test]
+fn sa_and_gibbs_identities_declare_the_resolved_coupler_limit() {
+    let sa = cuda_sa_identity(410_747, 43_893_765);
+    assert_eq!(sa.max_nodes, 410_747);
+    assert_eq!(sa.max_edges, 43_893_765);
+    let gibbs = cuda_gibbs_identity(6_491_600, 183_869_076);
+    assert_eq!(gibbs.max_nodes, 6_491_600);
+    assert_eq!(gibbs.max_edges, 183_869_076);
 }
 
 #[test]
