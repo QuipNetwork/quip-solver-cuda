@@ -275,6 +275,153 @@ pub(crate) fn lookup(
     interpolate(samples(kernel, connectivity, precision), nodes)
 }
 
+/// A calibrated slowdown and whether any part of it comes from a projected entry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Slowdown {
+    /// Slowdown per lane-update against the kernel's baseline.
+    pub value: f64,
+    /// True when the value is a projected entry or interpolates toward one.
+    pub projected: bool,
+}
+
+/// [`lookup`] plus its source: past the last timed node count of a series that
+/// ends in a projected entry, the value is projected.
+pub(crate) fn lookup_with_source(
+    kernel: KernelKind,
+    connectivity: Connectivity,
+    precision: Precision,
+    nodes: usize,
+    reads: usize,
+) -> Option<Slowdown> {
+    let value = lookup(kernel, connectivity, precision, nodes, reads)?;
+    let projected = last_timed_before_projection(kernel, connectivity, precision)
+        .is_some_and(|last_timed| nodes > last_timed);
+    Some(Slowdown { value, projected })
+}
+
+/// The last timed node count of each series whose final entry is projected.
+const LAST_TIMED_BEFORE_PROJECTION: &[(KernelKind, Connectivity, Precision, usize)] = &[
+    (
+        KernelKind::Sa,
+        Connectivity::Degree(20),
+        Precision::Binary,
+        200_000,
+    ),
+    (
+        KernelKind::Sa,
+        Connectivity::Degree(60),
+        Precision::Binary,
+        200_000,
+    ),
+    (
+        KernelKind::Sa,
+        Connectivity::Complete,
+        Precision::Binary,
+        4_000,
+    ),
+    (
+        KernelKind::Sa,
+        Connectivity::Complete,
+        Precision::Int8,
+        4_000,
+    ),
+    (
+        KernelKind::Sa,
+        Connectivity::Complete,
+        Precision::Int32,
+        4_000,
+    ),
+    (
+        KernelKind::Sa,
+        Connectivity::Complete,
+        Precision::Float32,
+        4_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Degree(20),
+        Precision::Binary,
+        200_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Degree(20),
+        Precision::Int8,
+        200_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Degree(20),
+        Precision::Int32,
+        200_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Degree(20),
+        Precision::Float32,
+        200_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Degree(60),
+        Precision::Binary,
+        200_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Degree(60),
+        Precision::Int8,
+        200_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Degree(60),
+        Precision::Int32,
+        200_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Degree(60),
+        Precision::Float32,
+        200_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Complete,
+        Precision::Binary,
+        4_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Complete,
+        Precision::Int8,
+        4_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Complete,
+        Precision::Int32,
+        4_000,
+    ),
+    (
+        KernelKind::Gibbs,
+        Connectivity::Complete,
+        Precision::Float32,
+        4_000,
+    ),
+];
+
+fn last_timed_before_projection(
+    kernel: KernelKind,
+    connectivity: Connectivity,
+    precision: Precision,
+) -> Option<usize> {
+    LAST_TIMED_BEFORE_PROJECTION
+        .iter()
+        .find(|&&(k, c, p, _)| (k, c, p) == (kernel, connectivity, precision))
+        .map(|&(.., last_timed)| last_timed)
+}
+
 #[allow(clippy::cast_precision_loss)] // supported node counts fit exactly in f64
 fn interpolate(samples: &[(usize, f64)], nodes: usize) -> Option<f64> {
     let &(first, _) = samples.first()?;
@@ -321,6 +468,44 @@ mod tests {
                 Some(1.0)
             );
         }
+    }
+
+    #[test]
+    fn slowdown_marks_values_past_the_timed_range_projected() {
+        let at = |kernel, nodes, reads| {
+            lookup_with_source(
+                kernel,
+                Connectivity::Degree(20),
+                Precision::Binary,
+                nodes,
+                reads,
+            )
+            .map(|slowdown| slowdown.projected)
+        };
+        // 200,000 is the last timed SA cell; 410,747 is the projected probe limit.
+        assert_eq!(at(KernelKind::Sa, 64_000, 256), Some(false));
+        assert_eq!(at(KernelKind::Sa, 200_000, 256), Some(false));
+        assert_eq!(at(KernelKind::Sa, 300_000, 256), Some(true));
+        assert_eq!(at(KernelKind::Sa, 410_747, 256), Some(true));
+        assert_eq!(at(KernelKind::Sa, 410_748, 256), None);
+        assert_eq!(at(KernelKind::Msa, 2_145_598, 128), Some(false));
+        assert_eq!(
+            lookup_with_source(
+                KernelKind::Sa,
+                Connectivity::Degree(20),
+                Precision::Binary,
+                300_000,
+                256
+            )
+            .map(|slowdown| slowdown.value),
+            lookup(
+                KernelKind::Sa,
+                Connectivity::Degree(20),
+                Precision::Binary,
+                300_000,
+                256
+            )
+        );
     }
 
     #[test]

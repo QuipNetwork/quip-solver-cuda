@@ -28,11 +28,28 @@ pub struct ProbeCell {
     /// Global bytes allocated per instance.
     pub per_instance_bytes: usize,
     /// RTX A4000 slowdown per lane-update relative to this kernel's degree-20 Binary baseline.
-    /// Available only at the measured read count and within the measured node range.
+    /// Available only at the measured read count and within the calibrated node range.
     pub expected_slowdown: Option<f64>,
+    /// Whether `expected_slowdown` is projected past the timed range rather than measured.
+    pub slowdown_projected: bool,
 }
 
 impl ProbeCell {
+    /// One text-grid entry: size, tier, and slowdown, labelled when projected.
+    fn summary(&self) -> String {
+        let slowdown = match (self.expected_slowdown, self.slowdown_projected) {
+            (None, _) => "unknown".to_owned(),
+            (Some(value), false) => format!("{value:.2}x"),
+            (Some(value), true) => format!("{value:.2}x (projected)"),
+        };
+        format!(
+            "{} vars, {} couplers, {}, slowdown {slowdown}",
+            self.nodes,
+            self.couplers,
+            self.tier()
+        )
+    }
+
     /// Display tier for the model's spin and coefficient storage.
     #[must_use]
     pub fn tier(&self) -> &'static str {
@@ -100,6 +117,13 @@ pub fn probe(kernel: KernelKind, limits: &DeviceLimits, reads: usize) -> Vec<Pro
                     .1
                 }
             };
+            let slowdown = crate::slowdown_a4000::lookup_with_source(
+                kernel,
+                connectivity,
+                precision,
+                shape.nodes,
+                reads,
+            );
             cells.push(ProbeCell {
                 kernel,
                 connectivity,
@@ -109,13 +133,8 @@ pub fn probe(kernel: KernelKind, limits: &DeviceLimits, reads: usize) -> Vec<Pro
                 nodes: shape.nodes,
                 couplers: shape.couplers,
                 per_instance_bytes: footprint.per_instance_bytes,
-                expected_slowdown: crate::slowdown_a4000::lookup(
-                    kernel,
-                    connectivity,
-                    precision,
-                    shape.nodes,
-                    reads,
-                ),
+                expected_slowdown: slowdown.map(|slowdown| slowdown.value),
+                slowdown_projected: slowdown.is_some_and(|slowdown| slowdown.projected),
             });
         }
     }
@@ -124,8 +143,19 @@ pub fn probe(kernel: KernelKind, limits: &DeviceLimits, reads: usize) -> Vec<Pro
 
 /// Print the device capacity grid as a table or a single JSON object.
 pub fn print_probe(device: &CudaDevice, json: bool) {
-    let limits = &device.limits;
-    let kernel = device.kernel;
+    let name = device
+        .name()
+        .unwrap_or_else(|_| format!("cuda-{}", device.device_index));
+    print!(
+        "{}",
+        render_probe(&name, device.kernel, &device.limits, json)
+    );
+}
+
+/// The capacity grid of `kernel` on a device with `limits`, as text or JSON.
+fn render_probe(name: &str, kernel: KernelKind, limits: &DeviceLimits, json: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
     let reads = max_reads(kernel, limits);
     let instance_count = instances(kernel, limits.sm_count);
     let per_instance_budget = limits.usable_bytes() / instance_count;
@@ -141,9 +171,6 @@ pub fn print_probe(device: &CudaDevice, json: bool) {
         }
     };
     let cells = probe(kernel, limits, reads);
-    let name = device
-        .name()
-        .unwrap_or_else(|_| format!("cuda-{}", device.device_index));
     let connectivity = |conn| match conn {
         Connectivity::Degree(d) => format!("degree {d}"),
         Connectivity::Complete => "complete".to_owned(),
@@ -157,9 +184,10 @@ pub fn print_probe(device: &CudaDevice, json: bool) {
             "nodes": cell.nodes, "couplers": cell.couplers,
             "per_instance_bytes": cell.per_instance_bytes,
             "expected_slowdown": cell.expected_slowdown,
+            "projected": cell.slowdown_projected,
         })).collect();
-        println!(
-            "{}",
+        return format!(
+            "{}\n",
             serde_json::json!({
                 "kernel": kernel.name(), "device_name": name, "sm_count": limits.sm_count,
                 "free_bytes": limits.free_bytes, "usable_bytes": limits.usable_bytes(),
@@ -169,50 +197,51 @@ pub fn print_probe(device: &CudaDevice, json: bool) {
                 "slowdown_reference": slowdown_reference,
             })
         );
-        return;
     }
-    println!("{name}: SMs={} free_bytes={} usable_bytes={} instances={} per_instance_budget={} reads={reads} betas={MSA_DEFAULT_BETAS}",
+    writeln!(out, "{name}: SMs={} free_bytes={} usable_bytes={} instances={} per_instance_budget={} reads={reads} betas={MSA_DEFAULT_BETAS}",
         limits.sm_count, limits.free_bytes, limits.usable_bytes(),
-        instance_count, per_instance_budget);
-    println!(
-        "{:<12} | {:<48} | {:<48} | {:<48} | {:<48}",
+        instance_count, per_instance_budget).expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "{:<12} | {:<60} | {:<60} | {:<60} | {:<60}",
         "Connectivity", "Binary", "Int8", "Int32", "Float32"
-    );
+    )
+    .expect("writing to a String cannot fail");
     for row in cells.chunks(4) {
-        print!("{:<12}", connectivity(row[0].connectivity));
+        write!(out, "{:<12}", connectivity(row[0].connectivity))
+            .expect("writing to a String cannot fail");
         for cell in row {
-            print!(
-                " | {:<48}",
-                format!(
-                    "{} vars, {} couplers, {}, slowdown {}",
-                    cell.nodes,
-                    cell.couplers,
-                    cell.tier(),
-                    cell.expected_slowdown
-                        .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.2}x"))
-                )
-            );
+            write!(out, " | {:<60}", cell.summary()).expect("writing to a String cannot fail");
         }
-        println!();
+        writeln!(out).expect("writing to a String cannot fail");
     }
-    println!("Bytes per instance:");
-    println!(
+    writeln!(out, "Bytes per instance:").expect("writing to a String cannot fail");
+    writeln!(
+        out,
         "{:<12} | {:<16} | {:<16} | {:<16} | {:<16}",
         "Connectivity", "Binary", "Int8", "Int32", "Float32"
-    );
+    )
+    .expect("writing to a String cannot fail");
     for row in cells.chunks(4) {
-        println!(
+        writeln!(
+            out,
             "{:<12} | {:<16} | {:<16} | {:<16} | {:<16}",
             connectivity(row[0].connectivity),
             row[0].per_instance_bytes,
             row[1].per_instance_bytes,
             row[2].per_instance_bytes,
             row[3].per_instance_bytes
-        );
+        )
+        .expect("writing to a String cannot fail");
     }
-    println!(
-        "Slowdown: {slowdown_reference}. Unknown for other read counts or outside measured ranges."
-    );
+    writeln!(
+        out,
+        "Slowdown: {slowdown_reference}. Values marked (projected) extend the last timed value \
+         of their series to the probed limit. Unknown for other read counts or outside the \
+         calibrated range."
+    )
+    .expect("writing to a String cannot fail");
+    out
 }
 
 #[cfg(test)]
@@ -400,6 +429,80 @@ mod tests {
             cell(Precision::Int32).nodes,
             max_model(KernelKind::Msa, conn, Precision::Int32, 128, &limits).nodes
         );
+    }
+
+    /// A calibrated cell whose slowdown is measured (`projected == false`) or
+    /// projected, searched across free-memory sizes so the probe picks its nodes.
+    fn calibrated_cell(kernel: KernelKind, projected: bool) -> (DeviceLimits, ProbeCell) {
+        for mib in (256..=16_384).step_by(256) {
+            let mut limits = a4000_limits();
+            limits.free_bytes = mib << 20;
+            if let Some(cell) = probe(kernel, &limits, 256).into_iter().find(|cell| {
+                cell.expected_slowdown.is_some() && cell.slowdown_projected == projected
+            }) {
+                return (limits, cell);
+            }
+        }
+        panic!("no {kernel:?} cell with projected={projected}");
+    }
+
+    fn timed_max(connectivity: Connectivity) -> usize {
+        match connectivity {
+            Connectivity::Complete => 4_000,
+            Connectivity::Degree(_) => 200_000,
+        }
+    }
+
+    fn json_cell(output: &str, cell: &ProbeCell) -> serde_json::Value {
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        parsed["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| {
+                entry["nodes"] == cell.nodes
+                    && entry["precision"] == format!("{:?}", cell.precision)
+                    && entry["couplers"] == cell.couplers
+            })
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn probe_output_shows_measured_slowdown_unlabelled() {
+        for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
+            let (limits, cell) = calibrated_cell(kernel, false);
+            assert!(cell.nodes <= timed_max(cell.connectivity), "{cell:?}");
+            let value = cell.expected_slowdown.unwrap();
+            let text = render_probe("A4000", kernel, &limits, false);
+            let shown = format!("slowdown {value:.2}x");
+            let at = text.find(&shown).unwrap();
+            assert!(
+                !text[at + shown.len()..].starts_with(" (projected)"),
+                "{text}"
+            );
+            let entry = json_cell(&render_probe("A4000", kernel, &limits, true), &cell);
+            assert_eq!(entry["projected"], false);
+            assert!((entry["expected_slowdown"].as_f64().unwrap() - value).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn probe_output_labels_projected_slowdown() {
+        for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
+            let (limits, cell) = calibrated_cell(kernel, true);
+            assert!(cell.nodes > timed_max(cell.connectivity), "{cell:?}");
+            let value = cell.expected_slowdown.unwrap();
+            let text = render_probe("A4000", kernel, &limits, false);
+            assert!(
+                text.contains(&format!("slowdown {value:.2}x (projected)")),
+                "{text}"
+            );
+            assert!(text.contains("(projected) extend"), "{text}");
+            let entry = json_cell(&render_probe("A4000", kernel, &limits, true), &cell);
+            assert_eq!(entry["projected"], true);
+            assert!((entry["expected_slowdown"].as_f64().unwrap() - value).abs() < 1e-12);
+        }
     }
 
     #[test]
