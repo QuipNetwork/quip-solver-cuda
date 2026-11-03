@@ -681,9 +681,7 @@ fn session_topology(
     )?;
     if storage == capacity::Storage::Sparse {
         let topology = SelfFeedingTopology::build(graph);
-        if kernel == KernelKind::Gibbs && arithmetic.coefficients.path == CoefficientPath::Float32 {
-            check_gibbs_real_fields(&topology, graph)?;
-        }
+        check_real_session_fields(kernel, arithmetic.coefficients.path, &topology, graph)?;
         return Ok(topology);
     }
     let nnz = n
@@ -730,9 +728,7 @@ fn session_topology(
             }
         },
     };
-    if kernel == KernelKind::Gibbs && arithmetic.coefficients.path == CoefficientPath::Float32 {
-        check_gibbs_real_fields(&topology, graph)?;
-    }
+    check_real_session_fields(kernel, arithmetic.coefficients.path, &topology, graph)?;
     Ok(topology)
 }
 
@@ -2481,7 +2477,24 @@ pub(crate) fn float_plan(graph: &IsingGraph) -> Result<CoefficientPlan, SampleEr
     })
 }
 
-fn check_gibbs_real_fields(
+/// Refuse a real-coefficient SA or Gibbs model whose rounded f32 local field
+/// doubles past the finite range, before device allocation. Both kernels add
+/// `h` and then the row's couplings in this topology's order; SA doubles the
+/// field into its cached delta, so a non-finite delta would never recover.
+fn check_real_session_fields(
+    kernel: KernelKind,
+    path: CoefficientPath,
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+) -> Result<(), SampleError> {
+    if kernel != KernelKind::Msa && path == CoefficientPath::Float32 {
+        check_real_fields(topology, graph)
+    } else {
+        Ok(())
+    }
+}
+
+fn check_real_fields(
     topology: &SelfFeedingTopology,
     graph: &IsingGraph,
 ) -> Result<(), SampleError> {
@@ -2497,8 +2510,7 @@ fn check_gibbs_real_fields(
                 + f64::from(field.abs());
             if bound / (1.0 - error) > f64::from(f32::MAX) / 2.0 {
                 return Err(SampleError::Unsupported(
-                    "real Gibbs local field exceeds the finite f32 delta range after rounding"
-                        .into(),
+                    "real local field exceeds the finite f32 delta range after rounding".into(),
                 ));
             }
         }
@@ -2514,7 +2526,7 @@ fn check_gibbs_real_fields(
             .fold(field.abs(), |sum, value| sum + value.abs());
         if bound > f32::MAX / 2.0 {
             return Err(SampleError::Unsupported(
-                "real Gibbs local field exceeds the finite f32 delta range after rounding".into(),
+                "real local field exceeds the finite f32 delta range after rounding".into(),
             ));
         }
     }
@@ -3788,7 +3800,7 @@ mod tests {
     }
 
     #[test]
-    fn gibbs_real_fields_include_f32_accumulation_rounding() {
+    fn real_fields_include_f32_accumulation_rounding() {
         let half_max = f32::MAX / 2.0;
         let h = f32::from_bits(half_max.to_bits() - 2);
         let coupling = (half_max - h) * 0.3;
@@ -3801,9 +3813,51 @@ mod tests {
         assert!(float_plan(&graph).is_ok());
         let field = ((h + coupling) + coupling) + coupling;
         assert!((2.0 * field).is_infinite());
-        assert!(check_gibbs_real_fields(&SelfFeedingTopology::build(&graph), &graph).is_err());
         let bond = IsingGraph::new(vec![0.0; 2], vec![1e38], vec![(0, 1)]);
-        assert!(check_gibbs_real_fields(&SelfFeedingTopology::build(&bond), &bond).is_ok());
+        // SA local and global states read the CSR rows; dense reads full rows.
+        for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
+            for topology in [SelfFeedingTopology::build, dense_topology] {
+                assert!(
+                    check_real_session_fields(
+                        kernel,
+                        CoefficientPath::Float32,
+                        &topology(&graph),
+                        &graph
+                    )
+                    .is_err(),
+                    "{kernel:?}"
+                );
+                assert!(check_real_session_fields(
+                    kernel,
+                    CoefficientPath::Float32,
+                    &topology(&bond),
+                    &bond
+                )
+                .is_ok());
+            }
+        }
+    }
+
+    /// The dense session layout: no CSR, both matrix positions per coupler.
+    fn dense_topology(graph: &IsingGraph) -> SelfFeedingTopology {
+        let n = graph.num_nodes();
+        SelfFeedingTopology {
+            n,
+            nnz: n * n,
+            row_ptr: vec![],
+            col_ind: vec![],
+            edge_pos: graph
+                .edges
+                .iter()
+                .map(|&(u, v)| {
+                    (
+                        u32::try_from(u * n + v).unwrap(),
+                        u32::try_from(v * n + u).unwrap(),
+                    )
+                })
+                .collect(),
+            colors: crate::topology::ColorBlocks::serial(n),
+        }
     }
 
     #[test]
@@ -3908,6 +3962,46 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn sa_float32_refuses_rounded_field_overflow_on_every_route() {
+        let mut device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 5000).unwrap();
+        // A field whose f32 rounding doubles past half-max is refused on every
+        // SA route before allocation (see real_fields_include_f32_accumulation_rounding).
+        let half_max = f32::MAX / 2.0;
+        let h = f32::from_bits(half_max.to_bits() - 2);
+        let coupling = f64::from((half_max - h) * 0.3);
+        let star = IsingGraph::new(
+            vec![f64::from(h), 0.0, 0.0, 0.0],
+            vec![coupling; 3],
+            vec![(0, 1), (0, 2), (0, 3)],
+        );
+        for (global, storage) in [
+            (false, capacity::Storage::Sparse),
+            (true, capacity::Storage::Sparse),
+            (true, capacity::Storage::Dense),
+        ] {
+            device.sa_force_global = global;
+            let arithmetic = SessionArithmetic {
+                coefficients: real_plan(&device, &star).unwrap(),
+                msa_lane: DEFAULT_MSA_LANE,
+            };
+            let refused = session_topology(
+                &device,
+                KernelKind::Sa,
+                &star,
+                Some(storage),
+                256,
+                1,
+                arithmetic,
+            );
+            assert!(
+                matches!(refused, Err(SampleError::Unsupported(_))),
+                "global={global} {storage:?}"
+            );
         }
     }
 
