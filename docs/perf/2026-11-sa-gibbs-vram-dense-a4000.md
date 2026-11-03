@@ -383,6 +383,7 @@ Each grid cell larger than the timed range ended with a result. The slowdown col
 
 Projections exist only for full-concurrency cells at the probe limit.
 
+
 The next runs use the current build, which has no launch time limit by default.
 Each run has a one-hour cap that the driver script sets with `timeout 3600` inside the container.
 Exit code 124 means the run reached the cap with no error.
@@ -398,6 +399,32 @@ The run that ends in `-s256` uses 256 sweeps at one sweep per beta rung, with on
 | `sa-complete-binary-m48-n9370-s8-32` | 2026-11-02T23:13:19Z | 2026-11-03T00:21:53Z | 124 | ran 1 h, no error |
 | `sa-complete-int8-m1-n9370-s8-32` | 2026-11-03T02:21:59Z | 2026-11-03T03:21:59Z | 124 | ran 1 h, no error |
 | `sa-complete-int8-m48-n9370-s8-32` | 2026-11-03T01:21:58Z | 2026-11-03T02:21:59Z | 124 | ran 1 h, no error |
+
+## Projection check against smoke runs
+
+Each smoke run at a full-concurrency probe limit also gives a slowdown from its few sweeps, so its timing is noisier than a timed cell.
+The table compares that value with the projection. The calibration uses only the projection.
+
+| Cell | Sweeps | Smoke-run slowdown | Projected slowdown | Projection error |
+|---|---|---:|---:|---:|
+| `sa-degree-20-binary-m48-n410747` | 8/32 | 0.4548× | 0.4464× | -1.9% |
+| `gibbs-degree-20-binary-m12-n6491600` | 2/8 | 4.1576× | 3.4278× | -17.6% |
+| `gibbs-degree-20-int8-m12-n6491600` | 2/8 | 4.9561× | 3.6443× | -26.5% |
+| `gibbs-degree-20-int32-m12-n3077188` | 2/8 | 4.8424× | 3.6973× | -23.6% |
+| `gibbs-degree-20-float-m12-n3077188` | 2/8 | 4.8829× | 3.8183× | -21.8% |
+| `sa-degree-60-binary-m48-n347112` | 8/32 | 1.0023× | 0.9939× | -0.8% |
+| `gibbs-degree-60-binary-m12-n3641281` | 1/4 | 17.2960× | 12.3145× | -28.8% |
+| `gibbs-degree-60-int8-m12-n3641281` | 1/4 | 17.9549× | 13.0756× | -27.2% |
+| `gibbs-degree-60-int32-m12-n1296797` | 2/8 | 18.1866× | 15.8278× | -13.0% |
+| `gibbs-degree-60-float-m12-n1296797` | 2/8 | 16.1180× | 13.9336× | -13.6% |
+| `sa-complete-binary-m48-n9370` | 1/4 | 677.6269× | 676.0332× | -0.2% |
+| `gibbs-complete-binary-m12-n19177` | 1/4 | 1398.0027× | 1598.2570× | +14.3% |
+| `sa-complete-int8-m48-n9370` | 2/8 | 568.5705× | 358.2948× | -37.0% |
+| `gibbs-complete-int8-m12-n19177` | 1/4 | 1398.2126× | 1600.3476× | +14.5% |
+| `sa-complete-int32-m48-n4741` | 8/32 | 172.1529× | 170.0646× | -1.2% |
+| `gibbs-complete-int32-m12-n9592` | 2/8 | 764.4557× | 821.1391× | +7.4% |
+| `sa-complete-float-m48-n4741` | 8/32 | 124.5328× | 123.6501× | -0.7% |
+| `gibbs-complete-float-m12-n9592` | 2/8 | 798.4681× | 864.9393× | +8.3% |
 
 ## Grid wall time
 
@@ -561,6 +588,8 @@ Rows that exceed the bound repeat once. Each try appears below.
 The lookup uses timed synthetic cells at full concurrency and 256 reads for SA and Gibbs, plus the projected probe-limit values.
 The lookup interpolates linearly in log N. Each kernel, connectivity, and precision has its own series.
 Measured nodes keep their recorded value. Other read counts and nodes outside the measured range return unknown.
+A value at a projected entry, or between the last timed entry and a projected entry, counts as projected.
+The text probe prints `(projected)` after such a value. The JSON probe sets `projected` to true for that cell.
 MSA keeps its existing 128-read measurements and lookup behavior.
 The output names RTX A4000 as the reference card, including on other GPUs.
 
@@ -582,7 +611,7 @@ A second grid pass ran each cell again with a smaller sweep pair. The Smoke runs
 
 ## Failed cells
 
-The grid attempted 260 cells. It produced 248 timed cells and 12 failed cells.
+The grid attempted 260 cells. 248 ended with a result: 208 timed cells and 40 smoke runs. 12 cells failed.
 
 ### `sa-degree-20-int8-m48-n200000`
 
