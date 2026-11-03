@@ -12,9 +12,8 @@ The tables show both how much fits and how long it runs.
 - Reads: 256 per nonce. Concurrency: full instance count and one nonce.
 - Each sweep point uses one warm-up and four measured repeats.
 - Sweep pairs: 64/256, or 8/32 when earlier cells predict more than 900 seconds for 64/256.
-- The grid binaries stopped any benchmark launch after 10 minutes. This change removes that limit, see Retried cells.
-  To let the grid finish, a cell uses 2/8 when earlier cells predict more than 300 seconds for the longer 8/32 launch. When 2/8 also exceeds 300 seconds, the cell uses 1/4.
-- The 64/256 and 8/32 pairs use four sweeps per beta rung. The 2/8 and 1/4 pairs use one sweep per beta rung, so each launch runs the requested sweep count.
+- The 64/256 and 8/32 pairs use four sweeps per beta rung.
+- Some cells larger than the timed range ran with 2/8 or 1/4 sweeps at one sweep per beta rung. Those runs are smoke runs, and the report does not use their timing.
 - Each GPU run ends before the next starts. Each run records compute processes on physical GPU 1.
 
 Raw records, commands, generation logs, and scripts are in
@@ -336,60 +335,69 @@ Each kernel uses its full instance count at 256 reads.
 
 ## Smoke runs
 
-The grid ran every cell larger than the timed range with a reduced sweep pair, and every one ended with a result.
-The reduced-sweep slowdown below checks the projection, and the calibration does not use it.
+A smoke run passes when it ends with a result, or when it runs for one hour with no error.
+Each grid cell larger than the timed range ended with a result. The slowdown column shows the projection, not a measurement.
 
-| Cell | Sweeps | Wall seconds | Result | Reduced-sweep slowdown | Projected slowdown |
-|---|---|---:|---|---:|---:|
-| `sa-degree-20-binary-m48-n410747` | 8/32 | 357.7 | completed with a result | 0.4548× | 0.4464× |
-| `gibbs-degree-20-binary-m12-n6491600` | 2/8 | 3207.8 | completed with a result | 4.1576× | 3.4278× |
-| `sa-degree-20-binary-m1-n410747` | 8/32 | 322.3 | completed with a result | 0.9180× | none |
-| `gibbs-degree-20-binary-m1-n6491600` | 2/8 | 2761.0 | completed with a result | 3.8655× | none |
-| `gibbs-degree-20-int8-m12-n6491600` | 2/8 | 3538.0 | completed with a result | 4.9561× | 3.6443× |
-| `gibbs-degree-20-int8-m1-n6491600` | 2/8 | 2791.3 | completed with a result | 3.8501× | none |
-| `gibbs-degree-20-int32-m12-n3077188` | 2/8 | 1632.8 | completed with a result | 4.8424× | 3.6973× |
-| `gibbs-degree-20-int32-m1-n3077188` | 2/8 | 1334.4 | completed with a result | 3.9741× | none |
-| `gibbs-degree-20-float-m12-n3077188` | 2/8 | 1256.9 | completed with a result | 4.8829× | 3.8183× |
-| `gibbs-degree-20-float-m1-n3077188` | 2/8 | 972.5 | completed with a result | 4.0237× | none |
-| `sa-degree-60-binary-m48-n347112` | 8/32 | 676.7 | completed with a result | 1.0023× | 0.9939× |
-| `gibbs-degree-60-binary-m12-n3641281` | 1/4 | 3653.0 | completed with a result | 17.2960× | 12.3145× |
-| `sa-degree-60-binary-m1-n347112` | 8/32 | 641.4 | completed with a result | 2.1079× | none |
-| `gibbs-degree-60-binary-m1-n3641281` | 1/4 | 2920.4 | completed with a result | 12.2728× | none |
-| `gibbs-degree-60-int8-m12-n3641281` | 1/4 | 3814.4 | completed with a result | 17.9549× | 13.0756× |
-| `gibbs-degree-60-int8-m1-n3641281` | 1/4 | 3011.8 | completed with a result | 12.2999× | none |
-| `gibbs-degree-60-int32-m12-n1296797` | 2/8 | 2563.4 | completed with a result | 18.1866× | 15.8278× |
-| `gibbs-degree-60-int32-m1-n1296797` | 2/8 | 1466.8 | completed with a result | 12.0125× | none |
-| `gibbs-degree-60-float-m12-n1296797` | 2/8 | 1547.0 | completed with a result | 16.1180× | 13.9336× |
-| `gibbs-degree-60-float-m1-n1296797` | 2/8 | 967.3 | completed with a result | 12.2505× | none |
-| `sa-complete-binary-m48-n9370` | 1/4 | 1499.2 | completed with a result | 677.6269× | 676.0332× |
-| `gibbs-complete-binary-m12-n19177` | 1/4 | 3385.9 | completed with a result | 1398.0027× | 1598.2570× |
-| `sa-complete-binary-m1-n9370` | 2/8 | 1852.3 | completed with a result | 979.3371× | none |
-| `gibbs-complete-binary-m1-n19177` | 1/4 | 3263.6 | completed with a result | 1720.2618× | none |
-| `sa-complete-int8-m48-n9370` | 2/8 | 2950.9 | completed with a result | 568.5705× | 358.2948× |
-| `gibbs-complete-int8-m12-n19177` | 1/4 | 3495.0 | completed with a result | 1398.2126× | 1600.3476× |
-| `sa-complete-int8-m1-n9370` | 2/8 | 2023.6 | completed with a result | 843.1046× | none |
-| `gibbs-complete-int8-m1-n19177` | 1/4 | 3296.7 | completed with a result | 1721.2401× | none |
-| `sa-complete-int32-m48-n4741` | 8/32 | 1816.2 | completed with a result | 172.1529× | 170.0646× |
-| `gibbs-complete-int32-m12-n9592` | 2/8 | 1124.9 | completed with a result | 764.4557× | 821.1391× |
-| `sa-complete-int32-m1-n4741` | 8/32 | 1216.2 | completed with a result | 249.5503× | none |
-| `gibbs-complete-int32-m1-n9592` | 2/8 | 1167.2 | completed with a result | 928.1578× | none |
-| `sa-complete-float-m48-n4741` | 8/32 | 1505.6 | completed with a result | 124.5328× | 123.6501× |
-| `gibbs-complete-float-m12-n9592` | 2/8 | 607.1 | completed with a result | 798.4681× | 864.9393× |
-| `sa-complete-float-m1-n4741` | 8/32 | 996.5 | completed with a result | 182.0088× | none |
-| `gibbs-complete-float-m1-n9592` | 2/8 | 560.1 | completed with a result | 1000.8481× | none |
-| `sa-family-b-float-m48-n4741` | 8/32 | 1042.0 | completed with a result | 75.1660× | none |
-| `gibbs-family-b-float-m12-n9592` | 2/8 | 610.2 | completed with a result | 800.2850× | none |
-| `sa-family-b-float-m1-n4741` | 8/32 | 679.9 | completed with a result | 110.5631× | none |
-| `gibbs-family-b-float-m1-n9592` | 2/8 | 560.9 | completed with a result | 997.5916× | none |
+| Cell | Sweeps | Wall seconds | Result | Projected slowdown |
+|---|---|---:|---|---:|
+| `sa-degree-20-binary-m48-n410747` | 8/32 | 357.7 | completed with a result | 0.4464× |
+| `gibbs-degree-20-binary-m12-n6491600` | 2/8 | 3207.8 | completed with a result | 3.4278× |
+| `sa-degree-20-binary-m1-n410747` | 8/32 | 322.3 | completed with a result | not projected |
+| `gibbs-degree-20-binary-m1-n6491600` | 2/8 | 2761.0 | completed with a result | not projected |
+| `gibbs-degree-20-int8-m12-n6491600` | 2/8 | 3538.0 | completed with a result | 3.6443× |
+| `gibbs-degree-20-int8-m1-n6491600` | 2/8 | 2791.3 | completed with a result | not projected |
+| `gibbs-degree-20-int32-m12-n3077188` | 2/8 | 1632.8 | completed with a result | 3.6973× |
+| `gibbs-degree-20-int32-m1-n3077188` | 2/8 | 1334.4 | completed with a result | not projected |
+| `gibbs-degree-20-float-m12-n3077188` | 2/8 | 1256.9 | completed with a result | 3.8183× |
+| `gibbs-degree-20-float-m1-n3077188` | 2/8 | 972.5 | completed with a result | not projected |
+| `sa-degree-60-binary-m48-n347112` | 8/32 | 676.7 | completed with a result | 0.9939× |
+| `gibbs-degree-60-binary-m12-n3641281` | 1/4 | 3653.0 | completed with a result | 12.3145× |
+| `sa-degree-60-binary-m1-n347112` | 8/32 | 641.4 | completed with a result | not projected |
+| `gibbs-degree-60-binary-m1-n3641281` | 1/4 | 2920.4 | completed with a result | not projected |
+| `gibbs-degree-60-int8-m12-n3641281` | 1/4 | 3814.4 | completed with a result | 13.0756× |
+| `gibbs-degree-60-int8-m1-n3641281` | 1/4 | 3011.8 | completed with a result | not projected |
+| `gibbs-degree-60-int32-m12-n1296797` | 2/8 | 2563.4 | completed with a result | 15.8278× |
+| `gibbs-degree-60-int32-m1-n1296797` | 2/8 | 1466.8 | completed with a result | not projected |
+| `gibbs-degree-60-float-m12-n1296797` | 2/8 | 1547.0 | completed with a result | 13.9336× |
+| `gibbs-degree-60-float-m1-n1296797` | 2/8 | 967.3 | completed with a result | not projected |
+| `sa-complete-binary-m48-n9370` | 1/4 | 1499.2 | completed with a result | 676.0332× |
+| `gibbs-complete-binary-m12-n19177` | 1/4 | 3385.9 | completed with a result | 1598.2570× |
+| `sa-complete-binary-m1-n9370` | 2/8 | 1852.3 | completed with a result | not projected |
+| `gibbs-complete-binary-m1-n19177` | 1/4 | 3263.6 | completed with a result | not projected |
+| `sa-complete-int8-m48-n9370` | 2/8 | 2950.9 | completed with a result | 358.2948× |
+| `gibbs-complete-int8-m12-n19177` | 1/4 | 3495.0 | completed with a result | 1600.3476× |
+| `sa-complete-int8-m1-n9370` | 2/8 | 2023.6 | completed with a result | not projected |
+| `gibbs-complete-int8-m1-n19177` | 1/4 | 3296.7 | completed with a result | not projected |
+| `sa-complete-int32-m48-n4741` | 8/32 | 1816.2 | completed with a result | 170.0646× |
+| `gibbs-complete-int32-m12-n9592` | 2/8 | 1124.9 | completed with a result | 821.1391× |
+| `sa-complete-int32-m1-n4741` | 8/32 | 1216.2 | completed with a result | not projected |
+| `gibbs-complete-int32-m1-n9592` | 2/8 | 1167.2 | completed with a result | not projected |
+| `sa-complete-float-m48-n4741` | 8/32 | 1505.6 | completed with a result | 123.6501× |
+| `gibbs-complete-float-m12-n9592` | 2/8 | 607.1 | completed with a result | 864.9393× |
+| `sa-complete-float-m1-n4741` | 8/32 | 996.5 | completed with a result | not projected |
+| `gibbs-complete-float-m1-n9592` | 2/8 | 560.1 | completed with a result | not projected |
+| `sa-family-b-float-m48-n4741` | 8/32 | 1042.0 | completed with a result | not projected |
+| `gibbs-family-b-float-m12-n9592` | 2/8 | 610.2 | completed with a result | not projected |
+| `sa-family-b-float-m1-n4741` | 8/32 | 679.9 | completed with a result | not projected |
+| `gibbs-family-b-float-m1-n9592` | 2/8 | 560.9 | completed with a result | not projected |
 
-The rows with a projected value are the probe-limit cells at full concurrency, so they also show how close each projection is.
+Projections exist only for full-concurrency cells at the probe limit.
 
-These at-limit runs use the build without the 10-minute launch limit and a driver-side one-hour cap.
-Each run asks for 256 reads and 256 sweeps at one sweep per beta rung, with one repeat and no warm-up.
+The next runs use the current build, which has no launch time limit by default.
+Each run has a one-hour cap that the driver script sets with `timeout 3600` inside the container.
+Exit code 124 means the run reached the cap with no error.
+The longest launch that completed in these runs took 864 seconds, past the old 600-second limit.
+Runs that end in `-s8-32` use the grid sweep pair 8/32 with one warm-up and four repeats.
+The run that ends in `-s256` uses 256 sweeps at one sweep per beta rung, with one repeat and no warm-up.
 
 | Cell | Start | End | Exit code | Result |
 |---|---|---|---:|---|
-| `gibbs-degree-20-binary-m12-n6491600` | 2026-10-30T17:02:23Z | 2026-10-30T18:02:24Z | 124 | ran 1 h, no error |
+| `gibbs-degree-20-binary-m12-n6491600-s256` | 2026-10-30T17:02:23Z | 2026-10-30T18:02:24Z | 124 | ran 1 h, no error |
+| `gibbs-degree-20-binary-m12-n6491600-s8-32` | 2026-11-03T03:21:59Z | 2026-11-03T04:22:01Z | 124 | ran 1 h, no error |
+| `sa-complete-binary-m1-n9370-s8-32` | 2026-11-03T00:21:53Z | 2026-11-03T01:21:58Z | 124 | ran 1 h, no error |
+| `sa-complete-binary-m48-n9370-s8-32` | 2026-11-02T23:13:19Z | 2026-11-03T00:21:53Z | 124 | ran 1 h, no error |
+| `sa-complete-int8-m1-n9370-s8-32` | 2026-11-03T02:21:59Z | 2026-11-03T03:21:59Z | 124 | ran 1 h, no error |
+| `sa-complete-int8-m48-n9370-s8-32` | 2026-11-03T01:21:58Z | 2026-11-03T02:21:59Z | 124 | ran 1 h, no error |
 
 ## Grid wall time
 
@@ -559,10 +567,11 @@ The output names RTX A4000 as the reference card, including on other GPUs.
 ## Retried cells
 
 The first grid pass ran these cells at 8/32. Each run failed with `self-feeding kernel timed out`.
-The cause was a fixed 10-minute deadline on each benchmark launch. Neither the model size nor the probe caused the failure.
-This change removes that deadline and the 2-minute deadline on single-job sampling. Only a driver sets a time cap now.
-Their logs are in `grid/<cell>.timeout-8-32/`, and their records are in `manifest-timeouts-8-32.json`.
-The second pass, still with the old binaries, ran each cell again with the smaller pair that the test setup rule selects.
+A bug in the benchmark caused these failures. It stopped each launch after a fixed 10 minutes, even when the model fit the probe limit.
+Now the benchmark and single-job sampling wait for the kernel unless a driver passes `bench run --launch-timeout-secs`.
+The logs for these failures are in `grid/<cell>.timeout-8-32/`. The matching records are in `manifest-timeouts-8-32.json`.
+
+A second grid pass ran each cell again with a smaller sweep pair. The Smoke runs section repeats each cell at 8/32 with the current build.
 
 - `sa-complete-binary-m48-n9370`
 - `sa-complete-binary-m1-n9370`
