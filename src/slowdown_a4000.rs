@@ -2,8 +2,8 @@
 //! MSA: 128 reads, 48 nonces. SA: 256 reads, 48 nonces. Gibbs: 256 reads, 12 nonces.
 //! Generated from bench-evidence/{msa,sa-gibbs}-vram-dense/summary.json.
 //! SA and Gibbs entries are measured unless marked `projected`: a projected entry
-//! sits at the probed limit, past the timed range (sparse 200,000 nodes, complete
-//! 4,000), and extends the last measured value of its series.
+//! sits at the probed limit, past the timed range (SA sparse 200,000 nodes, Gibbs
+//! sparse 1,000,000, complete 4,000), and extends the last measured value of its series.
 
 use crate::capacity::{Connectivity, Precision};
 use crate::kernel::KernelKind;
@@ -170,56 +170,72 @@ fn samples(
             (16_000, 3.225_358_771_603),
             (64_000, 1.650_675_235_691),
             (200_000, 3.427_842_498_717),
-            (6_491_600, 3.427_842_498_717), // projected: flat from 200,000
+            (400_000, 4.347_284_393_523),
+            (1_000_000, 4.115_307_586_229),
+            (6_491_600, 4.115_307_586_229), // projected: flat from 1,000,000
         ],
         (KernelKind::Gibbs, Connectivity::Degree(20), Precision::Int8) => &[
             (4_800, 0.887_037_693_98),
             (16_000, 3.518_101_595_55),
             (64_000, 1.801_736_721_472),
             (200_000, 3.644_328_481_015),
-            (6_491_600, 3.644_328_481_015), // projected: flat from 200,000
+            (400_000, 4.388_039_457_633),
+            (1_000_000, 4.079_222_238_783),
+            (6_491_600, 4.079_222_238_783), // projected: flat from 1,000,000
         ],
         (KernelKind::Gibbs, Connectivity::Degree(20), Precision::Int32) => &[
             (4_800, 1.198_967_360_632),
             (16_000, 3.513_516_398_518),
             (64_000, 1.956_100_371_234),
             (200_000, 3.697_299_912_8),
-            (3_077_188, 3.697_299_912_8), // projected: flat from 200,000
+            (400_000, 4.180_918_957_577),
+            (1_000_000, 4.218_532_847_54),
+            (3_077_188, 4.218_532_847_54), // projected: flat from 1,000,000
         ],
         (KernelKind::Gibbs, Connectivity::Degree(20), Precision::Float32) => &[
             (4_800, 1.259_109_380_92),
             (16_000, 3.593_751_985_627),
             (64_000, 2.030_729_608_495),
             (200_000, 3.818_298_261_758),
-            (3_077_188, 3.818_298_261_758), // projected: flat from 200,000
+            (400_000, 4.253_610_742_121),
+            (1_000_000, 4.585_937_670_116),
+            (3_077_188, 4.585_937_670_116), // projected: flat from 1,000,000
         ],
         (KernelKind::Gibbs, Connectivity::Degree(60), Precision::Binary) => &[
             (4_800, 3.851_358_817_246),
             (16_000, 10.505_325_106_023),
             (64_000, 4.877_235_789_449),
             (200_000, 12.314_479_364_511),
-            (3_641_281, 12.314_479_364_511), // projected: flat from 200,000
+            (400_000, 15.274_523_481_182),
+            (1_000_000, 15.919_828_067_111),
+            (3_641_281, 15.919_828_067_111), // projected: flat from 1,000,000
         ],
         (KernelKind::Gibbs, Connectivity::Degree(60), Precision::Int8) => &[
             (4_800, 3.730_876_129_322),
             (16_000, 10.369_919_952_757),
             (64_000, 4.905_400_864_473),
             (200_000, 13.075_588_118_507),
-            (3_641_281, 13.075_588_118_507), // projected: flat from 200,000
+            (400_000, 15.113_586_446_46),
+            (1_000_000, 16.105_656_543_793),
+            (3_641_281, 16.105_656_543_793), // projected: flat from 1,000,000
         ],
         (KernelKind::Gibbs, Connectivity::Degree(60), Precision::Int32) => &[
             (4_800, 4.361_785_740_343),
             (16_000, 10.896_258_033_447),
             (64_000, 5.443_793_852_032),
             (200_000, 15.827_841_721_966),
-            (1_296_797, 15.827_841_721_966), // projected: flat from 200,000
+            (400_000, 14.931_950_062_188),
+            (1_000_000, 15.733_023_630_944),
+            (1_296_797, 15.733_023_630_944), // projected: flat from 1,000,000
         ],
         (KernelKind::Gibbs, Connectivity::Degree(60), Precision::Float32) => &[
             (4_800, 4.780_424_708_051),
             (16_000, 11.004_751_847_271),
             (64_000, 5.672_291_635_346),
             (200_000, 13.933_557_970_177),
-            (1_296_797, 13.933_557_970_177), // projected: flat from 200,000
+            (400_000, 15.815_077_549_481),
+            (1_000_000, 15.926_213_297_45),
+            (1_296_797, 15.926_213_297_45), // projected: flat from 1,000,000
         ],
         (KernelKind::Gibbs, Connectivity::Complete, Precision::Binary) => &[
             (64, 35.309_425_944_148),
@@ -341,49 +357,49 @@ const LAST_TIMED_BEFORE_PROJECTION: &[(KernelKind, Connectivity, Precision, usiz
         KernelKind::Gibbs,
         Connectivity::Degree(20),
         Precision::Binary,
-        200_000,
+        1_000_000,
     ),
     (
         KernelKind::Gibbs,
         Connectivity::Degree(20),
         Precision::Int8,
-        200_000,
+        1_000_000,
     ),
     (
         KernelKind::Gibbs,
         Connectivity::Degree(20),
         Precision::Int32,
-        200_000,
+        1_000_000,
     ),
     (
         KernelKind::Gibbs,
         Connectivity::Degree(20),
         Precision::Float32,
-        200_000,
+        1_000_000,
     ),
     (
         KernelKind::Gibbs,
         Connectivity::Degree(60),
         Precision::Binary,
-        200_000,
+        1_000_000,
     ),
     (
         KernelKind::Gibbs,
         Connectivity::Degree(60),
         Precision::Int8,
-        200_000,
+        1_000_000,
     ),
     (
         KernelKind::Gibbs,
         Connectivity::Degree(60),
         Precision::Int32,
-        200_000,
+        1_000_000,
     ),
     (
         KernelKind::Gibbs,
         Connectivity::Degree(60),
         Precision::Float32,
-        200_000,
+        1_000_000,
     ),
     (
         KernelKind::Gibbs,

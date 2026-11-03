@@ -446,10 +446,12 @@ mod tests {
         panic!("no {kernel:?} cell with projected={projected}");
     }
 
-    fn timed_max(connectivity: Connectivity) -> usize {
-        match connectivity {
-            Connectivity::Complete => 4_000,
-            Connectivity::Degree(_) => 200_000,
+    /// Last timed node count: Gibbs sparse runs to full spill at 1,000,000.
+    fn timed_max(kernel: KernelKind, connectivity: Connectivity) -> usize {
+        match (kernel, connectivity) {
+            (_, Connectivity::Complete) => 4_000,
+            (KernelKind::Gibbs, Connectivity::Degree(_)) => 1_000_000,
+            (_, Connectivity::Degree(_)) => 200_000,
         }
     }
 
@@ -472,7 +474,10 @@ mod tests {
     fn probe_output_shows_measured_slowdown_unlabelled() {
         for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
             let (limits, cell) = calibrated_cell(kernel, false);
-            assert!(cell.nodes <= timed_max(cell.connectivity), "{cell:?}");
+            assert!(
+                cell.nodes <= timed_max(kernel, cell.connectivity),
+                "{cell:?}"
+            );
             let value = cell.expected_slowdown.unwrap();
             let text = render_probe("A4000", kernel, &limits, false);
             let shown = format!("slowdown {value:.2}x");
@@ -491,7 +496,10 @@ mod tests {
     fn probe_output_labels_projected_slowdown() {
         for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
             let (limits, cell) = calibrated_cell(kernel, true);
-            assert!(cell.nodes > timed_max(cell.connectivity), "{cell:?}");
+            assert!(
+                cell.nodes > timed_max(kernel, cell.connectivity),
+                "{cell:?}"
+            );
             let value = cell.expected_slowdown.unwrap();
             let text = render_probe("A4000", kernel, &limits, false);
             assert!(
