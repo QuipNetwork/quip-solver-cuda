@@ -477,12 +477,25 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
     let (job_tx, job_rx) = channel::<StreamJob>(graphs.len());
     let (res_tx, mut res_rx) = channel(16);
     for (id, graph) in graphs.iter().enumerate() {
+        // MSA lanes share one acceptance threshold per node (kernels/msa.cu),
+        // so one uphill draw in the last sweep moves every read of the unit
+        // bond at once: about 0.5% per job at the default cold beta,
+        // ln(200) / 2. A cold beta of 20 puts that flip, an energy rise of 2,
+        // at e^-40.
+        let beta_range = (kind == KernelKind::Msa && graph.j == [1.0] && graph.h == [0.0, 0.0])
+            .then(|| {
+                (
+                    quip_solver_core::beta::default_ising_beta_range(graph).0,
+                    20.0,
+                )
+            });
         job_tx
             .try_send(StreamJob {
                 job_id: vec![u8::try_from(id).unwrap()],
                 graph: graph.clone(),
                 params: SampleParams {
                     num_sweeps: 8192,
+                    beta_range,
                     ..params()
                 },
                 watermark: None,
