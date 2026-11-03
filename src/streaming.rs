@@ -3923,9 +3923,9 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     fn sa_float32_large_coupling_deltas_stay_finite() {
         let mut device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 5000).unwrap();
-        // End bonds sit at SA's admission limit, a quarter of f32::MAX, once the
-        // weak power-of-two link joins them; the link keeps the f32 oracle exact.
-        let edge = f64::from(f32::MAX / 4.0 - 2.0_f32.powi(105));
+        // End bonds just below SA's admission limit, a quarter of f32::MAX, with
+        // the dense gamma margin; a weak power-of-two link keeps the oracle exact.
+        let edge = 8e37;
         let bond = IsingGraph::new(vec![0.0; 2], vec![edge], vec![(0, 1)]);
         let chain = IsingGraph::new(
             vec![0.0; 4],
