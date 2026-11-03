@@ -108,9 +108,10 @@ fn verify_portfolio(kernel: KernelKind, forced: bool) {
         }
         .unwrap_or_else(|error| panic!("{}: {error}", state.file));
         assert_eq!(reads.len(), params.num_reads, "{}", state.file);
-        // Small complete Gibbs models can have a smaller sparse footprint.
-        // Its automatic route depends on the device's instance count.
-        if kernel != KernelKind::Gibbs {
+        // Small complete Gibbs models can have a smaller sparse footprint, so
+        // its automatic route depends on the device's instance count. A forced
+        // run must stay dense on every kernel.
+        if forced || kernel != KernelKind::Gibbs {
             assert_eq!(
                 last_storage(&device),
                 Some(if forced || kernel == KernelKind::Sa {
@@ -172,4 +173,10 @@ fn sa_reaches_portfolio_ground_states() {
 #[ignore = "requires a CUDA GPU"]
 fn gibbs_reaches_portfolio_ground_states() {
     verify_portfolio(KernelKind::Gibbs, false);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_dense_path_forced_reaches_portfolio_ground_states() {
+    verify_portfolio(KernelKind::Gibbs, true);
 }
