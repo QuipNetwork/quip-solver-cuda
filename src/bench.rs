@@ -146,8 +146,9 @@ pub struct RunArgs {
     /// count is used instead). Useful on its own for micro checks.
     #[arg(long, default_value_t = 64)]
     pub nodes: u64,
-    /// Neighbours per node of the synthetic circulant graph (even, at least 2).
+    /// Neighbours per node of the synthetic circulant graph (even, at least 2, below --nodes).
     /// Node i links to i+1 ..= i+degree/2 (mod n). The default 2 is a ring.
+    /// MSA uses dense storage above degree 62. SA and Gibbs route by memory footprint.
     #[arg(long, default_value_t = 2, conflicts_with = "source")]
     pub degree: u64,
     /// Relabel the synthetic graph's nodes by a seeded random permutation. The
@@ -392,11 +393,10 @@ fn circulant_graph(n: u64, degree: u64, shuffle: Option<[u8; 32]>) -> IsingGraph
 
 /// Refuse a synthetic `degree` the circulant cannot build on `nodes` nodes,
 /// before any edge is allocated: it must be even, at least 2, below `nodes`
-/// (else pairs repeat and self-loops appear), and within
-/// [`crate::capacity::MSA_MAX_DEGREE`]. SA and Gibbs declare no degree limit
-/// of their own, so the msa limit is the bench-wide cap.
+/// (else pairs repeat and self-loops appear). Each kernel's normal storage
+/// routing applies: MSA uses dense storage above [`crate::capacity::MSA_MAX_DEGREE`],
+/// while SA and Gibbs choose by memory footprint.
 fn check_degree(degree: u64, nodes: u64) -> Result<(), BenchError> {
-    let max = crate::capacity::MSA_MAX_DEGREE as u64;
     if degree < 2 || !degree.is_multiple_of(2) {
         return Err(BenchError::Args(format!(
             "--degree {degree} must be even and at least 2"
@@ -405,11 +405,6 @@ fn check_degree(degree: u64, nodes: u64) -> Result<(), BenchError> {
     if degree >= nodes {
         return Err(BenchError::Args(format!(
             "--degree {degree} must be below --nodes {nodes}"
-        )));
-    }
-    if degree > max {
-        return Err(BenchError::Args(format!(
-            "--degree {degree} exceeds the kernel limit of {max}"
         )));
     }
     Ok(())
@@ -1077,12 +1072,60 @@ mod tests {
         assert!(check_degree(3, 100).is_err(), "odd");
         assert!(check_degree(0, 100).is_err(), "zero");
         assert!(check_degree(100, 100).is_err(), "degree equals nodes");
-        assert!(check_degree(6, 6).is_err(), "degree above nodes");
-        assert!(check_degree(64, 1000).is_err(), "above the msa limit");
+        assert!(check_degree(8, 6).is_err(), "degree above nodes");
         assert!(check_degree(1_000_000, 200_000).is_err(), "huge");
         assert!(check_degree(40, 1000).is_ok());
         assert!(check_degree(62, 1000).is_ok());
         assert!(check_degree(2, 5).is_ok());
+    }
+
+    #[test]
+    fn synthetic_degrees_above_the_msa_sparse_limit_are_accepted() {
+        for degree in [64, 128, 256, 512, 1_024, 2_048, 4_096] {
+            assert!(check_degree(degree, 5_000).is_ok(), "degree {degree}");
+        }
+    }
+
+    #[test]
+    fn msa_bench_degree_sixty_four_plans_dense_storage() {
+        use crate::capacity::{route_storage, DeviceLimits, ModelShape, Precision, Storage};
+        use clap::Parser;
+
+        let args = RunCli::try_parse_from([
+            "bench", "--nodes", "5000", "--degree", "64", "--out", "/tmp/x",
+        ])
+        .unwrap()
+        .args;
+        let models = super::load_models(&args).unwrap();
+        let graph = &models[0].graph;
+        let topology = crate::topology::SelfFeedingTopology::build(graph);
+        let shape = ModelShape {
+            nodes: graph.num_nodes(),
+            couplers: graph.edges.len(),
+            max_degree: topology.max_degree(),
+        };
+        assert_eq!(shape.nodes, 5_000);
+        assert_eq!(shape.couplers, 160_000);
+        assert_eq!(shape.max_degree, 64);
+        let plan = crate::streaming::bench_plan(graph, KernelKind::Msa, None).unwrap();
+        let limits = DeviceLimits {
+            shared_bytes_per_block: 48 << 10,
+            shared_bytes_per_block_optin: 100 << 10,
+            free_bytes: 15usize << 30,
+            sm_count: 48,
+            threads_per_sm: 1536,
+        };
+        assert_eq!(
+            route_storage(
+                KernelKind::Msa,
+                shape,
+                Precision::from_plan(plan, true),
+                8,
+                64,
+                &limits,
+            ),
+            Storage::Dense,
+        );
     }
 
     #[test]
