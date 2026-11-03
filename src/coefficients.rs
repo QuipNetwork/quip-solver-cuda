@@ -29,6 +29,11 @@ pub const WIDE_MAX_FIELD: i64 = 536_870_911;
 /// Largest local field, in scale units, the weighted MSA lanes hold exactly.
 pub const MSA_WEIGHTED_MAX_FIELD: i64 = (1 << 24) - 1;
 
+/// Largest local field, in scale units, the int8 Gibbs variants sum exactly.
+/// They add coefficients into a `float` field, and every partial sum stays a
+/// whole number below 2^24, where f32 still holds each integer.
+pub const GIBBS_FLOAT_EXACT_FIELD: i64 = (1 << 24) - 1;
+
 /// Relative bound on the rounding error of `milli / 1000 * 1000`, scaled by
 /// the rounded milli magnitude with a floor of one.
 const MILLI_TOLERANCE: f64 = 4.0 * f64::EPSILON;
@@ -146,8 +151,11 @@ pub(crate) fn plan_with_unit(
 ) -> Result<(CoefficientPlan, bool), String> {
     let unit_mining = is_unit_mining(graph);
     // Unit Gibbs coefficients fit int8, and unit MSA uses its original kernel.
-    // SA still needs its local-field bound, even with unit coefficients.
-    if kind != KernelKind::Sa && unit_mining {
+    // SA still needs its local-field bound, even with unit coefficients, and
+    // so does Gibbs once a unit field, at most 1 + edges, can leave float range.
+    let unit_field_exact =
+        i64::try_from(graph.edges.len()).is_ok_and(|edges| edges < GIBBS_FLOAT_EXACT_FIELD);
+    if unit_mining && (kind == KernelKind::Msa || (kind == KernelKind::Gibbs && unit_field_exact)) {
         return Ok((
             CoefficientPlan {
                 path: CoefficientPath::Int8,
@@ -192,7 +200,10 @@ pub(crate) fn plan_with_unit(
                 })
             }
         }
-        KernelKind::Gibbs if max_coef <= INT8_MAX_COEF => Ok(int8),
+        // Int8 Gibbs sums its field in float; past 2^24 it takes the integer wide path.
+        KernelKind::Gibbs if max_coef <= INT8_MAX_COEF && field <= GIBBS_FLOAT_EXACT_FIELD => {
+            Ok(int8)
+        }
         KernelKind::Gibbs if field > WIDE_MAX_FIELD => Err(format!(
             "gibbs: local field {field} times the model's {scale_milli} milli step exceeds the wide path's limit of {WIDE_MAX_FIELD}"
         )),
@@ -237,6 +248,64 @@ mod tests {
         );
         let g = graph(vec![fits + 0.001, 0.0], vec![0.001], vec![(0, 1)]);
         assert!(plan(KernelKind::Gibbs, &g).is_err());
+    }
+
+    /// A star whose hub sums one +1 and `leaves - 1` alternating ±126 couplings
+    /// (milli step 1, every coefficient within i8) to leaves with h = -127.
+    fn star(leaves: usize, j_milli: impl Fn(usize) -> i32) -> IsingGraph {
+        let edges = (1..=leaves).map(|leaf| (0, leaf)).collect();
+        let j = (0..leaves)
+            .map(|i| f64::from(j_milli(i)) / 1000.0)
+            .collect();
+        let mut h = vec![-0.127; leaves + 1];
+        h[0] = 0.0;
+        graph(h, j, edges)
+    }
+
+    fn alternating(i: usize) -> i32 {
+        match i {
+            0 => 1,
+            i if i % 2 == 1 => 126,
+            _ => -126,
+        }
+    }
+
+    #[test]
+    fn gibbs_routes_int8_rows_past_float_exactness_to_wide() {
+        // 126 * 133,152 + 1 = 16,777,153 < 2^24: float sums stay exact.
+        let below = plan(KernelKind::Gibbs, &star(133_153, alternating)).unwrap();
+        assert_eq!(below.path, CoefficientPath::Int8);
+        // 126 * 133,153 + 1 = 16,777,279 >= 2^24: the hub needs integer sums.
+        let above = plan(KernelKind::Gibbs, &star(133_154, alternating)).unwrap();
+        assert_eq!(above.path, CoefficientPath::Wide);
+        assert_eq!(above.scale_milli, 1);
+        // The review's case: 280,001 leaves, a row sum of 35,280,001.
+        let review = plan(KernelKind::Gibbs, &star(280_001, alternating)).unwrap();
+        assert_eq!(review.path, CoefficientPath::Wide);
+        // Admission sizes the rerouted model with the Int32 footprint.
+        assert_eq!(
+            crate::capacity::Precision::from_plan(review, false),
+            crate::capacity::Precision::Int32
+        );
+    }
+
+    #[test]
+    fn gibbs_routes_unit_rows_past_float_exactness_to_wide() {
+        let unit = |leaves| {
+            let edges = (1..=leaves).map(|leaf| (0, leaf)).collect();
+            graph(vec![0.0; leaves + 1], vec![1.0; leaves], edges)
+        };
+        // Hub field 2^24 - 1 stays on the mining int8 path; 2^24 does not.
+        let below = plan(KernelKind::Gibbs, &unit((1 << 24) - 1)).unwrap();
+        assert_eq!(below.path, CoefficientPath::Int8);
+        let above = plan(KernelKind::Gibbs, &unit(1 << 24)).unwrap();
+        assert_eq!(
+            above,
+            CoefficientPlan {
+                path: CoefficientPath::Wide,
+                scale_milli: 1000
+            }
+        );
     }
 
     #[test]
