@@ -68,7 +68,17 @@ fn cancel_then_complete(device: &CudaDevice, kernel: KernelKind, reads: usize) {
     thread::scope(|s| {
         let driver_cancel = cancel.clone();
         let gov_ref = &gov;
-        s.spawn(move || run_stream(device, kernel, job_rx, res_tx, driver_cancel, gov_ref));
+        s.spawn(move || {
+            run_stream(
+                device,
+                kernel,
+                job_rx,
+                res_tx,
+                driver_cancel,
+                gov_ref,
+                quip_solver_cuda::streaming::StallConfig::default(),
+            );
+        });
 
         job_tx
             .blocking_send(job(1, reads, LONG_SWEEPS, 1))

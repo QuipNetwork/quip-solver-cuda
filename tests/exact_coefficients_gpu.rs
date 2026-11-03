@@ -398,7 +398,15 @@ fn assert_stream_separates_scales(kind: KernelKind) {
     let driver = std::thread::spawn(move || {
         let device = device(kind);
         let gov = UtilGovernor::start(&device.pci_bus_id, 90, false);
-        run_stream(device, kind, job_rx, res_tx, CancelToken::default(), &gov);
+        run_stream(
+            device,
+            kind,
+            job_rx,
+            res_tx,
+            CancelToken::default(),
+            &gov,
+            quip_solver_cuda::streaming::StallConfig::default(),
+        );
     });
     let mut seen = [false; 2];
     while let Some(result) = res_rx.blocking_recv() {
@@ -505,7 +513,15 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
     drop(job_tx);
     let driver = std::thread::spawn(move || {
         let gov = UtilGovernor::start(&dev.pci_bus_id, 100, false);
-        run_stream(dev, kind, job_rx, res_tx, CancelToken::default(), &gov);
+        run_stream(
+            dev,
+            kind,
+            job_rx,
+            res_tx,
+            CancelToken::default(),
+            &gov,
+            quip_solver_cuda::streaming::StallConfig::default(),
+        );
     });
     let mut seen = vec![false; graphs.len()];
     while let Some(result) = res_rx.blocking_recv() {

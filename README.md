@@ -261,10 +261,21 @@ blocking receive. The next seed starts a new session.
 
 No slot completes. The host waits for a slot to complete. The kernel waits for a slot to become ready.
 If these states diverge, both sides wait. Each side behaves as written. Neither can detect the stall. The driver
-measures the longest gap between completions and sets the cutoff at 4 times that
-gap, with a floor of 10 minutes. Past the cutoff it rejects the jobs it holds,
-which refunds their credits at the coordinator, and starts a new session. It
-logs one line:
+sets the cutoff to the larger of the floor and 4 times the longest gap between completions.
+The default floor is the larger of 600 seconds and the job's total sweep count times 0.0004 seconds.
+The total sweep count is the number of beta entries times the sweeps per beta in the built schedule.
+Jobs in one session share these sweep settings.
+At 8,388,608 sweeps, the default floor is 3,355.4432 seconds, about 56 minutes.
+
+All three binaries accept `--stall-secs-per-sweep <SECONDS>` to change the per-sweep allowance.
+Only positive, finite values are valid.
+
+Use `--stall-floor-secs <SECONDS>` to set a fixed floor of at least 1 whole second.
+This flag replaces the scaled floor and its 600-second lower bound.
+The cutoff can still grow to 4 times the longest observed completion gap.
+The driver rejects held jobs once the cutoff passes. It then starts a new session.
+The coordinator refunds the credits for those jobs.
+The driver logs one line:
 
 ```text
 quip-solver-cuda: no slot completed in 612.4s; rebuilding the self-feeding session

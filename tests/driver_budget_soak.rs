@@ -265,6 +265,7 @@ fn stream_driver_soak() {
                 res_tx,
                 CancelToken::default(),
                 gov_ref,
+                quip_solver_cuda::streaming::StallConfig::default(),
             );
         });
 

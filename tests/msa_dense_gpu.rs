@@ -189,6 +189,7 @@ fn dense_cancel_aborts() {
                 res_tx,
                 driver_cancel,
                 gov_ref,
+                quip_solver_cuda::streaming::StallConfig::default(),
             );
         });
         job_tx
@@ -267,6 +268,7 @@ fn dense_stream_rotates_slots_with_distinct_matrices() {
         res_tx,
         CancelToken::default(),
         &gov,
+        quip_solver_cuda::streaming::StallConfig::default(),
     );
     let mut seen = vec![false; total];
     while let Some(result) = res_rx.blocking_recv() {

@@ -69,9 +69,9 @@ pub struct MsaSampler {
 impl MsaSampler {
     /// Bind an MSA device and governor. Lease turns share this device.
     #[must_use]
-    pub fn new(device: CudaDevice, gov: UtilGovernor) -> Self {
+    pub fn new(device: CudaDevice, gov: UtilGovernor, stall: streaming::StallConfig) -> Self {
         Self {
-            inner: CudaSampler::new(device, gov, KernelKind::Msa),
+            inner: CudaSampler::new(device, gov, KernelKind::Msa, stall),
             turns: lease_turn::LeaseTurns::default(),
             logged_modes: Mutex::default(),
         }
@@ -314,17 +314,24 @@ pub struct CudaSampler {
     device: CudaDevice,
     gov: UtilGovernor,
     kernel: KernelKind,
+    stall: streaming::StallConfig,
     screen: Mutex<screen_policy::Selector>,
 }
 
 impl CudaSampler {
     /// Bind an open device and its NVML governor into a sampler for `kernel`.
     #[must_use]
-    pub fn new(device: CudaDevice, gov: UtilGovernor, kernel: KernelKind) -> Self {
+    pub fn new(
+        device: CudaDevice,
+        gov: UtilGovernor,
+        kernel: KernelKind,
+        stall: streaming::StallConfig,
+    ) -> Self {
         Self {
             device,
             gov,
             kernel,
+            stall,
             screen: Mutex::new(screen_policy::Selector::default()),
         }
     }
@@ -352,7 +359,15 @@ impl Sampler for CudaSampler {
         out: tokio::sync::mpsc::Sender<StreamResult>,
         cancel: CancelToken,
     ) {
-        streaming::run_stream(&self.device, self.kernel, jobs, out, cancel, &self.gov);
+        streaming::run_stream(
+            &self.device,
+            self.kernel,
+            jobs,
+            out,
+            cancel,
+            &self.gov,
+            self.stall,
+        );
     }
 
     fn stream_width(&self) -> usize {

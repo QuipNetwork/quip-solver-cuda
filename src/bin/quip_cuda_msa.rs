@@ -23,6 +23,8 @@ struct Cli {
     command: Option<Command>,
     #[command(flatten)]
     common: CommonArgs,
+    #[command(flatten)]
+    stall: quip_solver_cuda::streaming::StallConfig,
     /// CUDA device index (one process per GPU). Default 0 → miner id `cuda-0`.
     #[arg(long, default_value_t = 0)]
     device: usize,
@@ -138,7 +140,7 @@ fn main() -> ExitCode {
         // process opened. Taking it from the opened device means both
         // APIs name the same physical GPU by construction.
         let gov = UtilGovernor::start(&device.pci_bus_id, cli.utilization, cli.yielding);
-        Ok(MsaSampler::new(device, gov))
+        Ok(MsaSampler::new(device, gov, cli.stall))
     })
 }
 
@@ -146,6 +148,40 @@ fn main() -> ExitCode {
 mod cli_tests {
     use super::{BenchAction, Cli, Command};
     use clap::Parser;
+
+    #[test]
+    fn parses_stall_flags() {
+        let defaults = Cli::parse_from(["quip-cuda-msa"]);
+        assert!((defaults.stall.stall_secs_per_sweep - 0.0004).abs() < f64::EPSILON);
+        assert_eq!(defaults.stall.stall_floor_secs, None);
+        let cli = Cli::parse_from([
+            "quip-cuda-msa",
+            "--stall-secs-per-sweep",
+            "0.001",
+            "--stall-floor-secs",
+            "1800",
+        ]);
+        assert!((cli.stall.stall_secs_per_sweep - 0.001).abs() < f64::EPSILON);
+        assert_eq!(cli.stall.stall_floor_secs, Some(1800));
+        assert_eq!(
+            cli.stall.floor(8_388_608),
+            std::time::Duration::from_mins(30)
+        );
+        for value in ["0", "-0.1", "NaN", "inf", "-inf"] {
+            assert!(
+                Cli::try_parse_from(["quip-cuda-msa", &format!("--stall-secs-per-sweep={value}"),])
+                    .is_err(),
+                "accepted seconds per sweep: {value}"
+            );
+        }
+        for value in ["0", "-1", "1.5"] {
+            assert!(
+                Cli::try_parse_from(["quip-cuda-msa", &format!("--stall-floor-secs={value}"),])
+                    .is_err(),
+                "accepted floor seconds: {value}"
+            );
+        }
+    }
 
     #[test]
     fn parses_probe_capacity_flags() {

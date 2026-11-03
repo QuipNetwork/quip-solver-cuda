@@ -68,9 +68,51 @@ const YIELD_SLICE: Duration = Duration::from_millis(250);
 /// use.
 const IDLE_TEARDOWN: Duration = Duration::from_secs(2);
 
-/// Floor for the no-completion cutoff, and the value used before this session
-/// has completed anything.
-const STALL_FLOOR: Duration = Duration::from_mins(10);
+/// Shared CLI options for the streaming no-completion watchdog.
+#[derive(Clone, Copy, Debug, clap::Args)]
+pub struct StallConfig {
+    /// Seconds allowed per sweep. Floor = max(600 seconds, total sweeps times
+    /// this value), unless --stall-floor-secs is set. Must be positive and finite.
+    #[arg(long, default_value_t = 0.0004, value_name = "SECONDS", value_parser = positive_finite_seconds)]
+    pub stall_secs_per_sweep: f64,
+    /// Fixed floor in seconds (at least 1), replacing max(600 seconds, total
+    /// sweeps times --stall-secs-per-sweep). Cutoff = max(floor, 4 times the
+    /// longest observed completion gap).
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub stall_floor_secs: Option<u64>,
+}
+
+impl Default for StallConfig {
+    fn default() -> Self {
+        Self {
+            stall_secs_per_sweep: 0.0004,
+            stall_floor_secs: None,
+        }
+    }
+}
+
+impl StallConfig {
+    /// Floor for the largest total sweep count held by a session.
+    /// The total is the built schedule length times its sweeps per beta.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // Sweep counts only need wall-clock precision here.
+    pub fn floor(self, total_sweeps: usize) -> Duration {
+        if let Some(seconds) = self.stall_floor_secs {
+            return Duration::from_secs(seconds);
+        }
+        let seconds = (total_sweeps as f64 * self.stall_secs_per_sweep).max(600.0);
+        Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
+    }
+}
+
+fn positive_finite_seconds(value: &str) -> Result<f64, String> {
+    let seconds: f64 = value.parse().map_err(|e| format!("invalid seconds: {e}"))?;
+    if seconds.is_finite() && seconds > 0.0 {
+        Ok(seconds)
+    } else {
+        Err("seconds must be positive and finite".to_owned())
+    }
+}
 
 /// Multiple of the longest observed completion gap that still counts as
 /// healthy. Four leaves generous room for a job that runs long without letting
@@ -85,8 +127,8 @@ const STALL_FACTOR: u32 = 4;
 /// job, and a cutoff short enough to be useful for the former would tear a
 /// healthy session apart mid-flight for the latter. So the cutoff tracks what
 /// this session has actually demonstrated — `STALL_FACTOR` times the longest
-/// wait between completions so far — and never drops below `STALL_FLOOR`,
-/// which is what covers the stretch before anything has completed at all.
+/// wait between completions so far — and never drops below the configured
+/// sweep-scaled or fixed floor, which covers the stretch before any completion.
 ///
 /// # Examples
 ///
@@ -94,15 +136,16 @@ const STALL_FACTOR: u32 = 4;
 /// use quip_solver_cuda::streaming::stall_cutoff;
 /// use std::time::Duration;
 ///
+/// let floor = Duration::from_secs(600);
 /// // Nothing observed yet, or a fast session: the floor governs.
-/// assert_eq!(stall_cutoff(Duration::ZERO), Duration::from_secs(600));
-/// assert_eq!(stall_cutoff(Duration::from_secs(30)), Duration::from_secs(600));
+/// assert_eq!(stall_cutoff(floor, Duration::ZERO), floor);
+/// assert_eq!(stall_cutoff(floor, Duration::from_secs(30)), floor);
 /// // A session whose jobs genuinely take five minutes gets proportionate room.
-/// assert_eq!(stall_cutoff(Duration::from_secs(300)), Duration::from_secs(1200));
+/// assert_eq!(stall_cutoff(floor, Duration::from_secs(300)), Duration::from_secs(1200));
 /// ```
 #[must_use]
-pub fn stall_cutoff(longest_gap: Duration) -> Duration {
-    STALL_FLOOR.max(longest_gap.saturating_mul(STALL_FACTOR))
+pub fn stall_cutoff(floor: Duration, longest_gap: Duration) -> Duration {
+    floor.max(longest_gap.saturating_mul(STALL_FACTOR))
 }
 
 /// Device slots each nonce rotates through. Typed `u8` because it is first a
@@ -3006,12 +3049,13 @@ fn emit_completion(
 
 /// Driver state that outlives any single session.
 ///
-/// Both fields span the whole `run_stream` call: the budget because uptime is
+/// These fields span the whole `run_stream` call: the budget because uptime is
 /// the variable QUI-870 measures, and the governor because a yield decision
 /// applies to the device rather than to one session.
 struct DriverContext<'a> {
     budget: &'a mut DriverBudget,
     gov: &'a UtilGovernor,
+    stall: StallConfig,
 }
 
 /// Why a session stopped drawing jobs from the channel.
@@ -3299,6 +3343,7 @@ fn pump_session(
     feed: &mut Feed<'_>,
     mut halt: Halt,
     ctx: &mut DriverContext<'_>,
+    stall_floor: Duration,
 ) -> Halt {
     let mut exhausted = halt.is_exhausted();
     // When the pipeline last went completely empty; `None` while it holds a job.
@@ -3397,7 +3442,7 @@ fn pump_session(
             // gone, the rebuild itself fails and that error is the
             // session-fatal signal.
             let stalled = last_completion.elapsed();
-            if stalled >= stall_cutoff(longest_gap) {
+            if stalled >= stall_cutoff(stall_floor, longest_gap) {
                 eprintln!(
                     "quip-solver-cuda: no slot completed in {stalled:?}; rebuilding the \
                      self-feeding session"
@@ -3541,7 +3586,18 @@ fn run_session(
         return next_seed(&mut feed, halt);
     }
 
-    let halt = pump_session(&mut sess, &mut slots[..active_nonces], &mut feed, halt, ctx);
+    // SessionKey requires identical sweep settings for every admitted job, so
+    // this is also the largest sweep count in flight. Use the built schedule
+    // rather than num_sweeps, which may round down or up in build_beta_schedule.
+    let stall_floor = ctx.stall.floor(beta.len().saturating_mul(sweeps_per_beta));
+    let halt = pump_session(
+        &mut sess,
+        &mut slots[..active_nonces],
+        &mut feed,
+        halt,
+        ctx,
+        stall_floor,
+    );
     drop(sess); // signals exit + synchronizes stream_compute (Drop impl)
 
     // Yield here, after teardown and before claiming the next seed. After
@@ -3600,7 +3656,7 @@ fn yield_after_session(
 /// use quip_solver_core::{CancelToken, StreamJob, StreamResult};
 /// use quip_solver_cuda::cuda_device::CudaDevice;
 /// use quip_solver_cuda::nvml_gov::UtilGovernor;
-/// use quip_solver_cuda::streaming::run_stream;
+/// use quip_solver_cuda::streaming::{run_stream, StallConfig};
 /// use quip_solver_cuda::KernelKind;
 /// use tokio::sync::mpsc::channel;
 ///
@@ -3613,7 +3669,7 @@ fn yield_after_session(
 /// // A real caller feeds `job_tx` from another task; closing it is what
 /// // eventually lets `run_stream` return.
 /// drop(job_tx);
-/// run_stream(&device, KernelKind::Sa, job_rx, res_tx, CancelToken::default(), &gov);
+/// run_stream(&device, KernelKind::Sa, job_rx, res_tx, CancelToken::default(), &gov, StallConfig::default());
 /// # Ok(())
 /// # }
 /// ```
@@ -3629,6 +3685,7 @@ pub fn run_stream(
     out: Sender<StreamResult>,
     cancel: CancelToken,
     gov: &UtilGovernor,
+    stall: StallConfig,
 ) {
     // One budget for the whole process, not per session: uptime is the
     // variable QUI-870 and QUI-922 are asking about, and a per-session budget
@@ -3637,6 +3694,7 @@ pub fn run_stream(
     let mut ctx = DriverContext {
         budget: &mut budget,
         gov,
+        stall,
     };
     let mut pending = jobs.blocking_recv();
     while let Some(seed) = pending.take() {

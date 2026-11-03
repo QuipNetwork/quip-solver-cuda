@@ -49,7 +49,12 @@ fn solves_past_one_million_couplers(kernel: KernelKind) {
         identity.max_edges
     );
     let gov = UtilGovernor::start(&device.pci_bus_id, 100, false);
-    let sampler = CudaSampler::new(device, gov, kernel);
+    let sampler = CudaSampler::new(
+        device,
+        gov,
+        kernel,
+        quip_solver_cuda::streaming::StallConfig::default(),
+    );
     let output = solve(&sampler, &identity, &complete_binary_problem())
         .unwrap_or_else(|e| panic!("{kernel:?}: {e}"));
     let solutions: Vec<serde_json::Value> = serde_json::from_slice(&output).unwrap();
