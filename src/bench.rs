@@ -41,7 +41,7 @@
 //!     --out out/cuda-sa_n512_s1024.folded.jsonl
 //! ```
 
-use crate::capacity::{default_nodes, msa_device_reads, msa_max_nodes};
+use crate::capacity::{default_nodes, msa_device_reads, msa_max_nodes, DeviceLimits};
 use crate::corpus;
 use crate::cuda_device::{CudaDevice, MsaLane};
 use crate::nsight;
@@ -690,6 +690,19 @@ fn check_reads(
     )))
 }
 
+/// Node cap for a bench run without `--max-nodes`, from this open's memory
+/// snapshot. MSA sizes its spin words from the run's read count, so a run
+/// below the device's full read width fits a larger graph than the miner,
+/// which advertises its cap at full width.
+fn default_bench_nodes(kernel: KernelKind, limits: &DeviceLimits, reads: u64) -> usize {
+    match kernel {
+        KernelKind::Msa => msa_max_nodes(limits, usize::try_from(reads).unwrap_or(usize::MAX)),
+        KernelKind::Sa | KernelKind::Gibbs => {
+            crate::capacity::advertised_nodes(kernel, usize::MAX, Some(limits))
+        }
+    }
+}
+
 fn run_run(
     device_index: usize,
     kernel: KernelKind,
@@ -738,17 +751,11 @@ fn run_run(
             max_nodes.unwrap_or_else(|| default_nodes(kernel)),
         )
         .map_err(|e| BenchError::Device(e.to_string()))?;
-        if kernel == KernelKind::Msa && max_nodes.is_none() {
-            // MSA has no compiled node array. Use this open's memory snapshot,
-            // as the miner does when no lower cap was requested.
-            device.max_nodes = msa_max_nodes(&device.limits, msa_device_reads(&device.limits));
-        }
-        if (kernel == KernelKind::Sa || kernel == KernelKind::Gibbs) && max_nodes.is_none() {
-            device.max_nodes =
-                crate::capacity::advertised_nodes(kernel, usize::MAX, Some(&device.limits));
+        check_reads(kernel, args.reads, &device.limits)?;
+        if max_nodes.is_none() {
+            device.max_nodes = default_bench_nodes(kernel, &device.limits, args.reads);
         }
         device.msa_shared_spins_cap = args.msa_shared_spins;
-        check_reads(kernel, args.reads, &device.limits)?;
         let width = stream_width(&device, kernel);
         let nonces = usize::try_from(args.nonces).unwrap_or(usize::MAX);
         if nonces > width {
@@ -984,8 +991,8 @@ fn fold_per_sweep(args: &FoldArgs) -> Result<Option<u64>, BenchError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_record, check_degree, check_reads, circulant_graph, CellConfig, HostSpans,
-        SpanAggregator,
+        assemble_record, check_degree, check_reads, circulant_graph, default_bench_nodes,
+        msa_max_nodes, CellConfig, HostSpans, SpanAggregator,
     };
     use crate::schema::Scope;
     use crate::streaming::DeviceTimings;
@@ -1459,6 +1466,31 @@ mod tests {
             err,
             "bench args: --reads 256 is outside 1..=128 for the msa kernel"
         );
+    }
+    #[test]
+    fn default_bench_nodes_follow_the_msa_read_count() {
+        let limits = crate::capacity::DeviceLimits {
+            shared_bytes_per_block: 49_152,
+            shared_bytes_per_block_optin: 101_376,
+            free_bytes: 15 << 30,
+            sm_count: 48,
+            threads_per_sm: 1536,
+        };
+        let full = default_bench_nodes(KernelKind::Msa, &limits, 128);
+        let half = default_bench_nodes(KernelKind::Msa, &limits, 64);
+        assert_eq!(full, msa_max_nodes(&limits, 128));
+        assert_eq!(half, msa_max_nodes(&limits, 64));
+        assert!(
+            half > full,
+            "64 reads hold one spin word, so N must grow: {half} <= {full}"
+        );
+        for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
+            assert_eq!(
+                default_bench_nodes(kernel, &limits, 64),
+                default_bench_nodes(kernel, &limits, 256),
+                "{kernel:?} cap does not depend on reads"
+            );
+        }
     }
     #[test]
     fn check_reads_uses_turing_device_limit() {
