@@ -41,7 +41,10 @@
 //!     --out out/cuda-sa_n512_s1024.folded.jsonl
 //! ```
 
-use crate::capacity::{default_nodes, msa_device_reads, msa_max_nodes, DeviceLimits};
+use crate::capacity::{
+    default_nodes, max_model, msa_device_reads, msa_max_nodes, Connectivity, DeviceLimits,
+    Precision,
+};
 use crate::corpus;
 use crate::cuda_device::{CudaDevice, MsaLane};
 use crate::nsight;
@@ -691,14 +694,22 @@ fn check_reads(
 }
 
 /// Node cap for a bench run without `--max-nodes`, from this open's memory
-/// snapshot. MSA sizes its spin words from the run's read count, so a run
-/// below the device's full read width fits a larger graph than the miner,
-/// which advertises its cap at full width.
+/// snapshot. MSA and Gibbs state grows with the read count, so a run below
+/// the full read width fits a larger graph than the miner, which advertises
+/// its cap at full width.
 fn default_bench_nodes(kernel: KernelKind, limits: &DeviceLimits, reads: u64) -> usize {
+    let reads = usize::try_from(reads).unwrap_or(usize::MAX);
     match kernel {
-        KernelKind::Msa => msa_max_nodes(limits, usize::try_from(reads).unwrap_or(usize::MAX)),
+        KernelKind::Msa => msa_max_nodes(limits, reads),
         KernelKind::Sa | KernelKind::Gibbs => {
-            crate::capacity::advertised_nodes(kernel, usize::MAX, Some(limits))
+            max_model(
+                kernel,
+                Connectivity::Degree(0),
+                Precision::Binary,
+                reads,
+                limits,
+            )
+            .nodes
         }
     }
 }
@@ -1468,7 +1479,7 @@ mod tests {
         );
     }
     #[test]
-    fn default_bench_nodes_follow_the_msa_read_count() {
+    fn default_bench_nodes_follow_the_read_count() {
         let limits = crate::capacity::DeviceLimits {
             shared_bytes_per_block: 49_152,
             shared_bytes_per_block_optin: 101_376,
@@ -1486,11 +1497,19 @@ mod tests {
         );
         for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
             assert_eq!(
-                default_bench_nodes(kernel, &limits, 64),
                 default_bench_nodes(kernel, &limits, 256),
-                "{kernel:?} cap does not depend on reads"
+                crate::capacity::advertised_nodes(kernel, usize::MAX, Some(&limits)),
+                "{kernel:?} at full width matches the miner"
             );
         }
+        // SA sizes its state at full block width whatever the read count.
+        assert_eq!(
+            default_bench_nodes(KernelKind::Sa, &limits, 64),
+            default_bench_nodes(KernelKind::Sa, &limits, 256)
+        );
+        let full = default_bench_nodes(KernelKind::Gibbs, &limits, 256);
+        let quarter = default_bench_nodes(KernelKind::Gibbs, &limits, 64);
+        assert!(quarter > full, "gibbs: {quarter} <= {full}");
     }
     #[test]
     fn check_reads_uses_turing_device_limit() {
