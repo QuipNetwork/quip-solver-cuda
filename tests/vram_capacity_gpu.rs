@@ -623,7 +623,11 @@ fn probe_capacity_json_parses() {
             assert!(value["reads"] == 128 || value["reads"] == 64);
         } else {
             assert_eq!(value["reads"], 256);
-            assert!(cells.iter().all(|cell| cell["expected_slowdown"].is_null()));
+        }
+        for cell in cells {
+            let slowdown = &cell["expected_slowdown"];
+            assert!(slowdown.is_null() || slowdown.as_f64().is_some_and(|s| s > 0.0));
+            assert!(cell["projected"].is_boolean());
         }
         let tiers = if kernel == KernelKind::Sa {
             ["local", "global", "dense"]
