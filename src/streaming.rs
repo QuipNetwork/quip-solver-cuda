@@ -23,6 +23,7 @@ use crate::driver_budget::{Bucket, DriverBudget};
 use crate::kernel::KernelKind;
 use crate::nvml_gov::UtilGovernor;
 use crate::sampler::SampleError;
+use crate::stream_pool::SessionStreams;
 use crate::topology::{fill_coefficients, SelfFeedingTopology};
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg};
@@ -356,6 +357,8 @@ struct SelfFeedingSession<'a> {
     algo_state: AlgoState,
 
     launched: bool,
+    // Last: return the pair only after buffer drops and their queued frees.
+    _streams: SessionStreams<'a>,
 }
 
 /// Slot buffers and reusable host staging, selected by coefficient width.
@@ -730,9 +733,9 @@ impl<'a> SelfFeedingSession<'a> {
             reads_per_nonce: to_kernel_i32("reads_per_nonce", reads_per_nonce)?,
         };
 
-        let ctx = &device.ctx;
-        let stream_compute = ctx.new_stream()?;
-        let stream_transfer = ctx.new_stream()?;
+        let streams = device.stream_pool.take();
+        let stream_compute = Arc::clone(&streams.compute);
+        let stream_transfer = Arc::clone(&streams.transfer);
 
         let row_ptr = if topology.row_ptr.is_empty() {
             vec![0i32]
@@ -815,6 +818,7 @@ impl<'a> SelfFeedingSession<'a> {
             d_beta,
             algo_state,
             launched: false,
+            _streams: streams,
         })
     }
 
@@ -1358,10 +1362,8 @@ impl<'a> SelfFeedingSession<'a> {
     /// memory, which surfaces as `CUDA_ERROR_LAUNCH_FAILED` on the next call.
     fn wait_exit(&mut self) -> Result<(), SampleError> {
         self.stream_transfer.synchronize()?;
-        if self.launched {
-            self.stream_compute.synchronize()?;
-            self.launched = false;
-        }
+        self.stream_compute.synchronize()?;
+        self.launched = false;
         Ok(())
     }
 }
@@ -2495,6 +2497,7 @@ fn run_session(
     cancel: &CancelToken,
     ctx: &mut DriverContext<'_>,
 ) -> Option<StreamJob> {
+    let watermark = seed.watermark;
     let limits = algo_limits(kernel, device.msa_replica_words);
     let reads_per_nonce = seed.params.num_reads.max(1).min(limits.max_reads);
     let key = match SessionKey::seed(
@@ -2608,12 +2611,32 @@ fn run_session(
     // a job, and a contended GPU can hold this loop for an unbounded time:
     // sleeping with a job already in hand would leave the coordinator waiting
     // on a result we have not started.
-    while ctx.gov.should_throttle() {
-        let yielded = ctx.budget.mark();
-        std::thread::sleep(YIELD_SLICE);
-        ctx.budget.charge(Bucket::Throttle, yielded);
-    }
+    yield_after_session(feed.jobs, &halt, cancel, watermark, ctx.budget, || {
+        ctx.gov.should_throttle()
+    });
     next_seed(&mut feed, halt)
+}
+
+fn yield_after_session(
+    jobs: &Receiver<StreamJob>,
+    halt: &Halt,
+    cancel: &CancelToken,
+    watermark: Option<u64>,
+    budget: &mut DriverBudget,
+    mut should_throttle: impl FnMut() -> bool,
+) {
+    while should_throttle() {
+        // All held jobs have been reported before teardown. A carried mismatch
+        // still needs another session, even if the input channel is drained.
+        let finished = matches!(halt, Halt::Closed)
+            || (!matches!(halt, Halt::Mismatch(_)) && jobs.is_closed() && jobs.is_empty());
+        if finished || cancel.is_cancelled(watermark) {
+            break;
+        }
+        let yielded = budget.mark();
+        std::thread::sleep(YIELD_SLICE);
+        budget.charge(Bucket::Throttle, yielded);
+    }
 }
 
 /// Drive the self-feeding streaming loop for the lifetime of `jobs`: keep up
@@ -2698,6 +2721,78 @@ mod tests {
 
     use super::*;
     use tokio::sync::mpsc::channel;
+
+    #[test]
+    fn governor_wait_ends_when_the_session_watermark_is_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (job_tx, job_rx) = channel(1);
+        let throttle = Arc::new(AtomicBool::new(true));
+        let cancel = CancelToken::default();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let throttle = Arc::clone(&throttle);
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                yield_after_session(
+                    &job_rx,
+                    &Halt::Idle,
+                    &cancel,
+                    Some(7),
+                    &mut DriverBudget::disabled(),
+                    || {
+                        entered_tx.send(()).expect("yield observer stays open");
+                        throttle.load(Ordering::Acquire)
+                    },
+                );
+                done_tx.send(()).unwrap();
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancel.cancel_through(6);
+        assert!(done_rx.recv_timeout(YIELD_SLICE * 2).is_err());
+        cancel.cancel_through(7);
+        let returned = done_rx.recv_timeout(Duration::from_secs(1));
+        throttle.store(false, Ordering::Release);
+        worker.join().unwrap();
+        assert!(
+            returned.is_ok(),
+            "cancellation must end a held throttle wait"
+        );
+        drop(job_tx);
+    }
+
+    #[test]
+    fn governor_wait_skips_a_closed_and_drained_finite_batch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (job_tx, job_rx) = channel(1);
+        drop(job_tx);
+        let throttle = Arc::new(AtomicBool::new(true));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let throttle = Arc::clone(&throttle);
+            std::thread::spawn(move || {
+                // The governor can end intake before refill observes closure,
+                // so the channel state must work even with Halt::Idle.
+                yield_after_session(
+                    &job_rx,
+                    &Halt::Idle,
+                    &CancelToken::default(),
+                    Some(1),
+                    &mut DriverBudget::disabled(),
+                    || throttle.load(Ordering::Acquire),
+                );
+                done_tx.send(()).unwrap();
+            })
+        };
+        let returned = done_rx.recv_timeout(Duration::from_secs(1));
+        throttle.store(false, Ordering::Release);
+        worker.join().unwrap();
+        assert!(
+            returned.is_ok(),
+            "a completed finite batch has no reason to yield"
+        );
+    }
 
     /// 4-node ring, unit couplings — small enough to reason about by hand.
     fn graph() -> IsingGraph {

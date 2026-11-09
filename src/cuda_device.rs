@@ -5,6 +5,7 @@
 use crate::capacity;
 use crate::jit_cache;
 use crate::kernel::KernelKind;
+use crate::stream_pool::StreamPool;
 use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute_enum};
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
@@ -67,7 +68,7 @@ pub const SUPPORTED_ARCHS: &[i32] = &[
 /// *newer* than the actual device (r610 driver → `compute_121` on an `sm_86`
 /// card) — and PTX only loads forward, so that open failed with
 /// `CUDA_ERROR_INVALID_PTX`.
-fn select_arch(cc: i32) -> i32 {
+pub(crate) fn select_arch(cc: i32) -> i32 {
     SUPPORTED_ARCHS
         .iter()
         .copied()
@@ -77,7 +78,7 @@ fn select_arch(cc: i32) -> i32 {
 }
 
 /// Detect the device capability and clamp it to the supported compile targets.
-fn device_arch(ctx: &CudaContext) -> i32 {
+pub(crate) fn device_arch(ctx: &CudaContext) -> i32 {
     let cc = match (
         ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
         ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR),
@@ -89,7 +90,7 @@ fn device_arch(ctx: &CudaContext) -> i32 {
 }
 
 /// `cuDriverGetVersion`, wrapped safely (cudarc exposes only the raw sys fn).
-fn driver_version() -> Result<i32, CudaError> {
+pub(crate) fn driver_version() -> Result<i32, CudaError> {
     let mut v: std::ffi::c_int = 0;
     // SAFETY: `v` is a live, initialized `c_int` owned by this frame, so
     // `from_mut(&mut v)` is a valid, aligned, uniquely-borrowed pointer for the
@@ -130,7 +131,7 @@ impl From<cudarc::driver::DriverError> for CudaError {
 /// fallback pass. The arch-unspecified compile the fallback served no longer
 /// exists: NVRTC 12.9's default target (`sm_52`) predates the kernels'
 /// `__nanosleep` floor, so a portable compile can never succeed.
-fn compile_for_arch(
+pub(crate) fn compile_for_arch(
     src: &str,
     max_nodes: usize,
     arch: i32,
@@ -375,10 +376,10 @@ pub struct CudaDevice {
     /// on, so the governor resolves its handle from this.
     pub pci_bus_id: String,
     pub(crate) ctx: Arc<CudaContext>,
-    /// The device's default (null) stream. `streaming` builds its own
-    /// compute/transfer streams, so nothing reads this today.
+    /// The device's default (null) stream. Sessions use the pool instead.
     #[allow(dead_code)]
     pub(crate) stream: Arc<CudaStream>,
+    pub(crate) stream_pool: StreamPool,
     /// `cuda_sa_self_feeding` — persistent kernel, 1 block (1 SM) per nonce.
     pub(crate) sa: CudaFunction,
     /// Wide `cuda_sa_self_feeding`, compiled with [`SA_WIDE_DEFINE`].
@@ -434,6 +435,9 @@ impl fmt::Debug for CudaDevice {
 
 impl CudaDevice {
     /// Create a context on `device_index` and NVRTC-compile the kernels.
+    ///
+    /// Precreates 64 session stream pairs. Additional concurrent sessions wait
+    /// for a pair to return instead of creating streams beside running kernels.
     ///
     /// # Errors
     ///
@@ -591,11 +595,13 @@ impl CudaDevice {
             ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID)?,
         );
 
+        let stream_pool = StreamPool::new(&ctx)?;
         Ok(Self {
             device_index,
             pci_bus_id,
             ctx,
             stream,
+            stream_pool,
             sa,
             sa_wide,
             gibbs,
