@@ -7,7 +7,7 @@ use crate::coefficients::CoefficientPath;
 use crate::jit_cache;
 use crate::kernel::KernelKind;
 use crate::stream_pool::StreamPool;
-use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute_enum};
+use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute_enum, CUshared_carveout_enum};
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
 use std::fmt;
@@ -343,6 +343,7 @@ fn compile_gibbs_variants(
             || compile_for_arch(GIBBS_SRC, capacity::GIBBS_DEFAULT_NODES, arch, defines),
         )?
         .load_function("cuda_gibbs_self_feeding")?;
+        prefer_gibbs_l1(&function)?;
         if defines.contains(&"-DQUIP_GIBBS_SPILL") {
             let static_bytes = usize::try_from(function.shared_size_bytes()?)
                 .map_err(|_| CudaError::Driver("negative Gibbs static shared memory".into()))?;
@@ -437,6 +438,21 @@ fn compile_sa_variants(ctx: &Arc<CudaContext>) -> Result<SaVariants, CudaError> 
 /// dynamic-shared-memory budget.
 /// Kept out of [`CudaDevice::open_with_nodes`] to stay under the crate's
 /// function-length cap.
+/// Ask the driver for the smallest shared-memory carve-out that fits one
+/// Gibbs block, leaving the rest of the SM's unified cache to L1.
+///
+/// The Gibbs launch is persistent with one block per SM, so occupancy above
+/// one block buys nothing. Without the hint the driver sizes the carve-out
+/// for the most resident blocks, which on `sm_86` leaves 28 KB of L1 at most
+/// sizes, and the `__ldg` reads of the CSR tables then miss L1.
+fn prefer_gibbs_l1(gibbs: &CudaFunction) -> Result<(), CudaError> {
+    gibbs.set_attribute(
+        CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        CUshared_carveout_enum::CU_SHAREDMEM_CARVEOUT_MAX_L1 as i32,
+    )?;
+    Ok(())
+}
+
 fn configure_msa_shared_memory(
     msa: &CudaFunction,
     shared_per_block_optin: usize,
@@ -700,6 +716,7 @@ impl CudaDevice {
         let msa_dense = msa_mod.load_function("cuda_msa_dense_self_feeding")?;
         configure_msa_shared_memory(&msa_dense, shared_per_block_optin)?;
         let gibbs = gibbs_mod.load_function("cuda_gibbs_self_feeding")?;
+        prefer_gibbs_l1(&gibbs)?;
         let gibbs_variants = if kernel == KernelKind::Gibbs {
             Some(compile_gibbs_variants(&ctx, shared_per_block_optin)?)
         } else {
