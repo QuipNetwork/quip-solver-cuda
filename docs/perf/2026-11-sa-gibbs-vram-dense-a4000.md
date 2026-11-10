@@ -631,6 +631,16 @@ The text probe prints `(projected)` after such a value. The JSON probe sets `pro
 MSA keeps its existing 128-read measurements and lookup behavior.
 The output names RTX A4000 as the reference card, including on other GPUs.
 
+### Gibbs recalibration after the L1 carve-out change
+
+Commit 2fde76c asks the driver to prefer L1 over shared memory for every Gibbs function. The 24 Gibbs cells at 4,800, 16,000, and 64,000 nodes, at degrees 20 and 60 in every precision, ran again at 12 nonces with that build. Each cell used its original command and sweep pair. The Gibbs entries in `src/slowdown_a4000.rs` use these new times, and every other Gibbs cell keeps its earlier time. Every Gibbs slowdown now uses the new degree-20 Binary baseline at 4,800 nodes, which fell from 4.47 ns to 3.35 ns per lane-update.
+
+- The cells at 16,000 nodes run 1.95 to 2.51 times faster than before.
+- The cells at 64,000 nodes and the other cells at 4,800 nodes stay within 16 percent of their earlier times.
+- The cells at 200,000 nodes and larger did not run again. Their times stay the same, so their slowdowns against the faster baseline rise by 1.34 times. Degree-20 Binary cells larger than 4,800 nodes now take 1.81 to 5.81 times the baseline time per lane-update.
+
+The Gibbs slowdowns in the timing tables, observations, and smoke-run sections of this report come from the earlier build. The rerun is in `/zfspool/quip-mining/bench-evidence/sa-gibbs-vram-dense/carveout/`, with `results.jsonl`, `summary.json`, and the scripts that ran the cells and rewrote the table.
+
 ## Retried cells
 
 The first grid pass ran these cells at 8/32. Each run failed with `self-feeding kernel timed out`.
