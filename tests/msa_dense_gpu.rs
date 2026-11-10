@@ -554,3 +554,49 @@ fn dense_weighted_planted_mattis_multi_tile() {
         }
     }
 }
+
+// QUI-1596: CPU MSA shares one acceptance draw across lanes, and on a dense
+// model every read then merges into one configuration. The dense CUDA kernel
+// gives each replica its own RNG stream, so its reads stay distinct.
+fn distinct_rows(spins: impl Iterator<Item = Vec<i8>>) -> usize {
+    spins.collect::<std::collections::HashSet<_>>().len()
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_reads_do_not_collapse_to_one_configuration() {
+    let device = open();
+    let reads = msa_device_reads(&device.limits);
+    // A long anneal can end every read in the ground state and its global
+    // flip, so only the 16-sweep anneal must keep an eighth of reads apart.
+    for sweeps in [16, 64, 4_096] {
+        let p = params(&device, sweeps);
+        let binary = sample_one(&device, &sk(28, 7), &p, KernelKind::Msa).unwrap();
+        let mut counts = vec![("binary", distinct_rows(binary.into_iter().map(|r| r.spins)))];
+        for path in [
+            CoefficientPath::WeightedInt8,
+            CoefficientPath::Wide,
+            CoefficientPath::Float32,
+        ] {
+            let graph = weighted_graph(28, 7, path);
+            let set = sample_one_real(&device, &graph, &p).unwrap();
+            counts.push((
+                match path {
+                    CoefficientPath::WeightedInt8 => "int8",
+                    CoefficientPath::Wide => "i32",
+                    _ => "f32",
+                },
+                distinct_rows(set.into_iter().map(|r| r.spins)),
+            ));
+        }
+        eprintln!("{sweeps} sweeps, {reads} reads: {counts:?}");
+        for (name, distinct) in counts {
+            let floor = if sweeps == 16 { reads / 8 } else { 1 };
+            assert!(
+                distinct > floor,
+                "{name} at {sweeps} sweeps: {distinct} distinct rows of {reads}"
+            );
+        }
+    }
+}
