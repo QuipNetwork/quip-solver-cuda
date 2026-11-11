@@ -24,6 +24,166 @@ use std::time::Instant;
 const HOST_RUNS: usize = 20;
 const KERNEL_RUNS: usize = 5;
 
+#[allow(dead_code)] // Reuse the real coordinator rather than copying session behavior.
+#[path = "../../tests/common/lease.rs"]
+mod session;
+
+#[allow(clippy::too_many_lines)] // One timed session and its untimed result validation.
+async fn throughput(base: &BaseTopology, params: &[u8], mode: &str) -> serde_json::Value {
+    use quip_solver_core::quip_proto::v1::{
+        coord_msg, EdgeList, FamilyDescriptor, GeneratorAlgorithm, Topology,
+    };
+    use std::time::Duration;
+
+    assert!(["serial", "core-prefetch"].contains(&mode));
+    let binary = std::env::var("CU4_BINARY").expect("set CU4_BINARY to the release miner path");
+    let mut session = session::Session::start(&binary, 1, "").await;
+    let hash = [0x73; 32];
+    session
+        .send(coord_msg::Msg::Topology(Topology {
+            hash: hash.to_vec(),
+            nodes: base.node_ids().to_vec(),
+            edges: Some(EdgeList {
+                u: base.edges().iter().map(|&(u, _)| u).collect(),
+                v: base.edges().iter().map(|&(_, v)| v).collect(),
+            }),
+            allowed_h_milli: vec![0],
+            allowed_j_milli: vec![-1000, 1000],
+        }))
+        .await;
+    session
+        .send(coord_msg::Msg::SetTarget(session::target(i64::MAX, 256)))
+        .await;
+    let request = |id: &[u8], start, count| {
+        let mut request = session::lease(id, 1, hash, start, count);
+        let generator = request.generator.as_mut().unwrap();
+        generator.algorithm = GeneratorAlgorithm::FamilyChacha8V1 as i32;
+        generator.family = Some(FamilyDescriptor {
+            family_id: TWISTED_DIMER_V1.family_id.into(),
+            revision: 1,
+            params: params.to_vec(),
+            params_digest: params_digest(params).to_vec(),
+        });
+        generator.topology_order_digest = base.order_digest().to_vec();
+        // Match the original cost measurement's nonce inputs.
+        generator.last_proof_block_hash = vec![1; 32];
+        generator.miner_account = vec![2; 32];
+        generator.base_salt = vec![3; 32];
+        request
+    };
+    session
+        .send(coord_msg::Msg::Job(request(b"warmup", 999, 1)))
+        .await;
+    session
+        .until("warmup", Duration::from_secs(10), |log| {
+            log.done_count(b"warmup") == 1 && log.refunds() == 1
+        })
+        .await;
+    assert!(session.log.rejects.is_empty());
+    let gpu_start = telemetry();
+    let start = Instant::now();
+    let leases = if mode == "serial" { 50 } else { 1 };
+    for index in 0..leases {
+        let id = format!("timed-{index}");
+        let (salt_start, count) = if mode == "serial" {
+            (index, 1)
+        } else {
+            (0, 50)
+        };
+        session
+            .send(coord_msg::Msg::Job(request(
+                id.as_bytes(),
+                salt_start,
+                count,
+            )))
+            .await;
+        session
+            .until("50-job throughput", Duration::from_secs(15), |log| {
+                log.done_count(id.as_bytes()) == 1
+                    && log.refunds() == u32::try_from(index).unwrap() + 2
+            })
+            .await;
+        assert!(start.elapsed() < Duration::from_secs(40));
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let gpu_end = telemetry();
+    assert!(session.log.rejects.is_empty());
+    assert!(session.log.fatal.is_none());
+    assert_eq!(session.log.results.len(), 51);
+    let spec =
+        LeaseSpec::from_proto(request(b"expected", 0, 50).generator.as_ref().unwrap()).unwrap();
+    let digest = params_digest(params);
+    let contracts = [TWISTED_DIMER_V1];
+    let admitted = admit(
+        &contracts,
+        TWISTED_DIMER_V1.family_id.as_bytes(),
+        1,
+        params,
+        &digest,
+    )
+    .unwrap();
+    let bounds = admit_topology(
+        &admitted,
+        base,
+        base.order_digest(),
+        &AdvertisedLimits {
+            max_nodes: 0,
+            max_edges: 0,
+            max_degree: 0,
+        },
+    )
+    .unwrap();
+    let mut energies = Vec::new();
+    let mut sampler_time_us = 0_u64;
+    for (index, result) in session.log.results.iter().skip(1).enumerate() {
+        let index = u64::try_from(index).unwrap();
+        assert_eq!(result.salt, spec.salt(index).unwrap());
+        assert_eq!(result.nonce, spec.nonce(index).unwrap());
+        assert_eq!(result.solutions.len(), 64);
+        let meta = result.meta.as_ref().unwrap();
+        assert_eq!((meta.reads, meta.sweeps), (64, 256));
+        sampler_time_us += meta.device_access_time_us;
+        let instance =
+            generate(params, &digest, base, &bounds, spec.nonce(index).unwrap()).unwrap();
+        let edges: Vec<_> = instance
+            .edges()
+            .iter()
+            .map(|&(u, v)| (u as usize, v as usize))
+            .collect();
+        for solution in &result.solutions {
+            let spins = quip_solver_core::quip_protocol::wire::decode_spins_packed(
+                &solution.spins,
+                instance.node_ids().len(),
+            )
+            .unwrap();
+            assert_eq!(
+                solution.energy_milli,
+                quip_solver_core::quip_protocol::scoring::energy_from_milli(
+                    &spins,
+                    instance.h(),
+                    instance.j(),
+                    &edges
+                )
+            );
+        }
+        energies.push(
+            result
+                .solutions
+                .iter()
+                .map(|s| s.energy_milli)
+                .collect::<Vec<_>>(),
+        );
+    }
+    let ctx = CudaContext::new(0).unwrap();
+    let width = limits(&ctx).sm_count;
+    assert_eq!(session.shutdown(2000).await, 0);
+    json!({"mode": mode, "jobs": 50, "elapsed_s": elapsed,
+        "jobs_per_s": 50.0 / elapsed, "reads": 64, "sweeps": 256,
+        "stream_width": width, "lease_prefetch_depth": width * 2,
+        "sampler_time_s": Duration::from_micros(sampler_time_us).as_secs_f64(),
+        "gpu_start": gpu_start, "gpu_end": gpu_end, "energies_milli": energies})
+}
+
 fn median(values: &[f64]) -> f64 {
     assert!(!values.is_empty());
     let mut values = values.to_vec();
@@ -263,6 +423,24 @@ fn measure_generation_cost() {
     let parent = output.parent().unwrap().canonicalize().unwrap();
     assert!(parent.starts_with(root.canonicalize().unwrap()));
     let start_telemetry = telemetry();
+    if let Ok(mode) = std::env::var("CU4_THROUGHPUT") {
+        let base = topology(m, t);
+        let params = parameters(m, t, weak, pairs);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut row = runtime.block_on(throughput(&base, &params, &mode));
+        row["shape"] = json!(shape);
+        row["commit"] = json!(command("git", &["rev-parse", "HEAD"]));
+        row["date_utc"] = json!(command("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output)
+            .unwrap();
+        serde_json::to_writer(&mut file, &row).unwrap();
+        writeln!(file).unwrap();
+        println!("CU4 {row}");
+        return;
+    }
     let kernel = ClusterKernel::load(0).unwrap(); // Visible ordinal 0 is physical GPU 1.
     let ctx = kernel.stream.context();
     let limits = limits(ctx);

@@ -1,6 +1,11 @@
 # Family generation costs
 
-Recommend building device generation under the stated decision rule.
+The CU-4 session measurements below supersede the original device-generation recommendation.
+Core 0.0.8 already generates lease instances ahead of the sampler.
+The maintainer selected host overlap instead of device generation.
+Production behavior remains unchanged under the task's measurement-only stop condition.
+
+The original spike recommended device generation under its stated decision rule.
 At all three registered 4,800-node recipes, generation plus coefficient transfer is 13.47–13.73% of a low-budget mining job.
 Generation alone is 13.39–13.65%, so the conclusion does not depend on counting packed neighbor bits as coefficient transfer.
 The 10% condition passes at mining-relevant sizes. No admitted measured case exceeds the alternative 50 ms saving condition.
@@ -171,3 +176,127 @@ All required checks pass with zero warnings:
 - `cargo test --release`: 438 passed. The run ignores 258 tests and reports zero failures.
 
 The test run uses `RUST_TEST_THREADS=1` and `CUDA_VISIBLE_DEVICES=1`.
+
+## Existing host generation overlap
+
+Core 0.0.8 generates family instances on a Tokio runtime worker, separate from the `quip-sampler` thread.
+The expander task can migrate between runtime workers at await points.
+It calls canonical generation synchronously within each task poll.
+It does not generate instances on `quip-sampler`.
+
+The source chain in `quip-solver-core-0.0.8/src/` is:
+
+- `lib.rs:185`: `generates_locally` defaults to false. The Otsuka sampler keeps this default.
+- `session.rs:1999`: the miner creates the multithread Tokio runtime.
+- `session.rs:1155`: prefetch is twice the live stream width. `lease_depth` uses that bound.
+- `session.rs:1184`: the `quip-sampler` thread consumes the job receiver.
+- `session.rs:1197`: a shared semaphore bounds unfinished lease salts across expanders.
+- `session.rs:1507`: the session spawns `Expander::run` as a Tokio task.
+- `lease.rs:689`: the expander acquires a slot before drawing each salt.
+- `lease.rs:708`: `salt_graph` generates the next instance before sending its job.
+- `lease.rs:636`: `family_graph` calls `FamilyLease::generate` and converts the instance into a graph and family context.
+- `lease.rs:133`: `FamilyLease::generate` admits the saved descriptor and calls `generate_instance` at line 143.
+- `lease.rs:750`: the expander sends the generated job to the sampler channel.
+
+Within this crate, `src/cluster/sampler.rs:442` receives each generated `WarmStreamJob`.
+Line 449 builds `PreparedGraph` on `quip-sampler`, immediately before the synchronous device work at line 450.
+`src/cluster/prepare.rs:290` delegates family preparation to `from_instance`.
+`src/cluster/sampler.rs:466` delegates stream width to SA, which resolves to 48 on the A4000.
+Core permits 96 unfinished lease salts. This bound covers queued and active work.
+This existing bound differs from a proposed new queue of one or two prepared jobs.
+CU-4 adds no queue and changes no bound.
+
+Canonical generation already overlaps GPU work. CU-1 preparation remains serial on the sampler thread.
+The task explicitly requires stopping at measurement when core already generates ahead on another thread.
+That branch requires no production change or core change.
+
+### Throughput method
+
+The existing ignored measurement test now accepts `CU4_THROUGHPUT=serial` or `core-prefetch`.
+It remains behind `long-tests` and reuses the real coordinator in `tests/common/lease.rs`.
+Both modes launch the unchanged release miner and use the same 50 canonical lease salts.
+One untimed single-salt lease warms the sampler before the timer starts.
+Every timed salt uses 64 reads and 256 sweeps.
+
+The serial control sends 50 single-salt leases. It waits for each completion and refund before sending the next lease.
+The existing core mode sends one 50-salt lease, allowing the expander to generate ahead while the sampler runs.
+The timer includes initial generation, sampling, result transport, lease completion, and refunds.
+It excludes process startup, warmup, independent energy checks, and shutdown.
+The control includes 49 extra lease exchanges and repeated lease admission.
+The throughput difference compares whole sessions and does not isolate generation savings.
+Both modes use the same production code.
+
+The measurement checks salt and nonce order, 64 reads per salt, reported sweep counts, and exact energies against regenerated instances.
+It also checks rejection and fatal-error absence, each expected refund, and a successful shutdown.
+Sampler timing sums the 50 reported `device_access_time_us` values.
+This sum includes CU-1, upload, device work, download, and final sampler scoring.
+The remaining wall time includes initial generation, protocol work, and any idle gaps.
+
+Raw session records: [2026-11-11-cu4-overlap-a4000.jsonl](2026-11-11-cu4-overlap-a4000.jsonl).
+
+### Throughput results
+
+These rows use the final timing instrumentation. Each row covers 50 jobs on physical GPU 1.
+
+| Nodes | Parameters m,t,weak,pairs | Mode | Wall seconds | Sampler seconds | Outside sampler seconds | Jobs/s |
+|---|---|---|---:|---:|---:|---:|
+| 4,800 | `12,4,62,1200` | Serial single-salt leases | 6.912209 | 5.033263 | 1.878946 | 7.2336 |
+| 4,800 | `12,4,62,1200` | Existing core prefetch | 5.437914 | 5.376243 | 0.061671 | 9.1947 |
+| 2,176 | `8,4,62,544` | Serial single-salt leases | 3.659842 | 2.689768 | 0.970074 | 13.6618 |
+| 2,176 | `8,4,62,544` | Existing core prefetch | 2.994327 | 2.965065 | 0.029262 | 16.6982 |
+
+The prefetched runs spend 98.9% and 99.0% of wall time inside the serial sampler.
+Generation for 50 salts cannot lie serially outside sampling in gaps of only 62 ms and 29 ms.
+The source trace and these gaps show that core already hides generation behind sampling.
+The task's stop condition applies. This measurement adds no production worker or prepared successor.
+
+Session throughput rises by 27.1% and 22.2% over the controls.
+These percentages also include fewer lease exchanges and admission checks.
+They do not estimate a new code change or isolate CU-1 savings.
+The sampler remains serial for family jobs and still prepares each graph immediately before running it.
+
+The final runs start at 65–68 C and finish at 70–78 C.
+Their final SM clocks range from 1,860 to 1,890 MHz.
+Each timed run lasts under seven seconds. The longest whole measurement test lasts 15.38 seconds.
+That duration includes startup and host checks.
+The seven raw records also keep three initial runs without summed sampler timing.
+The first 4,800-node control ran at 1,560 MHz and took 10.428 seconds.
+The main table uses the later run with summed sampler timing rather than that clock-affected initial control.
+The initial prefetched runs measured 8.1408 jobs/s and 16.6837 jobs/s.
+
+### Rerun the session comparison
+
+Build the miner once. Run one shape and mode per process.
+Use `8,4,62,544` for the smaller case and `serial` for the control.
+Run only one GPU command at a time.
+
+```sh
+cargo build --release --bin quip-cuda-otsuka
+mkdir -p .tmp
+CUDA_VISIBLE_DEVICES=1 \
+TMPDIR="$PWD/.tmp" \
+CU4_SHAPE=12,4,62,1200 \
+CU4_THROUGHPUT=core-prefetch \
+CU4_BINARY="$PWD/target/release/quip-cuda-otsuka" \
+CU4_OUTPUT=docs/perf/cu4-overlap-rerun.jsonl \
+cargo test --release --features long-tests --lib measure_generation_cost -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The existing ignored benchmark supports the 50-job measurement.
+No new test enters the default suite or the cluster session timing gate.
+
+### Session verification
+
+The final formatting check and both requested clippy checks pass with zero compiler or lint warnings.
+The release suite passes 438 top-level tests and ignores 264 tests.
+All 45 cluster host, device, and session tests pass with ignored tests enabled on GPU 1.
+The CI timing command passes all 24 cluster session tests. Its longest test takes 4.346 seconds.
+
+The first release suite run failed during the existing headless routing test's shutdown.
+`tests/common/lease.rs:218` reported an HTTP/2 body-read error.
+The focused reproduction, CI timing run, and fresh full suite pass without changes to that test or transport code.
+The shutdown failure's cause remains unresolved. This work changes no production code.
+
+Vale reports no prose errors. Its four remaining readability warnings reflect technical terms and source references in this record.
+The record keeps those terms for precision.
