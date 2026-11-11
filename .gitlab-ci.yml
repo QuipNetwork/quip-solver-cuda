@@ -9,23 +9,24 @@ variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
   # Downloadable binaries live in the generic package registry under this name.
   PKG: quip-solver-cuda
+  # The toolchain image the jobs run on, by digest. The
+  # build-toolchain-image job prints this line after a rebuild.
+  TOOLCHAIN_IMAGE: registry.gitlab.com/quip.network/quip-solver-cuda/ci-toolchain@sha256:5ebdbbd387d4a04a24a439f0ea2f43e41ba04e6ed161360807b8714758e7d885
 
 default:
-  # Same toolkit the Makefile targets use (Dockerfile.ci is this base with
-  # rustup preinstalled): the CUDA 12.9 the crate's cuda-12090 pin targets.
-  # A CUDA-less image cannot catch a pin/toolkit mismatch — the original
-  # cuda-13020-vs-12.9-image gap shipped precisely because CI built on
-  # rust:1.97. rust-toolchain.toml supplies the toolchain at first cargo use.
-  image: nvidia/cuda:12.9.1-devel-ubuntu24.04
   tags: [linux, amd64]
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq curl ca-certificates build-essential pkg-config git
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-    - export PATH="$CARGO_HOME/bin:$PATH"
 
 cache:
   key: cargo-$CI_COMMIT_REF_SLUG
   paths: [.cargo/, target/]
+
+# The cargo jobs run on the toolchain image (.gitlab/ci-toolchain.Dockerfile):
+# the CUDA 12.9 toolkit that the crate's cuda-12090 pin targets, the build
+# tools, and Rust 1.97.1. A CUDA-less image cannot catch a pin and toolkit
+# mismatch. The image holds every tool the jobs used to install, so the jobs
+# have no setup steps.
+.toolchain:
+  image: $TOOLCHAIN_IMAGE
 
 # The toolchain image. Its Dockerfile says what it holds. This job runs on a
 # branch push that changes the Dockerfile and is manual otherwise. The jobs
@@ -81,6 +82,7 @@ build-toolchain-image:
 # gates. nvidia-smi fails the job at once if the runner gave it no GPU.
 # `make test-gpu` is the local equivalent.
 test:
+  extends: .toolchain
   stage: test
   tags: [linux, amd64, cuda]
   timeout: 30m
@@ -103,7 +105,7 @@ test:
     expire_in: 1 week
 
 build-amd64:
-  extends: .build
+  extends: [.build, .toolchain]
   script:
     - cargo build --release --bins
     - mkdir -p dist
@@ -118,7 +120,6 @@ upload:
   image: curlimages/curl:latest
   rules:
     - if: $CI_COMMIT_TAG
-  before_script: []
   script:
     - |
       for f in dist/*; do
@@ -133,7 +134,6 @@ release:
   rules:
     - if: $CI_COMMIT_TAG
   needs: [{job: dependency-gate, optional: true}, upload]
-  before_script: []
   script:
     - |
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"

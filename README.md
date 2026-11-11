@@ -352,6 +352,26 @@ Tests that need a live CUDA device carry `#[ignore]`, so a machine without a
 GPU reports them as ignored. Run them with `--include-ignored`
 on a CUDA host.
 
+## Continuous integration
+
+The jobs run on a toolchain image that `.gitlab/ci-toolchain.Dockerfile`
+defines. The image holds the CUDA 12.9.1 toolkit, the C build tools, and Rust
+1.97.1 with clippy and rustfmt. The jobs install nothing. `make ci-image` builds
+the same file for the local `make` targets.
+
+The jobs pull the image by digest, from `TOOLCHAIN_IMAGE` in `.gitlab-ci.yml`.
+To change the image:
+
+1. Edit the Dockerfile and push the branch. A branch push that changes the
+   Dockerfile runs the `build-toolchain-image` job. On other pipelines the job
+   is manual.
+2. Copy the `TOOLCHAIN_IMAGE=...` line that the job prints into
+   `.gitlab-ci.yml`, and commit it.
+
+Run the job by hand to pick up a new base image without a Dockerfile change.
+The build context is empty, so a `Cargo.lock` change never needs a rebuild. A
+change to `rust-toolchain.toml` needs the same version in the Dockerfile.
+
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE).
