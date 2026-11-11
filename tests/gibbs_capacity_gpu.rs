@@ -33,8 +33,8 @@ fn params() -> SampleParams {
 }
 
 #[allow(clippy::float_cmp)] // Binary fixture energies are exactly representable.
-fn check_energies(graph: &IsingGraph, reads: &[SamplerResult]) {
-    assert_eq!(reads.len(), 256);
+fn check_energies(graph: &IsingGraph, reads: &[SamplerResult], num_reads: usize) {
+    assert_eq!(reads.len(), num_reads);
     for r in reads {
         assert_eq!(r.spins.len(), graph.num_nodes());
         assert!(r.spins.iter().all(|&s| s == -1 || s == 1));
@@ -60,19 +60,34 @@ fn check_energies(graph: &IsingGraph, reads: &[SamplerResult]) {
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn gibbs_spill_matches_all_shared_at_every_cap() {
+    gibbs_spill_matches_all_shared_at_every_cap_case(16);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_spill_matches_all_shared_at_every_cap_long() {
+    gibbs_spill_matches_all_shared_at_every_cap_case(256);
+}
+
+fn gibbs_spill_matches_all_shared_at_every_cap_case(num_reads: usize) {
+    let params = SampleParams {
+        num_reads,
+        ..params()
+    };
     let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 4000).unwrap();
     let graph = circulant(4000);
     for metropolis in [false, true] {
         device.gibbs_metropolis = metropolis;
         device.gibbs_force_spill = false;
         device.gibbs_shared_spins_cap = None;
-        let baseline = sample_one(&device, &graph, &params(), KernelKind::Gibbs).unwrap();
-        check_energies(&graph, &baseline);
+        let baseline = sample_one(&device, &graph, &params, KernelKind::Gibbs).unwrap();
+        check_energies(&graph, &baseline, num_reads);
         device.gibbs_force_spill = true;
         for cap in [Some(0), Some(1_000), Some(3_999), None] {
             device.gibbs_shared_spins_cap = cap;
-            let reads = sample_one(&device, &graph, &params(), KernelKind::Gibbs).unwrap();
-            check_energies(&graph, &reads);
+            let reads = sample_one(&device, &graph, &params, KernelKind::Gibbs).unwrap();
+            check_energies(&graph, &reads, num_reads);
             for (a, b) in baseline.iter().zip(&reads) {
                 assert_eq!(a.spins, b.spins, "metropolis={metropolis} cap={cap:?}");
                 assert_eq!(a.energy_milli, b.energy_milli);
@@ -88,7 +103,7 @@ fn gibbs_threshold_selects_instantiation_and_runs() {
     for (n, variant) in [(4800, "gibbs"), (4801, "gibbs-spill")] {
         let graph = circulant(n);
         let reads = sample_one(&device, &graph, &params(), KernelKind::Gibbs).unwrap();
-        check_energies(&graph, &reads);
+        check_energies(&graph, &reads, params().num_reads);
         assert_eq!(
             quip_solver_cuda::streaming::last_gibbs_variant(&device),
             Some(variant)

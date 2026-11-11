@@ -116,6 +116,21 @@ fn sa_threshold_selects_instantiation_and_runs_case(params: &SampleParams, field
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn sa_model_past_limit_refused_before_allocation() {
+    sa_model_past_limit_refused_before_allocation_case(16);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_model_past_limit_refused_before_allocation_long() {
+    sa_model_past_limit_refused_before_allocation_case(256);
+}
+
+fn sa_model_past_limit_refused_before_allocation_case(num_reads: usize) {
+    let params = SampleParams {
+        num_reads,
+        ..params()
+    };
     let mut device = CudaDevice::open_with_nodes(0, KernelKind::Sa, usize::MAX).unwrap();
     // Keep the boundary fixture fast and leave room for another GPU workload.
     let mut limits = device.limits;
@@ -132,8 +147,8 @@ fn sa_model_past_limit_refused_before_allocation() {
         );
         assert!(model.nodes > 5000);
         let graph = circulant(model.nodes, wide);
-        sample_one(&device, &graph, &params(), KernelKind::Sa).unwrap();
-        bench_one(&device, &graph, &params(), KernelKind::Sa, None).unwrap();
+        sample_one(&device, &graph, &params, KernelKind::Sa).unwrap();
+        bench_one(&device, &graph, &params, KernelKind::Sa, None).unwrap();
         let graph = circulant(model.nodes + 1, wide);
         let ctx = CudaContext::new(0).unwrap();
         ctx.synchronize().unwrap();
@@ -141,8 +156,8 @@ fn sa_model_past_limit_refused_before_allocation() {
         // Memory refusal must take precedence over an optional lower node cap.
         device.max_nodes = 5000;
         for error in [
-            sample_one(&device, &graph, &params(), KernelKind::Sa).unwrap_err(),
-            bench_one(&device, &graph, &params(), KernelKind::Sa, None).unwrap_err(),
+            sample_one(&device, &graph, &params, KernelKind::Sa).unwrap_err(),
+            bench_one(&device, &graph, &params, KernelKind::Sa, None).unwrap_err(),
         ] {
             let SampleError::ModelExceedsDeviceMemory {
                 required_bytes,

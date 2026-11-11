@@ -881,14 +881,10 @@ fn check_derived_boundaries(
     }
 }
 
-fn check_small_derived_boundaries(kernel: KernelKind, precision: Precision) {
+fn check_small_derived_boundaries(kernel: KernelKind, precision: Precision, free_bytes: usize) {
     let device = CudaDevice::open_with_nodes(0, kernel, 8192).unwrap();
     let limits = DeviceLimits {
-        free_bytes: if kernel == KernelKind::Gibbs {
-            48 << 20
-        } else {
-            64 << 20
-        },
+        free_bytes,
         ..device.limits
     };
     let params = SampleParams {
@@ -908,6 +904,20 @@ fn check_small_derived_boundaries(kernel: KernelKind, precision: Precision) {
         &params,
         &[precision],
     );
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_binary_derived_boundary_long() {
+    check_small_derived_boundaries(KernelKind::Gibbs, Precision::Binary, 48 << 20);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_int8_derived_boundary_long() {
+    check_small_derived_boundaries(KernelKind::Gibbs, Precision::Int8, 48 << 20);
 }
 
 macro_rules! precision_tests {
@@ -936,15 +946,18 @@ macro_rules! precision_tests {
 
             #[test]
             #[ignore = "requires a CUDA GPU"]
-            fn sa_derived_boundary_ci() { check_small_derived_boundaries(KernelKind::Sa, Precision::$precision); }
+            fn sa_derived_boundary_ci() { check_small_derived_boundaries(KernelKind::Sa, Precision::$precision, 64 << 20); }
 
             #[test]
             #[ignore = "requires a CUDA GPU"]
-            fn gibbs_derived_boundary_ci() { check_small_derived_boundaries(KernelKind::Gibbs, Precision::$precision); }
+            fn gibbs_derived_boundary_ci() {
+                let mib = if matches!(Precision::$precision, Precision::Binary | Precision::Int8) { 41 } else { 48 };
+                check_small_derived_boundaries(KernelKind::Gibbs, Precision::$precision, mib << 20);
+            }
 
             #[test]
             #[ignore = "requires a CUDA GPU"]
-            fn msa_derived_boundary_ci() { check_small_derived_boundaries(KernelKind::Msa, Precision::$precision); }
+            fn msa_derived_boundary_ci() { check_small_derived_boundaries(KernelKind::Msa, Precision::$precision, 64 << 20); }
         })+
     };
 }
