@@ -128,6 +128,70 @@ impl Footprint {
     }
 }
 
+/// Threads per cluster anneal, matching `gpucluster.cu:272`.
+pub const CLUSTER_THREADS: usize = 512;
+
+/// Shared bytes per node: two int arrays and one byte spin (`gpucluster.cu:139-143`).
+pub const CLUSTER_SHARED_BYTES_PER_NODE: usize = 9;
+
+/// Dynamic shared padding requested by `gpucluster.cu:322`.
+pub const CLUSTER_DYNAMIC_PADDING: usize = 16;
+
+/// The static `changed` int in `gpucluster.cu:144`.
+pub const CLUSTER_STATIC_SHARED_BYTES: usize = 4;
+
+/// Sizes of the prepared cluster arrays. ELL widths count padded slots per node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterShape {
+    /// Number of nodes.
+    pub nodes: usize,
+    /// Number of four-node tiles.
+    pub tiles: usize,
+    /// Number of pair links.
+    pub links: usize,
+    /// Maximum nonzero residual degree.
+    pub weak_width: usize,
+    /// Maximum nonzero original degree.
+    pub all_width: usize,
+    /// Number of contiguous color ranges.
+    pub colors: usize,
+}
+
+/// Cluster global memory, including explicit fields and both weight arrays.
+///
+/// Counts `gpucluster.cu:298-307` uploads and `309-321` spin and RNG state.
+/// Each empty upload reserves one element, as in `gpucluster.cu:259-262`.
+/// Permutations and the original graph stay on the host. Parent and component
+/// accumulators occupy block shared memory, not global memory.
+#[must_use]
+pub fn cluster_footprint(shape: ClusterShape, anneals: usize) -> Footprint {
+    let n = shape.nodes;
+    let t = shape.tiles;
+    let p = shape.links;
+    let int_bytes = |count: usize| count.max(1).saturating_mul(4);
+    let mut shared = POOL_ALLOWANCE_BYTES;
+    for count in [
+        t.saturating_mul(4),
+        p.saturating_mul(2),
+        n,
+        n.saturating_mul(shape.weak_width),
+        n,
+        n.saturating_mul(shape.all_width),
+        shape.colors.saturating_add(1),
+        n,
+        t,
+        p,
+    ] {
+        shared = shared.saturating_add(int_bytes(count));
+    }
+    shared = shared.saturating_add(t.saturating_mul(4).max(1));
+    Footprint {
+        shared_bytes: shared,
+        per_instance_bytes: n.saturating_add(CLUSTER_THREADS.saturating_mul(8)),
+        instances: anneals,
+    }
+}
+
 /// Device allocation estimate for the selected kernel at full width.
 #[must_use]
 pub fn footprint(
