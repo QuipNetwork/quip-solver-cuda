@@ -4,6 +4,8 @@
 //! Family contexts come from the session after canonical metadata validation.
 //! Preparation performs no CUDA calls and does not enable a sampler route.
 
+/// On-demand device upload and bounded cluster anneals.
+pub mod device;
 mod prepare;
 
 use std::collections::HashMap;
