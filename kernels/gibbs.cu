@@ -22,6 +22,28 @@
 #define QUIP_MAX_NODES 4800
 #endif
 
+// Dense updates always use the launch-sized prefix and per-block spill.
+#if defined(QUIP_GIBBS_DENSE) && !defined(QUIP_GIBBS_SPILL)
+#define QUIP_GIBBS_SPILL
+#endif
+
+// One coefficient type serves both h and J. The default expands to the
+// original spelling so the mining instantiation preprocesses unchanged.
+#if defined(QUIP_GIBBS_COEF_I32)
+typedef int coef_t;
+#elif defined(QUIP_GIBBS_COEF_F32)
+typedef float coef_t;
+#else
+#define coef_t signed char
+#endif
+
+// Spill sessions can have coefficient and sample slots larger than 2 GiB.
+#ifdef QUIP_GIBBS_SPILL
+#define GIBBS_OFFSET unsigned long long
+#else
+#define GIBBS_OFFSET int
+#endif
+
 // ==============================================================================
 // NonceControl layout (flat int array, CTRL_STRIDE ints per nonce)
 // ==============================================================================
@@ -126,29 +148,104 @@ __device__ __forceinline__ void set_spin_packed(
 // h_eff = h_i + sum_j(J_ij * x_j)
 // ==============================================================================
 
+#ifdef QUIP_GIBBS_SPILL
+// Both loads and stores use the same split, with one tail per block.
+struct GibbsState {
+    volatile signed char* prefix;
+    volatile signed char* spill;
+    int shared_spins;
+
+    __device__ __forceinline__ volatile signed char& operator[](int var) const {
+        return var < shared_spins ? prefix[var] : spill[var - shared_spins];
+    }
+};
+#endif
+
+#ifdef QUIP_GIBBS_DENSE
+#ifdef QUIP_GIBBS_COEF_F32
+typedef float field_t;
+#else
+typedef int field_t;
+#endif
+
+// Each block has 256 threads. Integer partials stay exact through both
+// reduction stages; only the final field converts for the probability.
+__device__ float compute_effective_field_dense(
+    int var, int N, GibbsState state,
+    const coef_t* matrix, GIBBS_OFFSET j_off,
+    const coef_t* fields, GIBBS_OFFSET h_off,
+    field_t* partials
+) {
+    field_t sum = 0;
+    for (int j = threadIdx.x; j < N; j += blockDim.x) {
+        sum += (field_t)__ldg(&matrix[j_off + (GIBBS_OFFSET)var * N + j])
+             * (int)state[j];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    if (lane == 0) partials[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? partials[lane] : 0;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        }
+        if (lane == 0) sum += (field_t)__ldg(&fields[h_off + var]);
+    }
+    // Only thread zero consumes the result. The update barrier protects
+    // partials and the new spin before the next node starts its reduction.
+    return (float)sum;
+}
+#else
 __device__ float compute_effective_field_shared(
     int var,
+#ifdef QUIP_GIBBS_SPILL
+    GibbsState shared_state,
+#else
     volatile signed char* shared_state,
+#endif
     const int* csr_row_ptr, int rp_off,
     const int* csr_col_ind, int ci_off,
-    const signed char* csr_J_vals, int j_off,
-    const signed char* h_vals, int h_off
+    const coef_t* csr_J_vals, GIBBS_OFFSET j_off,
+    const coef_t* h_vals, GIBBS_OFFSET h_off
 ) {
     int start = __ldg(&csr_row_ptr[rp_off + var]);
     int end = __ldg(&csr_row_ptr[rp_off + var + 1]);
 
+#ifdef QUIP_GIBBS_COEF_I32
+    // WIDE_MAX_FIELD bounds every integer partial sum below INT_MAX.
+    int h_eff = __ldg(&h_vals[h_off + var]);
+#else
     float h_eff = (float)__ldg(&h_vals[h_off + var]);
+#endif
 
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
         int neighbor = __ldg(&csr_col_ind[ci_off + p]);
+#ifdef QUIP_GIBBS_COEF_F32
+        float Jij = __ldg(&csr_J_vals[j_off + p]);
+#else
         int Jij = (int)__ldg(&csr_J_vals[j_off + p]);
+#endif
         int neighbor_spin = (int)shared_state[neighbor];
+#ifdef QUIP_GIBBS_COEF_I32
+        h_eff += Jij * neighbor_spin;
+#else
         h_eff += (float)(Jij * neighbor_spin);
+#endif
     }
 
+#ifdef QUIP_GIBBS_COEF_I32
+    return (float)h_eff;
+#else
     return h_eff;
+#endif
 }
+
+#endif
 
 // ==============================================================================
 // Gibbs update: P(spin = +1) = 1 / (1 + exp(2 * beta * h_eff))
@@ -158,7 +255,12 @@ __device__ __forceinline__ int gibbs_sample(
     float h_eff, float beta, Xoshiro128 &rng
 ) {
     float prob_plus =
+#ifdef QUIP_GIBBS_COEF_F32
+        // The admitted field keeps 2*h_eff finite; 2*beta need not fit.
+        1.0f / (1.0f + __expf((2.0f * h_eff) * beta));
+#else
         1.0f / (1.0f + __expf(2.0f * beta * h_eff));
+#endif
     unsigned int rand_val = xoshiro128ss(rng);
     float rand_norm = (float)rand_val / 4294967295.0f;
     return (rand_norm < prob_plus) ? 1 : -1;
@@ -211,9 +313,9 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
 
     // Per-slot flat buffers (stride: see below)
     // J: indexed by (nonce_id * 3 + slot_id) * nnz + p
-    signed char* slot_J_vals,
+    coef_t* slot_J_vals,
     // h: indexed by (nonce_id * 3 + slot_id) * N + var
-    signed char* slot_h_vals,
+    coef_t* slot_h_vals,
     // samples: indexed by (nonce_id * 3 + slot_id)
     //          * reads_per_nonce * max_packed_size
     //          + read_idx * max_packed_size
@@ -236,10 +338,26 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
     int reads_per_chunk,
     unsigned int base_seed,
     int update_mode
+#ifdef QUIP_GIBBS_SPILL
+    , signed char* spin_spill,
+    int gibbs_shared_spins
+#endif
 ) {
+#ifdef QUIP_GIBBS_SPILL
+    extern __shared__ signed char spin_prefix[];
+    GibbsState shared_state = {
+        spin_prefix,
+        spin_spill + (unsigned long long)blockIdx.x * (N - gibbs_shared_spins),
+        gibbs_shared_spins
+    };
+#else
     __shared__ signed char shared_state[QUIP_MAX_NODES];
+#endif
     __shared__ int s_chunk;
     __shared__ int s_arrival;
+#ifdef QUIP_GIBBS_DENSE
+    __shared__ field_t partials[8];
+#endif
 
     int nonce_id = blockIdx.x / blocks_per_nonce;
     if (nonce_id >= num_nonces) return;
@@ -336,12 +454,14 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
     // === Model loop: process models until no READY slot ===
     while (true) {
         // Compute buffer offsets for this slot
-        int slot_idx = nonce_id * 3 + active_slot;
-        int j_off = slot_idx * nnz;
-        int h_off = slot_idx * N;
-        int sample_base = slot_idx * reads_per_nonce
+        GIBBS_OFFSET slot_idx = nonce_id * 3 + active_slot;
+        GIBBS_OFFSET j_off = slot_idx * nnz;
+        GIBBS_OFFSET h_off = slot_idx * N;
+        GIBBS_OFFSET sample_base = slot_idx * reads_per_nonce
                           * max_packed_size;
+#ifndef QUIP_GIBBS_COEF_F32
         int energy_base = slot_idx * reads_per_nonce;
+#endif
 
         unsigned int seed =
             base_seed + (unsigned int)(nonce_id * 3
@@ -406,13 +526,23 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
                             int bcount = __ldg(
                                 &all_block_counts[
                                     color_base + color]);
+#ifdef QUIP_GIBBS_DENSE
+                            for (int i = 0; i < bcount; ++i) {
+#else
                             for (int i = threadIdx.x;
                                  i < bcount;
                                  i += blockDim.x) {
+#endif
                                 int var = __ldg(
                                     &all_color_nodes[
                                         bstart + i]);
 
+#ifdef QUIP_GIBBS_DENSE
+                                float h_eff = compute_effective_field_dense(
+                                    var, N, shared_state, slot_J_vals, j_off,
+                                    slot_h_vals, h_off, partials);
+                                if (threadIdx.x == 0) {
+#else
                                 float h_eff =
                                     compute_effective_field_shared(
                                         var,
@@ -424,6 +554,7 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
                                         slot_h_vals,
                                         h_off
                                     );
+#endif
 
                                 int new_spin;
                                 if (update_mode == 0) {
@@ -444,12 +575,19 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
                                 shared_state[var] =
                                     (signed char)
                                     new_spin;
+#ifdef QUIP_GIBBS_DENSE
+                                }
+                                __syncthreads();
+#endif
                             }
                             __syncthreads();
                         }
                     }
                 }
 
+                // Real energies are scored from the original f64 graph on
+                // the host. An integer output cannot represent them.
+#ifndef QUIP_GIBBS_COEF_F32
                 // Phase 3: Energy (warp reduction)
                 float thread_energy = 0.0f;
                 for (int var = threadIdx.x; var < N;
@@ -462,14 +600,23 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
                             h_off + var]
                         * (float)spin_i;
 
+#ifdef QUIP_GIBBS_DENSE
+                    int start = var * N;
+                    int end = start + N;
+#else
                     int start = __ldg(
                         &csr_row_ptr[var]);
                     int end = __ldg(
                         &csr_row_ptr[var + 1]);
+#endif
                     for (int p = start; p < end;
                          ++p) {
+#ifdef QUIP_GIBBS_DENSE
+                        int j = p - start;
+#else
                         int j = __ldg(
                             &csr_col_ind[p]);
+#endif
                         if (j > var) {
                             int Jij = (int)
                                 slot_J_vals[
@@ -501,6 +648,7 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
                 }
 
                 __syncthreads();
+#endif
 
                 // Phase 4: Bit-pack (thread 0)
                 if (threadIdx.x == 0) {

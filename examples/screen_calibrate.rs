@@ -165,6 +165,7 @@ fn full_solve(
                 result_tx,
                 CancelToken::default(),
                 &gov,
+                quip_solver_cuda::streaming::StallConfig::default(),
             );
         });
         let mut energies = vec![None; nonces.len()];

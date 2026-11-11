@@ -41,7 +41,10 @@
 //!     --out out/cuda-sa_n512_s1024.folded.jsonl
 //! ```
 
-use crate::capacity::{default_nodes, msa_device_reads, msa_max_nodes};
+use crate::capacity::{
+    default_nodes, max_model, msa_device_reads, msa_max_nodes, Connectivity, DeviceLimits,
+    Precision,
+};
 use crate::corpus;
 use crate::cuda_device::{CudaDevice, MsaLane};
 use crate::nsight;
@@ -114,6 +117,8 @@ pub enum BenchPrecision {
 }
 
 /// Arguments for `bench run`.
+///
+/// Each launch runs until the kernel finishes; a driver caps a run with a process-level timeout.
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
     /// MSA path (default: auto). Accepted only by the MSA kernel.
@@ -122,7 +127,7 @@ pub struct RunArgs {
     /// Coefficient tier (default: binary). Redraws fields and couplings at the selected precision.
     #[arg(long, value_enum)]
     pub precision: Option<BenchPrecision>,
-    /// Real-valued `.qmodel` file. Uses the MSA f32 coefficient path.
+    /// Real-valued `.qmodel` file. Uses the selected kernel's f32 coefficient path.
     #[arg(long, conflicts_with_all = ["source", "degree", "shuffle", "precision"])]
     pub model: Option<PathBuf>,
     /// Complete synthetic graph with N nodes and the selected precision.
@@ -144,8 +149,9 @@ pub struct RunArgs {
     /// count is used instead). Useful on its own for micro checks.
     #[arg(long, default_value_t = 64)]
     pub nodes: u64,
-    /// Neighbours per node of the synthetic circulant graph (even, at least 2).
+    /// Neighbours per node of the synthetic circulant graph (even, at least 2, below --nodes).
     /// Node i links to i+1 ..= i+degree/2 (mod n). The default 2 is a ring.
+    /// MSA uses dense storage above degree 62. SA and Gibbs route by memory footprint.
     #[arg(long, default_value_t = 2, conflicts_with = "source")]
     pub degree: u64,
     /// Relabel the synthetic graph's nodes by a seeded random permutation. The
@@ -390,11 +396,10 @@ fn circulant_graph(n: u64, degree: u64, shuffle: Option<[u8; 32]>) -> IsingGraph
 
 /// Refuse a synthetic `degree` the circulant cannot build on `nodes` nodes,
 /// before any edge is allocated: it must be even, at least 2, below `nodes`
-/// (else pairs repeat and self-loops appear), and within
-/// [`crate::capacity::MSA_MAX_DEGREE`]. SA and Gibbs declare no degree limit
-/// of their own, so the msa limit is the bench-wide cap.
+/// (else pairs repeat and self-loops appear). Each kernel's normal storage
+/// routing applies: MSA uses dense storage above [`crate::capacity::MSA_MAX_DEGREE`],
+/// while SA and Gibbs choose by memory footprint.
 fn check_degree(degree: u64, nodes: u64) -> Result<(), BenchError> {
-    let max = crate::capacity::MSA_MAX_DEGREE as u64;
     if degree < 2 || !degree.is_multiple_of(2) {
         return Err(BenchError::Args(format!(
             "--degree {degree} must be even and at least 2"
@@ -403,11 +408,6 @@ fn check_degree(degree: u64, nodes: u64) -> Result<(), BenchError> {
     if degree >= nodes {
         return Err(BenchError::Args(format!(
             "--degree {degree} must be below --nodes {nodes}"
-        )));
-    }
-    if degree > max {
-        return Err(BenchError::Args(format!(
-            "--degree {degree} exceeds the kernel limit of {max}"
         )));
     }
     Ok(())
@@ -693,6 +693,27 @@ fn check_reads(
     )))
 }
 
+/// Node cap for a bench run without `--max-nodes`, from this open's memory
+/// snapshot. MSA and Gibbs state grows with the read count, so a run below
+/// the full read width fits a larger graph than the miner, which advertises
+/// its cap at full width.
+fn default_bench_nodes(kernel: KernelKind, limits: &DeviceLimits, reads: u64) -> usize {
+    let reads = usize::try_from(reads).unwrap_or(usize::MAX);
+    match kernel {
+        KernelKind::Msa => msa_max_nodes(limits, reads),
+        KernelKind::Sa | KernelKind::Gibbs => {
+            max_model(
+                kernel,
+                Connectivity::Degree(0),
+                Precision::Binary,
+                reads,
+                limits,
+            )
+            .nodes
+        }
+    }
+}
+
 fn run_run(
     device_index: usize,
     kernel: KernelKind,
@@ -702,11 +723,6 @@ fn run_run(
     if args.msa_path.is_some() && kernel != KernelKind::Msa {
         return Err(BenchError::Args(
             "--msa-path requires the MSA kernel".into(),
-        ));
-    }
-    if uses_real(args) && kernel != KernelKind::Msa {
-        return Err(BenchError::Args(
-            "real coefficients require the MSA kernel".into(),
         ));
     }
     if args.msa_shared_spins.is_some() && kernel != KernelKind::Msa {
@@ -746,13 +762,11 @@ fn run_run(
             max_nodes.unwrap_or_else(|| default_nodes(kernel)),
         )
         .map_err(|e| BenchError::Device(e.to_string()))?;
-        if kernel == KernelKind::Msa && max_nodes.is_none() {
-            // MSA has no compiled node array. Use this open's memory snapshot,
-            // as the miner does when no lower cap was requested.
-            device.max_nodes = msa_max_nodes(&device.limits, msa_device_reads(&device.limits));
+        check_reads(kernel, args.reads, &device.limits)?;
+        if max_nodes.is_none() {
+            device.max_nodes = default_bench_nodes(kernel, &device.limits, args.reads);
         }
         device.msa_shared_spins_cap = args.msa_shared_spins;
-        check_reads(kernel, args.reads, &device.limits)?;
         let width = stream_width(&device, kernel);
         let nonces = usize::try_from(args.nonces).unwrap_or(usize::MAX);
         if nonces > width {
@@ -835,7 +849,7 @@ fn run_model(
     let plan = if real {
         float_plan(graph)
     } else {
-        bench_plan(ctx.device, graph, ctx.kernel, msa_lane)
+        bench_plan(graph, ctx.kernel, msa_lane)
     }
     .map_err(|e| BenchError::Device(e.to_string()))?;
     let (beta, sweeps_per_beta) = crate::streaming::build_beta_schedule(
@@ -988,8 +1002,8 @@ fn fold_per_sweep(args: &FoldArgs) -> Result<Option<u64>, BenchError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_record, check_degree, check_reads, circulant_graph, CellConfig, HostSpans,
-        SpanAggregator,
+        assemble_record, check_degree, check_reads, circulant_graph, default_bench_nodes,
+        msa_max_nodes, CellConfig, HostSpans, SpanAggregator,
     };
     use crate::schema::Scope;
     use crate::streaming::DeviceTimings;
@@ -1076,12 +1090,60 @@ mod tests {
         assert!(check_degree(3, 100).is_err(), "odd");
         assert!(check_degree(0, 100).is_err(), "zero");
         assert!(check_degree(100, 100).is_err(), "degree equals nodes");
-        assert!(check_degree(6, 6).is_err(), "degree above nodes");
-        assert!(check_degree(64, 1000).is_err(), "above the msa limit");
+        assert!(check_degree(8, 6).is_err(), "degree above nodes");
         assert!(check_degree(1_000_000, 200_000).is_err(), "huge");
         assert!(check_degree(40, 1000).is_ok());
         assert!(check_degree(62, 1000).is_ok());
         assert!(check_degree(2, 5).is_ok());
+    }
+
+    #[test]
+    fn synthetic_degrees_above_the_msa_sparse_limit_are_accepted() {
+        for degree in [64, 128, 256, 512, 1_024, 2_048, 4_096] {
+            assert!(check_degree(degree, 5_000).is_ok(), "degree {degree}");
+        }
+    }
+
+    #[test]
+    fn msa_bench_degree_sixty_four_plans_dense_storage() {
+        use crate::capacity::{route_storage, DeviceLimits, ModelShape, Precision, Storage};
+        use clap::Parser;
+
+        let args = RunCli::try_parse_from([
+            "bench", "--nodes", "5000", "--degree", "64", "--out", "/tmp/x",
+        ])
+        .unwrap()
+        .args;
+        let models = super::load_models(&args).unwrap();
+        let graph = &models[0].graph;
+        let topology = crate::topology::SelfFeedingTopology::build(graph);
+        let shape = ModelShape {
+            nodes: graph.num_nodes(),
+            couplers: graph.edges.len(),
+            max_degree: topology.max_degree(),
+        };
+        assert_eq!(shape.nodes, 5_000);
+        assert_eq!(shape.couplers, 160_000);
+        assert_eq!(shape.max_degree, 64);
+        let plan = crate::streaming::bench_plan(graph, KernelKind::Msa, None).unwrap();
+        let limits = DeviceLimits {
+            shared_bytes_per_block: 48 << 10,
+            shared_bytes_per_block_optin: 100 << 10,
+            free_bytes: 15usize << 30,
+            sm_count: 48,
+            threads_per_sm: 1536,
+        };
+        assert_eq!(
+            route_storage(
+                KernelKind::Msa,
+                shape,
+                Precision::from_plan(plan, true),
+                8,
+                64,
+                &limits,
+            ),
+            Storage::Dense,
+        );
     }
 
     #[test]
@@ -1415,6 +1477,39 @@ mod tests {
             err,
             "bench args: --reads 256 is outside 1..=128 for the msa kernel"
         );
+    }
+    #[test]
+    fn default_bench_nodes_follow_the_read_count() {
+        let limits = crate::capacity::DeviceLimits {
+            shared_bytes_per_block: 49_152,
+            shared_bytes_per_block_optin: 101_376,
+            free_bytes: 15 << 30,
+            sm_count: 48,
+            threads_per_sm: 1536,
+        };
+        let full = default_bench_nodes(KernelKind::Msa, &limits, 128);
+        let half = default_bench_nodes(KernelKind::Msa, &limits, 64);
+        assert_eq!(full, msa_max_nodes(&limits, 128));
+        assert_eq!(half, msa_max_nodes(&limits, 64));
+        assert!(
+            half > full,
+            "64 reads hold one spin word, so N must grow: {half} <= {full}"
+        );
+        for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
+            assert_eq!(
+                default_bench_nodes(kernel, &limits, 256),
+                crate::capacity::advertised_nodes(kernel, usize::MAX, Some(&limits)),
+                "{kernel:?} at full width matches the miner"
+            );
+        }
+        // SA sizes its state at full block width whatever the read count.
+        assert_eq!(
+            default_bench_nodes(KernelKind::Sa, &limits, 64),
+            default_bench_nodes(KernelKind::Sa, &limits, 256)
+        );
+        let full = default_bench_nodes(KernelKind::Gibbs, &limits, 256);
+        let quarter = default_bench_nodes(KernelKind::Gibbs, &limits, 64);
+        assert!(quarter > full, "gibbs: {quarter} <= {full}");
     }
     #[test]
     fn check_reads_uses_turing_device_limit() {

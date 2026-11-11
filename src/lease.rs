@@ -366,6 +366,7 @@ fn run_full_batch(
             out_tx,
             cancel.clone(),
             &sampler.gov,
+            sampler.stall,
         );
         drop(session_done);
         watcher
@@ -501,7 +502,12 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let device = crate::cuda_device::CudaDevice::open(0).unwrap();
         let gov = crate::nvml_gov::UtilGovernor::start(&device.pci_bus_id, 100, false);
-        let sampler = CudaSampler::new(device, gov, KernelKind::Msa);
+        let sampler = CudaSampler::new(
+            device,
+            gov,
+            KernelKind::Msa,
+            crate::streaming::StallConfig::default(),
+        );
         let count = sampler.stream_width() * 3;
         let (jobs, incoming) = channel(count);
         let n = 1024;

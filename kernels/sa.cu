@@ -16,6 +16,12 @@
 // through NVRTC as -D QUIP_MAX_NODES=<n>; the default matches the historical
 // fixed size so a plain compile is unchanged. This array is per thread, so
 // raising it multiplies the local-memory footprint by the thread count.
+#ifdef QUIP_SA_DENSE
+#ifndef QUIP_SA_GLOBAL_STATE
+#define QUIP_SA_GLOBAL_STATE
+#endif
+#endif
+
 #ifndef QUIP_MAX_NODES
 #define QUIP_MAX_NODES 5000
 #endif
@@ -64,8 +70,22 @@
 // below names the type the line used before. -DQUIP_SA_WIDE builds the
 // exact fixed-point fallback (src/coefficients.rs, src/accept_table.rs):
 // i32 coefficients and delta, and an integer-only Metropolis test.
-#ifdef QUIP_SA_WIDE
+#ifdef QUIP_SA_COEF_I8_DELTA_I32
+#define QUIP_SA_WIDE
+#endif
+#if defined(QUIP_SA_COEF_F32) && defined(QUIP_SA_WIDE)
+#error "SA float and integer coefficient defines are mutually exclusive"
+#endif
+#ifdef QUIP_SA_COEF_F32
+typedef float coef_t;
+typedef float delta_t;
+typedef float energy_t;
+#elif defined(QUIP_SA_WIDE)
+#ifdef QUIP_SA_COEF_I8_DELTA_I32
+typedef signed char coef_t;
+#else
 typedef int coef_t;
+#endif
 typedef int delta_t;
 typedef long long energy_t;
 #define NEGLOG_MASK 65535
@@ -74,7 +94,7 @@ typedef signed char coef_t;
 typedef signed char delta_t;
 typedef int energy_t;
 #endif
-#ifdef QUIP_SA_WIDE
+#if defined(QUIP_SA_WIDE) && !defined(QUIP_SA_COEF_I8_DELTA_I32)
 static_assert(sizeof(coef_t) == 4, "wide build uses i32 coefficients");
 #endif
 
@@ -114,24 +134,52 @@ __device__ delta_t get_flip_energy_unpacked(
     const coef_t* csr_J_vals,
     int n,
     const coef_t* h
+#ifdef QUIP_SA_GLOBAL_STATE
+    , int total_threads, int global_tid
+#endif
 ) {
+#ifdef QUIP_SA_DENSE
+    const int start = var * n;
+    const int end = start + n;
+#else
     const int start = __ldg(&csr_row_ptr[var]);
     const int end = __ldg(&csr_row_ptr[var + 1]);
+#endif
 
+#ifdef QUIP_SA_COEF_F32
+    float energy = 0;
+#else
     int energy = 0;
+#endif
 
     if (h != NULL) {
+#ifdef QUIP_SA_COEF_F32
+        energy += __ldg(&h[var]);
+#else
         energy += (int)__ldg(&h[var]);
+#endif
     }
 
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
+#ifdef QUIP_SA_DENSE
+        const int neighbor = p - start;
+#else
         const int neighbor = __ldg(&csr_col_ind[p]);
+#endif
         const coef_t Jij = __ldg(&csr_J_vals[p]);
+#ifdef QUIP_SA_GLOBAL_STATE
+        energy += unpacked_state[(long long)neighbor * total_threads + global_tid] * Jij;
+#else
         energy += unpacked_state[neighbor] * Jij;
+#endif
     }
 
+#ifdef QUIP_SA_GLOBAL_STATE
+    return (delta_t)(-2 * unpacked_state[(long long)var * total_threads + global_tid] * energy);
+#else
     return (delta_t)(-2 * unpacked_state[var] * energy);
+#endif
 }
 
 
@@ -169,9 +217,12 @@ __global__ void cuda_sa_self_feeding(
     int max_packed_size,
     unsigned int base_seed,
 
-    // Workspace (per global thread)
+    // Workspace (per global thread, interleaved in the global instantiation)
     delta_t* delta_energy_workspace,
     int max_N
+#ifdef QUIP_SA_GLOBAL_STATE
+    , signed char* state_workspace
+#endif
 #ifdef QUIP_SA_WIDE
     , const long long* __restrict__ beta_fixed
     , const int* __restrict__ delta_cut
@@ -241,8 +292,12 @@ __global__ void cuda_sa_self_feeding(
             (long long)slot_idx * nnz];
         const coef_t* my_h = &slot_h_vals[
             (long long)slot_idx * N];
+#ifdef QUIP_SA_GLOBAL_STATE
+        long long sample_base = (long long)slot_idx * num_reads * max_packed_size;
+#else
         int sample_base = slot_idx * num_reads
                           * max_packed_size;
+#endif
         int energy_base = slot_idx * num_reads;
 
         unsigned int slot_seed =
@@ -257,14 +312,23 @@ __global__ void cuda_sa_self_feeding(
         if (tid < num_reads) {
             int packed_size = (N + 7) / 8;
 
-            // Thread-local state
+            // Mining-size local state or interleaved global state
+#ifdef QUIP_SA_GLOBAL_STATE
+            signed char* unpacked_state = state_workspace;
+            int total_threads = num_nonces * blockDim.x;
+#else
             signed char unpacked_state[QUIP_MAX_NODES];
+#endif
 
             // Delta energy workspace (unique per global thread)
             int global_tid = blockIdx.x * blockDim.x + tid;
+#ifdef QUIP_SA_GLOBAL_STATE
+            delta_t* delta_energy = delta_energy_workspace;
+#else
             delta_t* delta_energy =
                 &delta_energy_workspace[
                     (long long)global_tid * max_N];
+#endif
 
             // Init RNG (unique per thread + slot)
             unsigned int rng_state =
@@ -274,38 +338,71 @@ __global__ void cuda_sa_self_feeding(
             // Random initial state
             for (int var = 0; var < N; var++) {
                 unsigned int r = xorshift32(rng_state);
+#ifdef QUIP_SA_GLOBAL_STATE
+                unpacked_state[(long long)var * total_threads + global_tid] =
+#else
                 unpacked_state[var] =
+#endif
                     (r & 1) ? (signed char)-1
                             : (signed char)1;
             }
 
             // Build initial delta_energy including h
             for (int var = 0; var < N; var++) {
+#ifdef QUIP_SA_GLOBAL_STATE
+                delta_energy[(long long)var * total_threads + global_tid] =
+#else
                 delta_energy[var] =
+#endif
                     get_flip_energy_unpacked(
                         var, unpacked_state,
                         csr_row_ptr, csr_col_ind,
+#ifdef QUIP_SA_GLOBAL_STATE
+                        my_J, N, my_h, total_threads, global_tid);
+#else
                         my_J, N, my_h);
+#endif
             }
 
             // Initial energy (h + J terms)
             energy_t current_energy = 0;
             for (int i = 0; i < N; i++) {
+#ifdef QUIP_SA_GLOBAL_STATE
+                signed char spin_i = unpacked_state[(long long)i * total_threads + global_tid];
+#else
                 signed char spin_i = unpacked_state[i];
+#endif
                 current_energy +=
+#ifdef QUIP_SA_COEF_F32
+                    __ldg(&my_h[i]) * spin_i;
+#else
                     (int)__ldg(&my_h[i]) * spin_i;
+#endif
+#ifdef QUIP_SA_DENSE
+                const int start = i * N;
+                const int end = start + N;
+#else
                 const int start =
                     __ldg(&csr_row_ptr[i]);
                 const int end =
                     __ldg(&csr_row_ptr[i + 1]);
+#endif
                 for (int p = start; p < end; ++p) {
+#ifdef QUIP_SA_DENSE
+                    const int j = p - start;
+#else
                     const int j =
                         __ldg(&csr_col_ind[p]);
+#endif
                     if (j > i) {
                         const coef_t Jij =
                             __ldg(&my_J[p]);
                         const signed char spin_j =
+#ifdef QUIP_SA_GLOBAL_STATE
+                            unpacked_state[(long long)j * total_threads + global_tid];
+#else
                             unpacked_state[j];
+#endif
                         current_energy +=
                             Jij * spin_i * spin_j;
                     }
@@ -329,7 +426,9 @@ __global__ void cuda_sa_self_feeding(
 #else
                 float beta = __ldg(
                     &beta_schedule[beta_idx]);
+#ifndef QUIP_SA_COEF_F32
                 float threshold = 22.18f / beta;
+#endif
 #endif
 
                 for (int sweep = 0;
@@ -337,7 +436,11 @@ __global__ void cuda_sa_self_feeding(
                      sweep++) {
                     for (int var = 0; var < N; var++) {
                         delta_t de =
+#ifdef QUIP_SA_GLOBAL_STATE
+                            delta_energy[(long long)var * total_threads + global_tid];
+#else
                             delta_energy[var];
+#endif
 
 #ifdef QUIP_SA_WIDE
                         if (de > rung_cut) {
@@ -351,6 +454,15 @@ __global__ void cuda_sa_self_feeding(
                             flip_spin =
                                 (long long)de * rung_beta
                                 < __ldg(&neglog_table[r & NEGLOG_MASK]);
+                        }
+#elif defined(QUIP_SA_COEF_F32)
+                        // Match the real MSA acceptance with this thread's draw.
+                        // 23 bits keep k + 0.5f exact and the uniform below 1.
+                        bool flip_spin = de <= 0;
+                        if (!flip_spin) {
+                            const unsigned int draw = xorshift32(rng_state);
+                            const float u = ((float)(draw >> 9) + 0.5f) * 1.1920929e-7f;
+                            flip_spin = u < __expf(-beta * de);
                         }
 #else
                         if (de >= threshold) {
@@ -381,11 +493,19 @@ __global__ void cuda_sa_self_feeding(
 
                             const signed char
                                 var_spin =
+#ifdef QUIP_SA_GLOBAL_STATE
+                                    unpacked_state[(long long)var * total_threads + global_tid];
+#else
                                     unpacked_state[
                                         var];
+#endif
                             const signed char
                                 multiplier =
                                     4 * var_spin;
+#ifdef QUIP_SA_DENSE
+                            const int start = var * N;
+                            const int end = start + N;
+#else
                             const int start =
                                 __ldg(
                                     &csr_row_ptr[
@@ -394,28 +514,61 @@ __global__ void cuda_sa_self_feeding(
                                 __ldg(
                                     &csr_row_ptr[
                                         var + 1]);
+#endif
                             for (int p = start;
                                  p < end; ++p) {
+#ifdef QUIP_SA_DENSE
+                                const int neighbor = p - start;
+                                if (neighbor == var) continue;
+#else
                                 const int neighbor =
                                     __ldg(
                                         &csr_col_ind[
                                             p]);
+#endif
                                 const coef_t
                                     Jij = __ldg(
                                         &my_J[p]);
                                 const signed char
                                     ns =
+#ifdef QUIP_SA_GLOBAL_STATE
+                                        unpacked_state[(long long)neighbor * total_threads + global_tid];
+#else
                                         unpacked_state[
                                             neighbor];
+#endif
+#ifdef QUIP_SA_COEF_F32
+                                delta_t* neighbor_delta = &delta_energy[
+#ifdef QUIP_SA_GLOBAL_STATE
+                                    (long long)neighbor * total_threads + global_tid];
+#else
+                                    neighbor];
+#endif
+                                // 4*J may overflow even when the updated delta fits.
+                                *neighbor_delta = fmaf((float)(multiplier * ns), Jij, *neighbor_delta);
+#else
+#ifdef QUIP_SA_GLOBAL_STATE
+                                delta_energy[(long long)neighbor * total_threads + global_tid] +=
+#else
                                 delta_energy[
                                     neighbor] +=
+#endif
                                     multiplier
                                     * Jij * ns;
+#endif
                             }
 
+#ifdef QUIP_SA_GLOBAL_STATE
+                            unpacked_state[(long long)var * total_threads + global_tid] =
+#else
                             unpacked_state[var] =
+#endif
                                 -var_spin;
+#ifdef QUIP_SA_GLOBAL_STATE
+                            delta_energy[(long long)var * total_threads + global_tid] = -de;
+#else
                             delta_energy[var] = -de;
+#endif
                         }
                     }
                 }
@@ -428,6 +581,19 @@ __global__ void cuda_sa_self_feeding(
                 // as `unpacked_state` it packs: a fixed size here would be
                 // overrun by any N above `size * 8`, and the two must not
                 // drift apart.
+#ifdef QUIP_SA_GLOBAL_STATE
+                signed char* out_sample = &slot_samples[
+                    sample_base + (long long)tid * max_packed_size];
+                for (int b = 0; b < packed_size; b++) {
+                    unsigned char packed = 0;
+                    for (int bit = 0; bit < 8 && b * 8 + bit < N; bit++) {
+                        if (unpacked_state[(long long)(b * 8 + bit) * total_threads + global_tid] < 0)
+                            packed |= 1u << bit;
+                    }
+                    out_sample[b] = (signed char)packed;
+                }
+
+#else
                 signed char packed_state[(QUIP_MAX_NODES + 7) / 8];
                 for (int b = 0; b < packed_size; b++)
                     packed_state[b] = 0;
@@ -445,6 +611,7 @@ __global__ void cuda_sa_self_feeding(
                 for (int b = 0; b < packed_size; b++)
                     out_sample[b] = packed_state[b];
 
+#endif
                 // Write energy to output
                 slot_energies[energy_base + tid] =
                     (int)current_energy;

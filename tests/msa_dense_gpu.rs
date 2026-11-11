@@ -1,7 +1,7 @@
 //! Dense MSA correctness and cancellation on a real GPU.
 
 use quip_solver_core::{CancelToken, StreamJob, StreamOutcome, StreamResult};
-use quip_solver_cuda::capacity::{msa_device_reads, MsaStorage, Precision};
+use quip_solver_cuda::capacity::{msa_device_reads, Precision, Storage};
 use quip_solver_cuda::coefficients::{self, CoefficientPath};
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::nvml_gov::UtilGovernor;
@@ -35,7 +35,7 @@ fn sample_one_real(
     graph: &IsingGraph,
     params: &SampleParams,
 ) -> Result<quip_solver_cuda::SampleSet, quip_solver_cuda::sampler::SampleError> {
-    sample_one_real_forced(device, graph, params, MsaStorage::Dense)
+    sample_one_real_forced(device, graph, params, Storage::Dense)
 }
 
 fn sample_one(
@@ -103,13 +103,25 @@ fn ground_energy(graph: &IsingGraph) -> i64 {
     best
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
 fn dense_unit_finds_brute_force_ground_state() {
+    unit_ground_states(20, 10);
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_unit_finds_brute_force_ground_state_ci() {
+    unit_ground_states(16, 2);
+}
+
+fn unit_ground_states(nodes: usize, seeds: u64) {
     let device = open();
-    for seed in 1..=10 {
-        let graph = sk(20, seed);
+    for seed in 1..=seeds {
+        let graph = sk(nodes, seed);
         let ground = ground_energy(&graph);
         let reads = sample_one(&device, &graph, &params(&device, 4_096), KernelKind::Msa).unwrap();
         assert_eq!(reads.len(), msa_device_reads(&device.limits));
@@ -189,6 +201,7 @@ fn dense_cancel_aborts() {
                 res_tx,
                 driver_cancel,
                 gov_ref,
+                quip_solver_cuda::streaming::StallConfig::default(),
             );
         });
         job_tx
@@ -267,6 +280,7 @@ fn dense_stream_rotates_slots_with_distinct_matrices() {
         res_tx,
         CancelToken::default(),
         &gov,
+        quip_solver_cuda::streaming::StallConfig::default(),
     );
     let mut seen = vec![false; total];
     while let Some(result) = res_rx.blocking_recv() {
@@ -349,7 +363,7 @@ fn weighted_graph(n: usize, mut seed: u64, path: CoefficientPath) -> IsingGraph 
     let graph = IsingGraph::new(h, j, edges);
     if path != CoefficientPath::Float32 {
         assert_eq!(
-            coefficients::plan(KernelKind::Msa, &graph, n).unwrap().path,
+            coefficients::plan(KernelKind::Msa, &graph).unwrap().path,
             path
         );
     }
@@ -401,10 +415,10 @@ fn ground_real_energy(graph: &IsingGraph) -> f64 {
     scored
 }
 
-fn weighted_ground_states(path: CoefficientPath) {
+fn weighted_ground_states(path: CoefficientPath, nodes: usize, seeds: u64) {
     let device = open();
-    for seed in 1..=10 {
-        let graph = weighted_graph(20, seed, path);
+    for seed in 1..=seeds {
+        let graph = weighted_graph(nodes, seed, path);
         if path == CoefficientPath::Float32 {
             let ground = ground_real_energy(&graph);
             let reads = sample_one_real(&device, &graph, &params(&device, 4_096)).unwrap();
@@ -428,28 +442,30 @@ fn weighted_ground_states(path: CoefficientPath) {
     }
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
 fn dense_int8_finds_brute_force_ground_state() {
-    weighted_ground_states(CoefficientPath::WeightedInt8);
+    weighted_ground_states(CoefficientPath::WeightedInt8, 20, 10);
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
 fn dense_i32_finds_brute_force_ground_state() {
-    weighted_ground_states(CoefficientPath::Wide);
+    weighted_ground_states(CoefficientPath::Wide, 20, 10);
 }
 
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
 fn dense_f32_real_finds_brute_force_ground_state() {
-    weighted_ground_states(CoefficientPath::Float32);
+    weighted_ground_states(CoefficientPath::Float32, 20, 10);
 }
 
-fn check_weighted_energies(device: &CudaDevice, graph: &IsingGraph, storage: MsaStorage) {
+fn check_weighted_energies(device: &CudaDevice, graph: &IsingGraph, storage: Storage) {
     let reads = sample_one_real_forced(device, graph, &params(device, 64), storage).unwrap();
     assert_eq!(reads.len(), msa_device_reads(&device.limits));
     for read in reads {
@@ -469,7 +485,7 @@ fn dense_weighted_energies_match_host() {
         CoefficientPath::Wide,
         CoefficientPath::Float32,
     ] {
-        check_weighted_energies(&device, &weighted_graph(500, 99, path), MsaStorage::Dense);
+        check_weighted_energies(&device, &weighted_graph(500, 99, path), Storage::Dense);
     }
 }
 
@@ -485,8 +501,8 @@ fn dense_and_sparse_weighted_energies_match_host() {
         CoefficientPath::Float32,
     ] {
         let graph = weighted_graph(20, 99, path);
-        check_weighted_energies(&sparse, &graph, MsaStorage::Sparse);
-        check_weighted_energies(&dense, &graph, MsaStorage::Dense);
+        check_weighted_energies(&sparse, &graph, Storage::Sparse);
+        check_weighted_energies(&dense, &graph, Storage::Dense);
     }
 }
 
@@ -494,6 +510,18 @@ fn dense_and_sparse_weighted_energies_match_host() {
 #[serial]
 #[ignore = "requires a CUDA GPU"]
 fn dense_weighted_planted_mattis_multi_tile() {
+    dense_weighted_planted_mattis_multi_tile_case(64);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_weighted_planted_mattis_multi_tile_long() {
+    dense_weighted_planted_mattis_multi_tile_case(1024);
+}
+
+fn dense_weighted_planted_mattis_multi_tile_case(sweeps: usize) {
     let device = open();
     let n = 600;
     for precision in [Precision::Int8, Precision::Int32, Precision::Float32] {
@@ -521,13 +549,13 @@ fn dense_weighted_planted_mattis_multi_tile() {
         }
         let graph = IsingGraph::new(vec![0.0; n], j, edges);
         if precision != Precision::Float32 {
-            let plan = coefficients::plan(KernelKind::Msa, &graph, device.max_nodes).unwrap();
+            let plan = coefficients::plan(KernelKind::Msa, &graph).unwrap();
             assert_eq!(Precision::from_plan(plan, false), precision);
         }
         let reads =
-            sample_one_real_forced(&device, &graph, &params(&device, 1_024), MsaStorage::Dense)
+            sample_one_real_forced(&device, &graph, &params(&device, sweeps), Storage::Dense)
                 .unwrap();
-        assert_eq!(last_storage(&device), Some(MsaStorage::Dense));
+        assert_eq!(last_storage(&device), Some(Storage::Dense));
         if precision == Precision::Float32 {
             let ground = -graph.j.iter().map(|v| v.abs()).sum::<f64>();
             assert!(
@@ -553,6 +581,20 @@ fn dense_weighted_planted_mattis_multi_tile() {
             );
         }
     }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_int8_finds_brute_force_ground_state_ci() {
+    weighted_ground_states(CoefficientPath::WeightedInt8, 16, 2);
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_i32_finds_brute_force_ground_state_ci() {
+    weighted_ground_states(CoefficientPath::Wide, 16, 2);
 }
 
 // QUI-1596: CPU MSA shares one acceptance draw across lanes, and on a dense

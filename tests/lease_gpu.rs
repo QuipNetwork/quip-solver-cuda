@@ -120,12 +120,23 @@ async fn an_easy_target_and_a_lease_only_session_report_every_salt() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires CUDA device 0"]
 async fn a_target_change_during_a_lease_applies_to_later_chunks() {
+    a_target_change_during_a_lease_applies_to_later_chunks_case(512, 256).await;
+}
+
+#[cfg(feature = "long-tests")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires CUDA device 0"]
+async fn a_target_change_during_a_lease_applies_to_later_chunks_long() {
+    a_target_change_during_a_lease_applies_to_later_chunks_case(1024, 1024).await;
+}
+
+async fn a_target_change_during_a_lease_applies_to_later_chunks_case(nodes: u32, salt_count: u64) {
     let mut s = start("[screen]\naudit_denominator = 0\nprobe_sweeps = 2048").await;
-    let (topology, view) = ring(1024, RING_A);
+    let (topology, view) = ring(nodes, RING_A);
     s.send(coord_msg::Msg::Topology(topology)).await;
     s.send(coord_msg::Msg::SetTarget(target(i64::MIN, 32)))
         .await;
-    let job = lease(b"live-target", 3, RING_A, 0, 1024);
+    let job = lease(b"live-target", 3, RING_A, 0, salt_count);
     let spec = generator(&job);
     s.send(coord_msg::Msg::Job(job)).await;
     // The initial probe budget is 88 salts at 2048 sweeps. Those warm-up
@@ -135,7 +146,7 @@ async fn a_target_change_during_a_lease_applies_to_later_chunks() {
     s.send(coord_msg::Msg::SetTarget(target(i64::MAX, 32)))
         .await;
     finish(&mut s, b"live-target").await;
-    verify(&s, b"live-target", &spec, &view, 1024);
+    verify(&s, b"live-target", &spec, &view, salt_count);
     let salts: HashSet<_> = s
         .log
         .results_for(b"live-target")
@@ -147,7 +158,7 @@ async fn a_target_change_during_a_lease_applies_to_later_chunks() {
         "unreachable warm-up chunk returns no reads"
     );
     assert!(
-        (896..1024).all(|salt| salts.contains(&salt)),
+        (salt_count - 128..salt_count).all(|salt| salts.contains(&salt)),
         "easy target keeps every salt in later chunks"
     );
     assert_eq!(s.shutdown(2000).await, 0);

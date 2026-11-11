@@ -1,11 +1,8 @@
 //! Node-capacity policy for the self-feeding kernels.
 //!
-//! The sa and gibbs kernels size their state arrays from a `QUIP_MAX_NODES`
-//! macro that `cuda_device` supplies at NVRTC compile time. The msa kernel
-//! keeps its hot spin state in dynamic shared memory sized per launch and
-//! spills the rest to a global buffer. This module
-//! owns every bound on those values so the binaries, the device, and the
-//! backend identities cannot disagree.
+//! SA uses its fixed local frame through 5000 nodes and global state above it.
+//! Gibbs and MSA keep hot spins in shared memory and spill the rest.
+//! Footprints bound session allocations before device buffers are built.
 
 use crate::coefficients::{CoefficientPath, CoefficientPlan};
 use crate::kernel::KernelKind;
@@ -15,42 +12,32 @@ use thiserror::Error;
 /// smaller array saves nothing measurable and only narrows what runs.
 pub const SA_DEFAULT_NODES: usize = 5000;
 
-/// CUDA's hard cap on per-thread local memory. The SA stack frame lives
-/// here, so it bounds SA regardless of how much device memory is free.
-pub const LOCAL_MEM_BYTES_PER_THREAD: usize = 512 * 1024;
-
 /// Threads per block the SA kernel launches, and so the multiplier on its
 /// per-thread `delta_energy` workspace. Mirrors `total_threads` in
 /// `streaming::build_algo_state`.
 pub const SA_THREADS_PER_NONCE: usize = 256;
 
-/// Bytes per node per thread of the wide SA `delta_energy` workspace (`int`).
-pub const SA_WIDE_DELTA_BYTES: usize = 4;
-
 /// Fraction of free device memory the capacity derivation will spend, as
 /// numerator over denominator.
 ///
-/// The model below covers the two allocations that scale with node count and
-/// dominate at large N. It does not model the topology, sample and energy
-/// buffers, nor the driver's own rounding of the local-memory reservation, so
-/// the headroom absorbs them. The driver's `CUDA_ERROR_OUT_OF_MEMORY` is the
-/// real backstop; this only keeps a reasonable request from reaching it.
+/// Headroom leaves room for driver allocations and other device users beyond
+/// the session buffers and the explicit pool allowance.
 pub const MEMORY_HEADROOM_NUM: usize = 4;
 /// See [`MEMORY_HEADROOM_NUM`].
 pub const MEMORY_HEADROOM_DEN: usize = 5;
 
 /// Session allowance for CUDA pool growth and allocation overhead.
-const MSA_POOL_ALLOWANCE_BYTES: usize = 32 << 20;
+const POOL_ALLOWANCE_BYTES: usize = 32 << 20;
 
 /// Device facts the capacity derivation needs, read once at open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceLimits {
-    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK`. Bounds Gibbs.
+    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK`.
     pub shared_bytes_per_block: usize,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`. Bounds msa,
+    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`. Bounds the prefix,
     /// whose block opts in to more than the default per-block limit.
     pub shared_bytes_per_block_optin: usize,
-    /// Free device memory at open, from `cuMemGetInfo`. Bounds SA.
+    /// Free device memory at open, from `cuMemGetInfo`. Bounds session buffers.
     pub free_bytes: usize,
     /// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
     pub sm_count: usize,
@@ -100,9 +87,9 @@ impl Precision {
     }
 }
 
-/// Device representation of the MSA coupling matrix.
+/// Device representation of the coupling matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MsaStorage {
+pub enum Storage {
     /// Two directed CSR entries per undirected coupling.
     Sparse,
     /// Row-major dense matrix storage.
@@ -141,6 +128,75 @@ impl Footprint {
     }
 }
 
+/// Device allocation estimate for the selected kernel at full width.
+#[must_use]
+pub fn footprint(
+    kernel: KernelKind,
+    shape: ModelShape,
+    precision: Precision,
+    storage: Storage,
+    reads: usize,
+    betas: usize,
+    limits: &DeviceLimits,
+) -> Footprint {
+    match kernel {
+        KernelKind::Msa => msa_footprint(shape, precision, storage, reads, betas, limits),
+        KernelKind::Sa => sa_footprint(shape, precision, storage, reads, betas, limits),
+        KernelKind::Gibbs => gibbs_footprint(shape, precision, storage, reads, betas, limits),
+    }
+}
+
+/// Storage selected for a model. MSA uses dense storage above degree 62.
+/// SA and Gibbs choose the smaller footprint.
+#[must_use]
+pub fn route_storage(
+    kernel: KernelKind,
+    shape: ModelShape,
+    precision: Precision,
+    reads: usize,
+    betas: usize,
+    limits: &DeviceLimits,
+) -> Storage {
+    match kernel {
+        KernelKind::Msa if shape.max_degree > MSA_MAX_DEGREE => Storage::Dense,
+        KernelKind::Sa | KernelKind::Gibbs => {
+            let dense = footprint(
+                kernel,
+                shape,
+                precision,
+                Storage::Dense,
+                reads,
+                betas,
+                limits,
+            );
+            let sparse = footprint(
+                kernel,
+                shape,
+                precision,
+                Storage::Sparse,
+                reads,
+                betas,
+                limits,
+            );
+            if dense.total() <= sparse.total() {
+                Storage::Dense
+            } else {
+                Storage::Sparse
+            }
+        }
+        KernelKind::Msa => Storage::Sparse,
+    }
+}
+
+/// Read cap for the selected kernel on this device.
+#[must_use]
+pub fn max_reads(kernel: KernelKind, limits: &DeviceLimits) -> usize {
+    match kernel {
+        KernelKind::Msa => msa_device_reads(limits),
+        KernelKind::Sa | KernelKind::Gibbs => 256,
+    }
+}
+
 /// Device allocation estimate for MSA sessions at full width.
 ///
 /// CSR and colour tables, beta schedules and integer acceptance tables are
@@ -158,7 +214,7 @@ impl Footprint {
 pub fn msa_footprint(
     shape: ModelShape,
     precision: Precision,
-    storage: MsaStorage,
+    storage: Storage,
     reads: usize,
     betas: usize,
     limits: &DeviceLimits,
@@ -170,14 +226,14 @@ pub fn msa_footprint(
 pub(crate) fn msa_footprint_with_shared_cap(
     shape: ModelShape,
     precision: Precision,
-    storage: MsaStorage,
+    storage: Storage,
     reads: usize,
     betas: usize,
     limits: &DeviceLimits,
     shared_cap: Option<usize>,
 ) -> Footprint {
     let count = instances(KernelKind::Msa, limits.sm_count);
-    if storage == MsaStorage::Dense {
+    if storage == Storage::Dense {
         let coefficient_bytes = match precision {
             Precision::Binary | Precision::Int8 => 1,
             Precision::Int32 | Precision::Float32 => 4,
@@ -186,7 +242,7 @@ pub(crate) fn msa_footprint_with_shared_cap(
             .max(1)
             .saturating_mul(4)
             .saturating_add(8)
-            .saturating_add(MSA_POOL_ALLOWANCE_BYTES);
+            .saturating_add(POOL_ALLOWANCE_BYTES);
         if precision == Precision::Int8 || precision == Precision::Int32 {
             shared_bytes = shared_bytes
                 .saturating_add(betas.max(1).saturating_mul(12))
@@ -229,7 +285,7 @@ pub(crate) fn msa_footprint_with_shared_cap(
         .saturating_add(n.max(1)) // colour nodes
         .saturating_mul(4)
         .saturating_add(betas.saturating_mul(4)) // d_beta
-        .saturating_add(MSA_POOL_ALLOWANCE_BYTES);
+        .saturating_add(POOL_ALLOWANCE_BYTES);
     let coefficient_bytes = match precision {
         Precision::Binary | Precision::Int8 => 1,
         Precision::Int32 | Precision::Float32 => 4,
@@ -268,105 +324,180 @@ pub(crate) fn msa_footprint_with_shared_cap(
     }
 }
 
+/// SA session allocation bound at full launch width.
+/// Output slots are bounded at 256 reads regardless of the requested count.
+/// Global spins and deltas use one element per launched thread and node.
+/// Sparse mining frames are reserved at resident-thread occupancy.
+/// Dense sessions always use global state.
+#[must_use]
+pub fn sa_footprint(
+    shape: ModelShape,
+    precision: Precision,
+    storage: Storage,
+    _reads: usize,
+    betas: usize,
+    limits: &DeviceLimits,
+) -> Footprint {
+    let n = shape.nodes;
+    let nnz = match storage {
+        Storage::Sparse => shape.couplers.saturating_mul(2).max(1),
+        Storage::Dense => n.saturating_mul(n).max(1),
+    };
+    let coef_bytes = match precision {
+        Precision::Binary | Precision::Int8 => 1,
+        Precision::Int32 | Precision::Float32 => 4,
+    };
+    let topology_bytes = match storage {
+        Storage::Sparse => n.saturating_add(1).saturating_add(nnz).saturating_mul(4),
+        Storage::Dense => 8, // Empty CSR arrays each retain one i32 stand-in.
+    };
+    let mut shared = topology_bytes
+        .saturating_add(betas.max(1).saturating_mul(4))
+        .saturating_add(POOL_ALLOWANCE_BYTES);
+    // Unit fields can add one to the degree. Above 62, reserve the i32
+    // delta path even when every coupling is binary.
+    let wide_binary = precision == Precision::Binary && shape.max_degree > 62;
+    let delta_bytes = if precision == Precision::Binary && !wide_binary {
+        1
+    } else {
+        4
+    };
+    if precision == Precision::Int8 || precision == Precision::Int32 || wide_binary {
+        shared = shared
+            .saturating_add(betas.max(1).saturating_mul(12))
+            .saturating_add(crate::accept_table::NEGLOG_LEN * 8);
+    }
+    if storage == Storage::Sparse && n <= SA_DEFAULT_NODES {
+        shared = shared.saturating_add(
+            (SA_DEFAULT_NODES + SA_DEFAULT_NODES.div_ceil(8))
+                .saturating_mul(limits.threads_per_sm)
+                .saturating_mul(limits.sm_count),
+        );
+    }
+    let per_instance_bytes = n
+        .max(1)
+        .saturating_add(nnz)
+        .saturating_mul(coef_bytes)
+        .saturating_mul(3)
+        .saturating_add(
+            n.div_ceil(8)
+                .max(1)
+                .saturating_mul(SA_THREADS_PER_NONCE)
+                .saturating_mul(3),
+        )
+        .saturating_add(SA_THREADS_PER_NONCE * 12 + 32)
+        .saturating_add(
+            n.max(1)
+                .saturating_mul(SA_THREADS_PER_NONCE)
+                .saturating_mul(delta_bytes + 1),
+        );
+    Footprint {
+        shared_bytes: shared,
+        per_instance_bytes,
+        instances: instances(KernelKind::Sa, limits.sm_count),
+    }
+}
+
 /// Usable device memory per MSA instance, before session-wide allocations.
 #[must_use]
 pub fn msa_per_instance_budget(limits: &DeviceLimits) -> usize {
     limits.usable_bytes() / instances(KernelKind::Msa, limits.sm_count)
 }
 
-/// Bytes of per-thread stack frame the SA kernel needs for `nodes`.
-///
-/// `unpacked_state` is one byte per node and `packed_state` one bit, both
-/// sized from `QUIP_MAX_NODES` in `kernels/sa.cu`.
-#[must_use]
-pub fn sa_frame_bytes(nodes: usize) -> usize {
-    nodes + nodes.div_ceil(8)
-}
-
-/// Device memory the SA path consumes at `nodes`, for the two allocations
-/// that scale with node count.
-///
-/// The local-memory backing store is the frame times full occupancy, because
-/// the driver reserves for every thread the device could run. The
-/// `delta_energy` workspace is one byte per node per launched thread
-/// (`streaming.rs`, `total_threads * topology.n`), and SA launches one block
-/// per SM.
-#[must_use]
-pub fn sa_working_set_bytes(nodes: usize, limits: &DeviceLimits) -> usize {
-    let local = sa_frame_bytes(nodes)
-        .saturating_mul(limits.sm_count)
-        .saturating_mul(limits.threads_per_sm);
-    let workspace = nodes
-        .saturating_mul(limits.sm_count)
-        .saturating_mul(SA_THREADS_PER_NONCE);
-    local.saturating_add(workspace)
-}
-
-/// Largest node count whose SA working set fits this device.
-///
-/// Video memory is the line. A device too full for even
-/// [`SA_DEFAULT_NODES`] gets a budget below it and [`resolve`] refuses,
-/// naming the request and the budget. Flooring this at the default would
-/// hand that case to the driver instead, and a bare
-/// `CUDA_ERROR_OUT_OF_MEMORY` from inside an allocation says nothing about
-/// which knob to turn.
-#[must_use]
-pub fn sa_budget(limits: &DeviceLimits) -> usize {
-    // Bytes per node, from `sa_working_set_bytes` with the packed-state
-    // rounding dropped: 9 bytes of frame per 8 nodes, plus one workspace byte
-    // per launched thread.
-    let per_node = limits
-        .sm_count
-        .saturating_mul(limits.threads_per_sm.saturating_mul(9) / 8 + SA_THREADS_PER_NONCE)
-        .max(1);
-    let by_memory = limits.usable_bytes() / per_node;
-    // 9 frame bytes per 8 nodes, inverted against the per-thread cap.
-    let by_local_cap = LOCAL_MEM_BYTES_PER_THREAD * 8 / 9;
-    by_memory.min(by_local_cap)
-}
-
-/// Device memory the wide SA path consumes at `nodes`: the local frame compiled
-/// at `frame_nodes`, an i32 delta workspace, and the `-ln(u)` table.
-#[must_use]
-pub fn sa_wide_working_set_bytes(nodes: usize, frame_nodes: usize, limits: &DeviceLimits) -> usize {
-    let local = sa_frame_bytes(frame_nodes)
-        .saturating_mul(limits.sm_count)
-        .saturating_mul(limits.threads_per_sm);
-    let workspace = nodes
-        .saturating_mul(SA_WIDE_DELTA_BYTES)
-        .saturating_mul(limits.sm_count)
-        .saturating_mul(SA_THREADS_PER_NONCE);
-    let table = crate::accept_table::NEGLOG_LEN * std::mem::size_of::<i64>();
-    local.saturating_add(workspace).saturating_add(table)
-}
-
-/// Largest node count whose wide SA working set fits this device with the
-/// compiled `frame_nodes` frame, at most `frame_nodes`. Returns zero if none fit.
-#[must_use]
-pub fn sa_wide_budget(frame_nodes: usize, limits: &DeviceLimits) -> usize {
-    let fixed = sa_wide_working_set_bytes(0, frame_nodes, limits);
-    let per_node = limits
-        .sm_count
-        .saturating_mul(SA_THREADS_PER_NONCE)
-        .saturating_mul(SA_WIDE_DELTA_BYTES);
-    let usable = limits.usable_bytes();
-    let by_memory = usable
-        .saturating_sub(fixed)
-        .checked_div(per_node)
-        .unwrap_or(frame_nodes);
-    let mut nodes = by_memory.min(frame_nodes);
-    while nodes > 0 && sa_wide_working_set_bytes(nodes, frame_nodes, limits) > usable {
-        nodes -= 1;
-    }
-    nodes
-}
-
-/// Shipped `shared_state` size in `kernels/gibbs.cu`, and the floor.
+/// Shipped static shared-state size in `kernels/gibbs.cu`.
 pub const GIBBS_DEFAULT_NODES: usize = 4800;
 
-/// Bytes of shared memory the Gibbs kernel uses outside `shared_state`:
-/// `s_chunk` and `s_arrival`, one `int` each.
-pub const GIBBS_FIXED_SHARED_BYTES: usize = 8;
+/// Two shared ints, rounded to the driver's 16-byte static allocation boundary.
+pub const GIBBS_STATIC_SHARED_BYTES: usize = 16;
+
+/// Eight warp partials for the 256-thread dense row reduction.
+pub(crate) const GIBBS_DENSE_REDUCTION_BYTES: usize = 32;
+
+/// Spins held in the dynamic shared prefix of a Gibbs block.
+#[must_use]
+pub fn gibbs_shared_spins(nodes: usize, optin_bytes: usize, cap: Option<usize>) -> usize {
+    nodes
+        .min(optin_bytes.saturating_sub(GIBBS_STATIC_SHARED_BYTES))
+        .min(cap.unwrap_or(usize::MAX))
+}
+
+/// Gibbs session allocation bound at full launch width.
+/// Colour starts and counts are tiled per instance; nodes and CSR are shared.
+/// Each instance owns three coefficient/output slots and four block spills.
+#[must_use]
+pub fn gibbs_footprint(
+    shape: ModelShape,
+    precision: Precision,
+    storage: Storage,
+    reads: usize,
+    betas: usize,
+    limits: &DeviceLimits,
+) -> Footprint {
+    gibbs_footprint_with_shared_cap(shape, precision, storage, reads, betas, limits, None)
+}
+
+pub(crate) fn gibbs_footprint_with_shared_cap(
+    shape: ModelShape,
+    precision: Precision,
+    storage: Storage,
+    reads: usize,
+    betas: usize,
+    limits: &DeviceLimits,
+    cap: Option<usize>,
+) -> Footprint {
+    let n = shape.nodes;
+    let (nnz, colours, csr_bytes, reduction_bytes) = match storage {
+        Storage::Sparse => {
+            let nnz = shape.couplers.saturating_mul(2).max(1);
+            (
+                nnz,
+                n.min(shape.max_degree.saturating_add(1)).max(1),
+                n.saturating_add(1).saturating_add(nnz).saturating_mul(4),
+                0,
+            )
+        }
+        Storage::Dense => (
+            n.saturating_mul(n).max(1),
+            n.max(1),
+            8,
+            GIBBS_DENSE_REDUCTION_BYTES,
+        ),
+    };
+    let coefficient_bytes = match precision {
+        Precision::Binary | Precision::Int8 => 1,
+        Precision::Int32 | Precision::Float32 => 4,
+    };
+    let shared_bytes = csr_bytes
+        .saturating_add(n.max(1).saturating_mul(4))
+        .saturating_add(betas.max(1).saturating_mul(4))
+        .saturating_add(POOL_ALLOWANCE_BYTES);
+    let reads = reads.max(1);
+    let prefix = gibbs_shared_spins(
+        n,
+        limits
+            .shared_bytes_per_block_optin
+            .saturating_sub(reduction_bytes),
+        cap,
+    );
+    let spill = n
+        .saturating_sub(prefix)
+        .saturating_mul(KernelKind::Gibbs.sms_per_instance());
+    let per_instance_bytes = n
+        .max(1)
+        .saturating_add(nnz)
+        .saturating_mul(coefficient_bytes)
+        .saturating_mul(3)
+        .saturating_add(reads.saturating_mul(n.div_ceil(8).max(1)).saturating_mul(3))
+        .saturating_add(reads.saturating_mul(12))
+        .saturating_add(32)
+        .saturating_add(colours.saturating_mul(8))
+        .saturating_add(spill.max(1));
+    Footprint {
+        shared_bytes,
+        per_instance_bytes,
+        instances: instances(KernelKind::Gibbs, limits.sm_count),
+    }
+}
 
 /// Minimum requested MSA capacity, also used when opening to read limits.
 /// The msa kernel has no compiled node array: its spin state uses dynamic
@@ -495,15 +626,6 @@ pub enum Connectivity {
 }
 
 impl Connectivity {
-    /// Storage used for this connectivity's capacity calculation.
-    #[must_use]
-    pub fn storage(self) -> MsaStorage {
-        match self {
-            Self::Degree(d) if d <= MSA_MAX_DEGREE => MsaStorage::Sparse,
-            Self::Degree(_) | Self::Complete => MsaStorage::Dense,
-        }
-    }
-
     /// Shape at a given node count, saturating for oversized requests.
     #[must_use]
     pub fn shape(self, nodes: usize) -> ModelShape {
@@ -519,6 +641,67 @@ impl Connectivity {
     }
 }
 
+/// Largest model for the selected kernel at the default beta count.
+#[must_use]
+pub fn max_model(
+    kernel: KernelKind,
+    conn: Connectivity,
+    precision: Precision,
+    reads: usize,
+    limits: &DeviceLimits,
+) -> ModelShape {
+    match kernel {
+        KernelKind::Msa => msa_max_model(conn, precision, reads, limits),
+        KernelKind::Sa | KernelKind::Gibbs => {
+            let mut high = i32::MAX as usize - 256;
+            if let Connectivity::Degree(d) = conn {
+                high = high.min((i32::MAX as usize - 1) / d.max(1));
+            } else {
+                high = high.min(46_340);
+            }
+            let at = |n| {
+                let shape = conn.shape(n);
+                let storage =
+                    route_storage(kernel, shape, precision, reads, MSA_DEFAULT_BETAS, limits);
+                footprint(
+                    kernel,
+                    shape,
+                    precision,
+                    storage,
+                    reads,
+                    MSA_DEFAULT_BETAS,
+                    limits,
+                )
+                .total()
+            };
+            // The local frame disappears above the mining threshold. Search
+            // the global interval first, then the local interval if none fits.
+            let first_global = SA_DEFAULT_NODES + 1;
+            let global_fits = kernel == KernelKind::Sa
+                && first_global <= high
+                && at(first_global) <= limits.usable_bytes();
+            let mut low = if global_fits { first_global } else { 0 };
+            if kernel == KernelKind::Sa && !global_fits {
+                high = high.min(SA_DEFAULT_NODES);
+            }
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                if at(mid) <= limits.usable_bytes() {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            if let Connectivity::Degree(d) = conn {
+                if low <= d {
+                    low = 0;
+                }
+            }
+            conn.shape(low)
+        }
+    }
+}
+
 /// Largest model that fits the default beta schedule and kernel index widths.
 #[must_use]
 pub fn msa_max_model(
@@ -527,8 +710,17 @@ pub fn msa_max_model(
     reads: usize,
     limits: &DeviceLimits,
 ) -> ModelShape {
-    let storage = conn.storage();
-    let mut high = if storage == MsaStorage::Dense {
+    // Select storage for the topology family before searching its node count.
+    // Complete-model capacity keeps dense storage even at small memory budgets.
+    let storage = route_storage(
+        KernelKind::Msa,
+        conn.shape(usize::MAX),
+        precision,
+        reads,
+        MSA_DEFAULT_BETAS,
+        limits,
+    );
+    let mut high = if storage == Storage::Dense {
         // Dense row-major matrix indices are signed 32-bit integers.
         46_340
     } else {
@@ -630,7 +822,7 @@ fn msa_max_fitting(
         let footprint = msa_footprint(
             shape(mid),
             Precision::Binary,
-            MsaStorage::Sparse,
+            Storage::Sparse,
             reads,
             MSA_DEFAULT_BETAS,
             limits,
@@ -647,19 +839,13 @@ fn msa_max_fitting(
 /// Which device limit bounds a kernel's capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetResource {
-    /// Gibbs holds its spin state in shared memory, per block.
-    SharedMemory,
-    /// SA holds its state in per-thread local memory, which the driver backs
-    /// with device memory reserved for full occupancy. msa spills spins past
-    /// its shared-memory budget to a per-nonce global buffer, so its worst
-    /// case is bounded by device memory too.
+    /// Session buffers are bounded by device memory.
     DeviceMemory,
 }
 
 impl std::fmt::Display for BudgetResource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SharedMemory => write!(f, "shared-memory"),
             Self::DeviceMemory => write!(f, "memory"),
         }
     }
@@ -669,9 +855,7 @@ impl std::fmt::Display for BudgetResource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CapacityError {
     /// Above what this device can hold. `resource` names which limit bound
-    /// it, because SA is bounded by device memory, Gibbs by shared memory and
-    /// msa by the memory its session needs, and a message
-    /// naming the wrong resource sends the reader to the wrong knob.
+    /// it. Session buffers must fit the usable device memory.
     #[error("requested {requested} nodes exceeds the device {resource} budget of {budget}")]
     AboveDeviceBudget {
         /// Nodes asked for.
@@ -681,13 +865,6 @@ pub enum CapacityError {
         /// Which device limit bound this request.
         resource: BudgetResource,
     },
-}
-
-/// Largest Gibbs `shared_state` this device can hold, in nodes. One node is
-/// one `signed char`, so bytes and nodes are the same number.
-#[must_use]
-pub fn gibbs_budget(shared_bytes_per_block: usize) -> usize {
-    shared_bytes_per_block.saturating_sub(GIBBS_FIXED_SHARED_BYTES)
 }
 
 /// Capacity used when `--max-nodes` is absent.
@@ -702,9 +879,8 @@ pub fn default_nodes(kernel: KernelKind) -> usize {
 
 /// Capacity to advertise in `--capabilities`.
 ///
-/// SA and Gibbs can answer without device limits. MSA derives its maximum
-/// from the footprint and advertises zero if no device limits are available.
-/// A requested MSA capacity is an optional lower cap on that maximum.
+/// Kernels derive maxima from device memory and advertise zero without
+/// device limits. A requested capacity is an optional lower cap.
 #[must_use]
 pub fn advertised_nodes(
     kernel: KernelKind,
@@ -713,23 +889,55 @@ pub fn advertised_nodes(
 ) -> usize {
     let want = requested.max(default_nodes(kernel));
     match kernel {
-        KernelKind::Sa => want.min(LOCAL_MEM_BYTES_PER_THREAD * 8 / 9),
+        KernelKind::Sa | KernelKind::Gibbs => limits.map_or(0, |limits| {
+            requested.min(
+                max_model(
+                    kernel,
+                    Connectivity::Degree(0),
+                    Precision::Binary,
+                    256,
+                    limits,
+                )
+                .nodes,
+            )
+        }),
         KernelKind::Msa => limits.map_or(0, |limits| {
             want.min(msa_max_nodes(limits, msa_device_reads(limits)))
         }),
-        KernelKind::Gibbs => want,
+    }
+}
+
+/// Binary coupler limit that an SA or Gibbs identity advertises: the complete
+/// model, the fewest nodes for its coupler count, at the full read count.
+/// Node and coupler limits are independent bounds, and each model still
+/// passes admission at its own precision, reads, and schedule length.
+#[must_use]
+pub fn advertised_couplers(kernel: KernelKind, limits: &DeviceLimits) -> usize {
+    match kernel {
+        KernelKind::Sa | KernelKind::Gibbs => {
+            max_model(
+                kernel,
+                Connectivity::Complete,
+                Precision::Binary,
+                256,
+                limits,
+            )
+            .couplers
+        }
+        KernelKind::Msa => msa_max_couplers(limits, msa_device_reads(limits)),
     }
 }
 
 /// Resolve a requested capacity against the kernel and the device.
 ///
-/// A request below the default is raised to the default. A request above a
-/// bound is an error, never a silent clamp.
+/// MSA raises requests below its default and rejects requests above its
+/// device bound. SA and Gibbs preserve the requested cap and check memory
+/// per model.
 ///
 /// # Errors
 ///
 /// [`CapacityError::AboveDeviceBudget`] when the request exceeds
-/// [`sa_budget`], [`gibbs_budget`] or [`msa_max_nodes`] for this device.
+/// [`msa_max_nodes`] for this device.
 pub fn resolve(
     kernel: KernelKind,
     requested: usize,
@@ -738,14 +946,10 @@ pub fn resolve(
     let floor = default_nodes(kernel);
     let want = requested.max(floor);
     let (budget, resource) = match kernel {
-        KernelKind::Sa => (sa_budget(limits), BudgetResource::DeviceMemory),
+        KernelKind::Sa | KernelKind::Gibbs => return Ok(requested),
         KernelKind::Msa => (
             msa_max_nodes(limits, msa_device_reads(limits)),
             BudgetResource::DeviceMemory,
-        ),
-        KernelKind::Gibbs => (
-            gibbs_budget(limits.shared_bytes_per_block),
-            BudgetResource::SharedMemory,
         ),
     };
     if want > budget {
@@ -764,6 +968,47 @@ mod tests {
     use crate::coefficients::{CoefficientPath, CoefficientPlan};
     use crate::kernel::KernelKind;
 
+    #[test]
+    fn gibbs_instances_use_four_sms() {
+        assert_eq!(instances(KernelKind::Gibbs, 48), 12);
+    }
+
+    #[test]
+    fn gibbs_max_model_exceeds_old_shared_ceiling() {
+        let limits = a4000_limits();
+        let m = max_model(
+            KernelKind::Gibbs,
+            Connectivity::Degree(20),
+            Precision::Binary,
+            256,
+            &limits,
+        );
+        assert!(m.nodes > GIBBS_DEFAULT_NODES);
+    }
+
+    #[test]
+    fn gibbs_explicit_cap_below_the_shared_array_is_preserved() {
+        let limits = a4000_limits();
+        assert_eq!(resolve(KernelKind::Gibbs, 1000, &limits), Ok(1000));
+        assert_eq!(
+            advertised_nodes(KernelKind::Gibbs, 1000, Some(&limits)),
+            1000
+        );
+        let memory_limit = max_model(
+            KernelKind::Gibbs,
+            Connectivity::Degree(0),
+            Precision::Binary,
+            256,
+            &limits,
+        )
+        .nodes;
+        assert_eq!(
+            advertised_nodes(KernelKind::Gibbs, usize::MAX, Some(&limits)),
+            memory_limit
+        );
+        assert_eq!(advertised_nodes(KernelKind::Gibbs, usize::MAX, None), 0);
+    }
+
     fn a4000_limits() -> DeviceLimits {
         DeviceLimits {
             shared_bytes_per_block: 49_152,
@@ -775,6 +1020,360 @@ mod tests {
     }
 
     #[test]
+    fn advertised_couplers_follow_the_complete_binary_footprint() {
+        for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
+            for limits in [a4000_limits(), a4000(512 << 20)] {
+                let bound = max_model(
+                    kernel,
+                    Connectivity::Complete,
+                    Precision::Binary,
+                    256,
+                    &limits,
+                )
+                .couplers;
+                assert_eq!(advertised_couplers(kernel, &limits), bound, "{kernel:?}");
+            }
+            // complete:1415 has 1,000,405 couplers, past the old fixed 1,000,000.
+            assert!(advertised_couplers(kernel, &a4000_limits()) > 1_000_405);
+        }
+    }
+
+    #[test]
+    fn sa_instances_follow_sm_count() {
+        assert_eq!(instances(KernelKind::Sa, 48), 48);
+    }
+
+    #[test]
+    fn gibbs_dense_footprint_counts_matrices_colours_and_spill() {
+        let limits = a4000_limits();
+        let shape = Connectivity::Complete.shape(600);
+        for (precision, per_instance) in [
+            (Precision::Binary, 1_147_305),
+            (Precision::Int8, 1_147_305),
+            (Precision::Int32, 4_392_705),
+            (Precision::Float32, 4_392_705),
+        ] {
+            let footprint = gibbs_footprint(shape, precision, Storage::Dense, 256, 64, &limits);
+            assert_eq!(footprint.instances, 12);
+            assert_eq!(footprint.shared_bytes, POOL_ALLOWANCE_BYTES + 2_664);
+            assert_eq!(footprint.per_instance_bytes, per_instance);
+            let spilled = gibbs_footprint_with_shared_cap(
+                shape,
+                precision,
+                Storage::Dense,
+                256,
+                64,
+                &limits,
+                Some(0),
+            );
+            assert_eq!(spilled.per_instance_bytes, per_instance + 2_399);
+            assert_eq!(
+                route_storage(KernelKind::Gibbs, shape, precision, 256, 64, &limits),
+                Storage::Dense
+            );
+            assert_eq!(
+                route_storage(
+                    KernelKind::Gibbs,
+                    Connectivity::Degree(20).shape(600),
+                    precision,
+                    256,
+                    64,
+                    &limits
+                ),
+                Storage::Sparse
+            );
+        }
+    }
+
+    #[test]
+    fn gibbs_small_complete_model_uses_the_smaller_sparse_footprint() {
+        let limits = a4000_limits();
+        let shape = Connectivity::Complete.shape(32);
+        let dense = gibbs_footprint(shape, Precision::Float32, Storage::Dense, 256, 64, &limits);
+        let sparse = gibbs_footprint(shape, Precision::Float32, Storage::Sparse, 256, 64, &limits);
+        // Three extra diagonals per instance cost 4,608 bytes. Removing
+        // shared CSR saves 4,092 bytes, so dense costs 516 bytes more.
+        assert_eq!(dense.total() - sparse.total(), 516);
+        assert_eq!(
+            route_storage(
+                KernelKind::Gibbs,
+                shape,
+                Precision::Float32,
+                256,
+                64,
+                &limits
+            ),
+            Storage::Sparse
+        );
+    }
+
+    #[test]
+    fn sa_routes_complete_graphs_dense() {
+        let limits = a4000_limits();
+        let shape = Connectivity::Complete.shape(2_000);
+        assert_eq!(
+            route_storage(KernelKind::Sa, shape, Precision::Int8, 256, 64, &limits),
+            Storage::Dense
+        );
+        let sparse = Connectivity::Degree(20).shape(2_000);
+        assert_eq!(
+            route_storage(KernelKind::Sa, sparse, Precision::Int8, 256, 64, &limits),
+            Storage::Sparse
+        );
+    }
+
+    #[test]
+    fn sa_dense_binary_capacity_includes_wide_deltas() {
+        let limits = a4000_limits();
+        let shape = Connectivity::Complete.shape(2_000);
+        assert_eq!(
+            sa_footprint(shape, Precision::Binary, Storage::Dense, 32, 64, &limits),
+            sa_footprint(shape, Precision::Int8, Storage::Dense, 32, 64, &limits),
+        );
+        let model = max_model(
+            KernelKind::Sa,
+            Connectivity::Complete,
+            Precision::Binary,
+            32,
+            &limits,
+        );
+        let at = |n| {
+            sa_footprint(
+                Connectivity::Complete.shape(n),
+                Precision::Binary,
+                Storage::Dense,
+                32,
+                64,
+                &limits,
+            )
+            .total()
+        };
+        assert!(at(model.nodes) <= limits.usable_bytes());
+        assert!(at(model.nodes + 1) > limits.usable_bytes());
+    }
+
+    #[test]
+    fn sa_footprint_counts_launched_threads_not_reads() {
+        let limits = a4000_limits();
+        let shape = Connectivity::Degree(20).shape(20_000);
+        let at = |reads| {
+            footprint(
+                KernelKind::Sa,
+                shape,
+                Precision::Binary,
+                Storage::Sparse,
+                reads,
+                64,
+                &limits,
+            )
+        };
+        assert_eq!(
+            at(64),
+            at(256),
+            "SA launches 256 threads per nonce at every read count"
+        );
+    }
+
+    #[test]
+    fn sa_max_model_searches_past_the_local_frame_drop() {
+        let mut limits = a4000_limits();
+        limits.free_bytes = 512 << 20;
+        let conn = Connectivity::Degree(20);
+        assert!(
+            sa_footprint(
+                conn.shape(5001),
+                Precision::Int32,
+                Storage::Sparse,
+                256,
+                64,
+                &limits
+            )
+            .total()
+                <= limits.usable_bytes()
+        );
+        let model = max_model(KernelKind::Sa, conn, Precision::Int32, 256, &limits);
+        assert!(model.nodes >= 5001);
+        assert!(
+            sa_footprint(
+                conn.shape(model.nodes + 1),
+                Precision::Int32,
+                Storage::Sparse,
+                256,
+                64,
+                &limits
+            )
+            .total()
+                > limits.usable_bytes()
+        );
+    }
+
+    #[test]
+    fn sa_max_model_exceeds_old_local_ceiling() {
+        let limits = a4000_limits();
+        let m = max_model(
+            KernelKind::Sa,
+            Connectivity::Degree(20),
+            Precision::Binary,
+            256,
+            &limits,
+        );
+        assert!(m.nodes > SA_DEFAULT_NODES);
+        let fp = footprint(
+            KernelKind::Sa,
+            m,
+            Precision::Binary,
+            Storage::Sparse,
+            256,
+            64,
+            &limits,
+        );
+        assert!(fp.total() <= limits.usable_bytes());
+        let next = Connectivity::Degree(20).shape(m.nodes + 1);
+        assert!(
+            footprint(
+                KernelKind::Sa,
+                next,
+                Precision::Binary,
+                Storage::Sparse,
+                256,
+                64,
+                &limits
+            )
+            .total()
+                > limits.usable_bytes()
+        );
+    }
+
+    #[test]
+    fn small_complete_msa_model_keeps_dense_accounting() {
+        let shape = Connectivity::Complete.shape(32);
+        let mut limits = a4000_limits();
+        let expected = msa_footprint(shape, Precision::Binary, Storage::Dense, 128, 64, &limits);
+        limits.free_bytes = expected.total().div_ceil(4) * 5;
+        let model = max_model(
+            KernelKind::Msa,
+            Connectivity::Complete,
+            Precision::Binary,
+            128,
+            &limits,
+        );
+        assert_eq!(model.nodes, 32);
+        let storage = route_storage(
+            KernelKind::Msa,
+            Connectivity::Complete.shape(usize::MAX),
+            Precision::Binary,
+            128,
+            64,
+            &limits,
+        );
+        assert_eq!(storage, Storage::Dense);
+        let cells = crate::probe::probe(KernelKind::Msa, &limits, 128);
+        let cell = cells
+            .iter()
+            .find(|cell| {
+                cell.connectivity == Connectivity::Complete && cell.precision == Precision::Binary
+            })
+            .unwrap();
+        assert_eq!(cell.nodes, 32);
+        assert_eq!(cell.storage, Storage::Dense);
+        assert_eq!(cell.per_instance_bytes, expected.per_instance_bytes);
+        assert_eq!(
+            footprint(
+                KernelKind::Msa,
+                model,
+                Precision::Binary,
+                storage,
+                128,
+                64,
+                &limits
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn msa_dispatch_matches_msa_footprint() {
+        let limits = a4000_limits();
+        let shape = Connectivity::Degree(20).shape(64_000);
+        for precision in [
+            Precision::Binary,
+            Precision::Int8,
+            Precision::Int32,
+            Precision::Float32,
+        ] {
+            assert_eq!(
+                footprint(
+                    KernelKind::Msa,
+                    shape,
+                    precision,
+                    Storage::Sparse,
+                    128,
+                    MSA_DEFAULT_BETAS,
+                    &limits
+                ),
+                msa_footprint(
+                    shape,
+                    precision,
+                    Storage::Sparse,
+                    128,
+                    MSA_DEFAULT_BETAS,
+                    &limits
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn msa_max_model_unchanged_by_dispatch() {
+        let limits = a4000_limits();
+        for conn in [
+            Connectivity::Degree(20),
+            Connectivity::Degree(60),
+            Connectivity::Complete,
+        ] {
+            for precision in [
+                Precision::Binary,
+                Precision::Int8,
+                Precision::Int32,
+                Precision::Float32,
+            ] {
+                assert_eq!(
+                    max_model(KernelKind::Msa, conn, precision, 128, &limits),
+                    msa_max_model(conn, precision, 128, &limits),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn msa_routes_by_degree() {
+        let limits = a4000_limits();
+        let at = |d| {
+            route_storage(
+                KernelKind::Msa,
+                Connectivity::Degree(d).shape(10_000),
+                Precision::Binary,
+                128,
+                64,
+                &limits,
+            )
+        };
+        assert_eq!(at(62), Storage::Sparse);
+        assert_eq!(at(63), Storage::Dense);
+    }
+
+    #[test]
+    fn max_reads_per_kernel() {
+        let limits = a4000_limits();
+        assert_eq!(max_reads(KernelKind::Sa, &limits), 256);
+        assert_eq!(max_reads(KernelKind::Gibbs, &limits), 256);
+        assert_eq!(
+            max_reads(KernelKind::Msa, &limits),
+            msa_device_reads(&limits)
+        );
+    }
+
+    #[test]
     fn msa_accepts_a_million_uncoupled_nodes_when_the_footprint_fits() {
         let limits = a4000_limits();
         let shape = ModelShape {
@@ -783,15 +1382,7 @@ mod tests {
             max_degree: 0,
         };
         assert!(
-            msa_footprint(
-                shape,
-                Precision::Binary,
-                MsaStorage::Sparse,
-                128,
-                64,
-                &limits
-            )
-            .total()
+            msa_footprint(shape, Precision::Binary, Storage::Sparse, 128, 64, &limits).total()
                 <= limits.usable_bytes()
         );
         assert_eq!(
@@ -817,33 +1408,11 @@ mod tests {
             couplers: c,
             max_degree: 40,
         };
-        let u = msa_footprint(
-            s(2_000_000),
-            Precision::Binary,
-            MsaStorage::Sparse,
-            128,
-            1,
-            &l,
-        );
-        let w = msa_footprint(
-            s(2_000_000),
-            Precision::Int32,
-            MsaStorage::Sparse,
-            128,
-            1,
-            &l,
-        );
+        let u = msa_footprint(s(2_000_000), Precision::Binary, Storage::Sparse, 128, 1, &l);
+        let w = msa_footprint(s(2_000_000), Precision::Int32, Storage::Sparse, 128, 1, &l);
         assert!(w.total() > u.total());
         assert!(
-            msa_footprint(
-                s(4_000_000),
-                Precision::Binary,
-                MsaStorage::Sparse,
-                128,
-                1,
-                &l
-            )
-            .total()
+            msa_footprint(s(4_000_000), Precision::Binary, Storage::Sparse, 128, 1, &l).total()
                 > u.total()
         );
         assert_eq!(u.instances, 48);
@@ -896,8 +1465,8 @@ mod tests {
             couplers: 2_000_000,
             max_degree: 40,
         };
-        let narrow = msa_footprint(shape, Precision::Int8, MsaStorage::Sparse, 128, 1, &l);
-        let wide = msa_footprint(shape, Precision::Int32, MsaStorage::Sparse, 128, 1, &l);
+        let narrow = msa_footprint(shape, Precision::Int8, Storage::Sparse, 128, 1, &l);
+        let wide = msa_footprint(shape, Precision::Int32, Storage::Sparse, 128, 1, &l);
         // Three slots, two directed halves per edge, three extra bytes per coefficient.
         assert_eq!(
             wide.per_instance_bytes - narrow.per_instance_bytes,
@@ -913,8 +1482,8 @@ mod tests {
             couplers: 2_000_000,
             max_degree: 40,
         };
-        let one = msa_footprint(shape, Precision::Binary, MsaStorage::Sparse, 64, 1, &l);
-        let two = msa_footprint(shape, Precision::Binary, MsaStorage::Sparse, 128, 1, &l);
+        let one = msa_footprint(shape, Precision::Binary, Storage::Sparse, 64, 1, &l);
+        let two = msa_footprint(shape, Precision::Binary, Storage::Sparse, 128, 1, &l);
         // 64 more reads in three sample/energy slots, plus the larger spill.
         assert_eq!(two.per_instance_bytes - one.per_instance_bytes, 3_200_768);
         let mut no_shared = l;
@@ -922,7 +1491,7 @@ mod tests {
         let spilled = msa_footprint(
             shape,
             Precision::Binary,
-            MsaStorage::Sparse,
+            Storage::Sparse,
             128,
             1,
             &no_shared,
@@ -939,7 +1508,7 @@ mod tests {
                 max_degree: 1_999,
             },
             Precision::Binary,
-            MsaStorage::Dense,
+            Storage::Dense,
             128,
             64,
             &a4000_limits(),
@@ -969,7 +1538,7 @@ mod tests {
                         max_degree: 0,
                     },
                     precision,
-                    MsaStorage::Dense,
+                    Storage::Dense,
                     128,
                     64,
                     &limits,
@@ -1012,7 +1581,7 @@ mod tests {
                     max_degree: 1_999,
                 },
                 precision,
-                MsaStorage::Dense,
+                Storage::Dense,
                 128,
                 64,
                 &a4000_limits(),
@@ -1031,7 +1600,7 @@ mod tests {
                 max_degree: usize::MAX,
             },
             Precision::Int32,
-            MsaStorage::Sparse,
+            Storage::Sparse,
             usize::MAX,
             1,
             &a4000_limits(),
@@ -1061,11 +1630,11 @@ mod tests {
         for (precision, bytes_per_beta) in [(Precision::Binary, 4), (Precision::Int32, 16)] {
             for betas in [1, 65_536] {
                 let extra = 17;
-                let base = msa_footprint(shape, precision, MsaStorage::Sparse, 128, betas, &limits);
+                let base = msa_footprint(shape, precision, Storage::Sparse, 128, betas, &limits);
                 let longer = msa_footprint(
                     shape,
                     precision,
-                    MsaStorage::Sparse,
+                    Storage::Sparse,
                     128,
                     betas + extra,
                     &limits,
@@ -1086,7 +1655,7 @@ mod tests {
         };
         for precision in [Precision::Binary, Precision::Int32] {
             let footprint =
-                |betas| msa_footprint(shape, precision, MsaStorage::Sparse, 128, betas, &limits);
+                |betas| msa_footprint(shape, precision, Storage::Sparse, 128, betas, &limits);
             assert_eq!(footprint(0), footprint(1));
             assert_eq!(footprint(usize::MAX).total(), usize::MAX);
         }
@@ -1098,51 +1667,6 @@ mod tests {
     }
 
     #[test]
-    fn wide_budget_fits_the_compiled_frame_at_16_gib() {
-        let limits = a4000(16 << 30);
-        let frame_nodes = sa_budget(&limits);
-        let wide = sa_wide_budget(frame_nodes, &limits);
-        assert_eq!(wide, 36_069);
-        assert!(sa_wide_working_set_bytes(wide, frame_nodes, &limits) <= limits.usable_bytes());
-        assert!(
-            sa_wide_working_set_bytes(wide + 1, frame_nodes, &limits) > limits.usable_bytes()
-                || wide == frame_nodes
-        );
-    }
-
-    #[test]
-    fn wide_budget_fits_at_8_gib_without_a_rounding_gap() {
-        let limits = a4000(8 << 30);
-        let frame_nodes = sa_budget(&limits);
-        let wide = sa_wide_budget(frame_nodes, &limits);
-        assert_eq!(wide, 18_029);
-        assert!(sa_wide_working_set_bytes(wide, frame_nodes, &limits) <= limits.usable_bytes());
-        assert!(sa_wide_working_set_bytes(wide + 1, frame_nodes, &limits) > limits.usable_bytes());
-    }
-
-    #[test]
-    fn wide_budget_covers_the_mining_frame() {
-        let limits = a4000(16 << 30);
-        assert_eq!(sa_wide_budget(4577, &limits), 4577);
-        assert!(sa_wide_working_set_bytes(4577, 4577, &limits) <= limits.usable_bytes());
-    }
-
-    #[test]
-    fn wide_budget_is_zero_when_the_frame_does_not_fit() {
-        let limits = a4000(128 << 20);
-        assert!(sa_wide_working_set_bytes(0, 4577, &limits) > limits.usable_bytes());
-        assert_eq!(sa_wide_budget(4577, &limits), 0);
-    }
-
-    /// A4000 reports 49152 bytes of shared memory per block. `s_chunk` and
-    /// `s_arrival` take 8 of them, so 49144 nodes is the Gibbs ceiling.
-    /// Measured: 48000 runs, 65536 fails to compile.
-    #[test]
-    fn gibbs_budget_subtracts_the_fixed_shared_members() {
-        assert_eq!(gibbs_budget(49152), 49144);
-    }
-
-    #[test]
     fn resolve_accepts_a_request_inside_both_bounds() {
         let limits = a4000(A4000_FREE);
         assert_eq!(resolve(KernelKind::Gibbs, 5640, &limits), Ok(5640));
@@ -1150,28 +1674,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_gibbs_above_the_device_budget() {
+    fn sa_explicit_cap_below_the_local_frame_is_preserved() {
+        let limits = a4000_limits();
+        assert_eq!(resolve(KernelKind::Sa, 1000, &limits), Ok(1000));
+        assert_eq!(advertised_nodes(KernelKind::Sa, 1000, Some(&limits)), 1000);
+        let memory_limit = max_model(
+            KernelKind::Sa,
+            Connectivity::Degree(0),
+            Precision::Binary,
+            256,
+            &limits,
+        )
+        .nodes;
         assert_eq!(
-            resolve(KernelKind::Gibbs, 65536, &a4000(A4000_FREE)),
-            Err(CapacityError::AboveDeviceBudget {
-                requested: 65536,
-                budget: 49144,
-                resource: BudgetResource::SharedMemory,
-            })
+            advertised_nodes(KernelKind::Sa, usize::MAX, Some(&limits)),
+            memory_limit
         );
     }
 
-    /// A request below the default would shrink the kernel array for no
-    /// gain, so the default is a floor.
+    /// MSA retains its default node floor.
     #[test]
-    fn resolve_raises_a_small_request_to_the_default() {
+    fn resolve_msa_raises_small_requests_to_the_default() {
         let limits = a4000(A4000_FREE);
-        assert_eq!(resolve(KernelKind::Sa, 64, &limits), Ok(SA_DEFAULT_NODES));
         assert_eq!(resolve(KernelKind::Msa, 64, &limits), Ok(MSA_DEFAULT_NODES));
-        assert_eq!(
-            resolve(KernelKind::Gibbs, 64, &limits),
-            Ok(GIBBS_DEFAULT_NODES)
-        );
     }
 
     #[test]
@@ -1197,112 +1722,6 @@ mod tests {
         }
     }
 
-    /// The SA stack frame is `unpacked_state` (one byte per node) plus
-    /// `packed_state` (one bit per node), both sized from `QUIP_MAX_NODES`.
-    #[test]
-    fn sa_frame_is_the_two_state_arrays() {
-        assert_eq!(sa_frame_bytes(5000), 5000 + 625);
-        assert_eq!(sa_frame_bytes(8), 8 + 1);
-        // Rounds up: 9 nodes need 2 packed bytes, not 1.
-        assert_eq!(sa_frame_bytes(9), 9 + 2);
-    }
-
-    /// The budget must be self-consistent: the working set at the budget fits
-    /// in the free memory it was derived from, and one node more does not.
-    #[test]
-    fn sa_budget_is_the_largest_node_count_that_fits() {
-        let limits = a4000(A4000_FREE);
-        let budget = sa_budget(&limits);
-        assert!(budget > 0, "a 16 GiB card must afford some capacity");
-        assert!(
-            sa_working_set_bytes(budget, &limits) <= limits.usable_bytes(),
-            "the working set at the budget must fit"
-        );
-        assert!(
-            sa_working_set_bytes(budget + 1, &limits) > limits.usable_bytes(),
-            "one node above the budget must not fit"
-        );
-    }
-
-    /// A bigger card affords more, which is the whole reason for deriving
-    /// this rather than hardcoding it.
-    #[test]
-    fn sa_budget_scales_with_free_memory() {
-        let small = sa_budget(&a4000(8 * 1024 * 1024 * 1024));
-        let large = sa_budget(&a4000(48 * 1024 * 1024 * 1024));
-        assert!(
-            large > small,
-            "48 GiB must afford more than 8 GiB: {large} vs {small}"
-        );
-    }
-
-    /// CUDA caps local memory at 512 KiB per thread regardless of how much
-    /// device memory is free, so a huge card is still bounded.
-    #[test]
-    fn sa_budget_respects_the_per_thread_local_cap() {
-        let huge = sa_budget(&a4000(1024 * 1024 * 1024 * 1024));
-        assert!(
-            sa_frame_bytes(huge) <= LOCAL_MEM_BYTES_PER_THREAD,
-            "frame {} exceeds the {LOCAL_MEM_BYTES_PER_THREAD}-byte per-thread cap",
-            sa_frame_bytes(huge)
-        );
-    }
-
-    /// At the limit resolves, one above it fails. This is the contract the
-    /// whole module exists for.
-    #[test]
-    fn resolve_sa_accepts_at_the_budget_and_rejects_above_it() {
-        let limits = a4000(A4000_FREE);
-        let budget = sa_budget(&limits);
-        assert_eq!(resolve(KernelKind::Sa, budget, &limits), Ok(budget));
-        assert_eq!(
-            resolve(KernelKind::Sa, budget + 1, &limits),
-            Err(CapacityError::AboveDeviceBudget {
-                requested: budget + 1,
-                budget,
-                resource: BudgetResource::DeviceMemory,
-            })
-        );
-    }
-
-    /// Same contract for Gibbs, whose budget comes from shared memory.
-    #[test]
-    fn resolve_gibbs_accepts_at_the_budget_and_rejects_above_it() {
-        let limits = a4000(A4000_FREE);
-        let budget = gibbs_budget(limits.shared_bytes_per_block);
-        assert_eq!(budget, 49144);
-        assert_eq!(resolve(KernelKind::Gibbs, budget, &limits), Ok(budget));
-        assert_eq!(
-            resolve(KernelKind::Gibbs, budget + 1, &limits),
-            Err(CapacityError::AboveDeviceBudget {
-                requested: budget + 1,
-                budget,
-                resource: BudgetResource::SharedMemory,
-            })
-        );
-    }
-
-    /// Video memory is the line. A card too full for even the default must
-    /// report a budget below it and refuse with our message, rather than be
-    /// floored to the default and hand a bare out-of-memory to the driver.
-    #[test]
-    fn a_starved_card_is_refused_rather_than_left_to_the_driver() {
-        let limits = a4000(1024 * 1024);
-        let budget = sa_budget(&limits);
-        assert!(
-            budget < SA_DEFAULT_NODES,
-            "a 1 MiB card cannot afford the default: budget {budget}"
-        );
-        assert_eq!(
-            resolve(KernelKind::Sa, SA_DEFAULT_NODES, &limits),
-            Err(CapacityError::AboveDeviceBudget {
-                requested: SA_DEFAULT_NODES,
-                budget,
-                resource: BudgetResource::DeviceMemory,
-            })
-        );
-    }
-
     /// A card with room for the default still opens on a plain invocation.
     #[test]
     fn an_ordinary_card_affords_the_default() {
@@ -1310,28 +1729,6 @@ mod tests {
         assert_eq!(
             resolve(KernelKind::Sa, SA_DEFAULT_NODES, &limits),
             Ok(SA_DEFAULT_NODES)
-        );
-    }
-
-    /// `--capabilities` runs without opening the device, so it cannot call
-    /// `resolve`. The per-thread local-memory cap is the one bound that holds
-    /// on every CUDA device, so it is the only clamp available here.
-    #[test]
-    fn advertised_clamps_sa_to_the_per_thread_local_cap() {
-        let cap = LOCAL_MEM_BYTES_PER_THREAD * 8 / 9;
-        assert_eq!(advertised_nodes(KernelKind::Sa, cap * 2, None), cap);
-        assert_eq!(advertised_nodes(KernelKind::Sa, 5640, None), 5640);
-        assert_eq!(advertised_nodes(KernelKind::Sa, 64, None), SA_DEFAULT_NODES);
-    }
-
-    /// Gibbs has no static ceiling — its bound comes from the device — so the
-    /// request passes through and `open_with_nodes` is what refuses.
-    #[test]
-    fn advertised_passes_gibbs_through_above_the_default() {
-        assert_eq!(advertised_nodes(KernelKind::Gibbs, 32768, None), 32768);
-        assert_eq!(
-            advertised_nodes(KernelKind::Gibbs, 64, None),
-            GIBBS_DEFAULT_NODES
         );
     }
 
@@ -1466,7 +1863,14 @@ mod tests {
                     msa_footprint(
                         shape,
                         Precision::Binary,
-                        conn.storage(),
+                        route_storage(
+                            KernelKind::Msa,
+                            shape,
+                            Precision::Binary,
+                            128,
+                            MSA_DEFAULT_BETAS,
+                            &limits,
+                        ),
                         128,
                         MSA_DEFAULT_BETAS,
                         &limits,
@@ -1514,38 +1918,32 @@ mod tests {
                     if shape.nodes == 0 {
                         continue;
                     }
+                    let storage = route_storage(
+                        KernelKind::Msa,
+                        shape,
+                        precision,
+                        128,
+                        MSA_DEFAULT_BETAS,
+                        &limits,
+                    );
                     assert!(
-                        msa_footprint(
-                            shape,
-                            precision,
-                            conn.storage(),
-                            128,
-                            MSA_DEFAULT_BETAS,
-                            &limits
-                        )
-                        .total()
+                        msa_footprint(shape, precision, storage, 128, MSA_DEFAULT_BETAS, &limits)
+                            .total()
                             <= limits.usable_bytes()
                     );
-                    if conn.storage() == MsaStorage::Dense {
+                    if storage == Storage::Dense {
                         assert!(i32::try_from(shape.nodes * shape.nodes).is_ok());
                     } else {
                         assert!(i32::try_from(shape.couplers * 2 + 20).is_ok());
                     }
                     let next = conn.shape(shape.nodes + 1);
                     assert!(
-                        msa_footprint(
-                            next,
-                            precision,
-                            conn.storage(),
-                            128,
-                            MSA_DEFAULT_BETAS,
-                            &limits
-                        )
-                        .total()
+                        msa_footprint(next, precision, storage, 128, MSA_DEFAULT_BETAS, &limits)
+                            .total()
                             > limits.usable_bytes()
-                            || (conn.storage() == MsaStorage::Dense
+                            || (storage == Storage::Dense
                                 && i32::try_from(next.nodes * next.nodes).is_err())
-                            || (conn.storage() == MsaStorage::Sparse
+                            || (storage == Storage::Sparse
                                 && (i32::try_from(next.couplers * 2 + 20).is_err()
                                     || i32::try_from(
                                         next.nodes * 2 + MSA_THREADS_PER_NONCE as usize

@@ -77,6 +77,7 @@ fn concurrent_one_job_sessions_all_finish() {
                 res_tx,
                 CancelToken::default(),
                 &gov,
+                quip_solver_cuda::streaming::StallConfig::default(),
             );
             let ok = res_rx
                 .blocking_recv()

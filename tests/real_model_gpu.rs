@@ -1,11 +1,173 @@
 //! Precision storage and real-valued MSA sampling on a CUDA device.
 
-use quip_solver_cuda::capacity::{msa_device_reads, MsaStorage};
+use quip_solver_cuda::capacity::{msa_device_reads, Storage};
 use quip_solver_cuda::coefficients::{plan, CoefficientPath};
 use quip_solver_cuda::cuda_device::{CudaDevice, MsaLane};
 use quip_solver_cuda::sampler::SampleError;
 use quip_solver_cuda::streaming::{bench_many_real, bench_one, sample_one, sample_one_real};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_bench_model_serves_real_coefficients() {
+    use quip_solver_cuda::model_file::{write_model, RealModel};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("real.qmodel");
+    let graph = IsingGraph::new(vec![0.100_000_01, -0.200_000_01], vec![-0.5], vec![(0, 1)]);
+    let ground = energy(&[1, 1], &graph) + 12.5;
+    write_model(
+        &path,
+        &RealModel {
+            graph,
+            offset: 12.5,
+        },
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_quip-cuda-gibbs"))
+        .args(["bench", "run", "--model"])
+        .arg(path)
+        .args(["--out"])
+        .arg(dir.path())
+        .args([
+            "--reads",
+            "128",
+            "--sweeps",
+            "1024",
+            "--warmup",
+            "0",
+            "--repeats",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let records = std::fs::read_to_string(dir.path().join("cuda-gibbs_n2_s1024.jsonl")).unwrap();
+    let record: serde_json::Value = serde_json::from_str(records.trim()).unwrap();
+    assert_eq!(record["backend"], "cuda-gibbs");
+    let best = record["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|metric| metric["name"] == "best_energy")
+        .unwrap()["value"]
+        .as_f64()
+        .unwrap();
+    assert!((best - ground).abs() < 1e-10, "{best} != {ground}");
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_real_route_reaches_planted_ground_state() {
+    gibbs_real_route_reaches_planted_ground_state_case(&params());
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_real_route_reaches_planted_ground_state_ci() {
+    gibbs_real_route_reaches_planted_ground_state_case(&SampleParams {
+        num_sweeps: 64,
+        num_reads: 32,
+        ..params()
+    });
+}
+
+fn gibbs_real_route_reaches_planted_ground_state_case(params: &SampleParams) {
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 4800).unwrap();
+    let edges: Vec<_> = (0..64)
+        .flat_map(|u| (1..=10).map(move |d| (u, (u + d) % 64)))
+        .collect();
+    let graph = IsingGraph::new(
+        vec![0.125_000_01; 64],
+        vec![-1.000_000_1; edges.len()],
+        edges,
+    );
+    // The fractional bond overcomes opposing fields. Truncating J to zero
+    // would instead favor [-1, +1].
+    let fractional = IsingGraph::new(vec![0.100_000_01, -0.200_000_01], vec![-0.5], vec![(0, 1)]);
+    for (graph, planted) in [(graph, vec![-1; 64]), (fractional, vec![1; 2])] {
+        let ground = energy(&planted, &graph);
+        assert!(sample_one(&device, &graph, params, KernelKind::Gibbs).is_err());
+        for metropolis in [false, true] {
+            device.gibbs_metropolis = metropolis;
+            let mut baseline = None;
+            for cap in [None, Some(0), Some(1), Some(64)] {
+                device.gibbs_shared_spins_cap = cap;
+                let reads = sample_one_real(&device, &graph, params).unwrap();
+                assert_eq!(reads.len(), params.num_reads);
+                assert!(reads.iter().any(|read| read.spins == planted));
+                assert!(reads
+                    .iter()
+                    .any(|read| (read.energy - ground).abs() < 1e-10));
+                let spins: Vec<_> = reads.iter().map(|read| read.spins.clone()).collect();
+                if let Some(expected) = &baseline {
+                    assert_eq!(&spins, expected);
+                } else {
+                    baseline = Some(spins);
+                }
+                for read in reads {
+                    assert!((read.energy - energy(&read.spins, &graph)).abs() < 1e-10);
+                }
+            }
+        }
+        bench_many_real(&device, &graph, params, 1).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_real_large_coefficients_keep_finite_fields() {
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 4800).unwrap();
+    let graph = IsingGraph::new(vec![1.0e37; 3], vec![-6.0e37; 2], vec![(0, 1), (1, 2)]);
+    let params = SampleParams {
+        beta_range: Some((1.0e-38, 1.0e-36)),
+        ..params()
+    };
+    for metropolis in [false, true] {
+        device.gibbs_metropolis = metropolis;
+        for cap in [None, Some(0)] {
+            device.gibbs_shared_spins_cap = cap;
+            let reads = sample_one_real(&device, &graph, &params).unwrap();
+            assert!(reads.iter().any(|read| read.spins == vec![-1; 3]));
+            assert!(reads.iter().all(|read| read.energy.is_finite()));
+        }
+    }
+    let overflow = IsingGraph::new(vec![0.0; 3], vec![1.0e38; 2], vec![(0, 1), (1, 2)]);
+    let error = sample_one_real(&device, &overflow, &params).unwrap_err();
+    assert!(
+        matches!(error, SampleError::Unsupported(message) if message.contains("finite f32 delta"))
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_real_route_reaches_planted_ground_state() {
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 5000).unwrap();
+    let edges: Vec<_> = (0..64)
+        .flat_map(|u| (1..=10).map(move |d| (u, (u + d) % 64)))
+        .collect();
+    let graph = IsingGraph::new(
+        vec![0.125_000_01; 64],
+        vec![-1.000_000_1; edges.len()],
+        edges,
+    );
+    let ground = energy(&[-1; 64], &graph);
+    assert!(sample_one(&device, &graph, &params(), KernelKind::Sa).is_err());
+    for global in [false, true] {
+        device.sa_force_global = global;
+        let reads = sample_one_real(&device, &graph, &params()).unwrap();
+        assert_eq!(reads.len(), params().num_reads);
+        assert!(reads.iter().any(|read| read.spins == vec![-1; 64]));
+        assert!(reads
+            .iter()
+            .any(|read| (read.energy - ground).abs() < 1e-10));
+    }
+}
 
 fn device() -> CudaDevice {
     CudaDevice::open_with_nodes(0, KernelKind::Msa, 50_000).unwrap()
@@ -98,9 +260,23 @@ fn real_bench_refuses_f32_beta_overflow() {
     assert!(message.contains("f32"), "{message}");
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn weighted_int8_matches_int32() {
+    weighted_int8_matches_int32_case(&params());
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn weighted_int8_matches_int32_ci() {
+    weighted_int8_matches_int32_case(&SampleParams {
+        num_sweeps: 16,
+        ..params()
+    });
+}
+
+fn weighted_int8_matches_int32_case(params: &SampleParams) {
     let mut device = device();
     device.msa_shared_spins_cap = Some(4);
     // Cover both the single-pass and chunked weighted hot loops, with spill.
@@ -115,20 +291,12 @@ fn weighted_int8_matches_int32() {
             .map(|i| if i % 2 == 0 { 0.032 } else { -0.976 })
             .collect();
         assert_eq!(
-            plan(KernelKind::Msa, &graph, device.max_nodes)
-                .unwrap()
-                .path,
+            plan(KernelKind::Msa, &graph).unwrap().path,
             CoefficientPath::WeightedInt8
         );
-        let (narrow, _) = bench_one(&device, &graph, &params(), KernelKind::Msa, None).unwrap();
-        let (wide, _) = bench_one(
-            &device,
-            &graph,
-            &params(),
-            KernelKind::Msa,
-            Some(MsaLane::I32),
-        )
-        .unwrap();
+        let (narrow, _) = bench_one(&device, &graph, params, KernelKind::Msa, None).unwrap();
+        let (wide, _) =
+            bench_one(&device, &graph, params, KernelKind::Msa, Some(MsaLane::I32)).unwrap();
         assert_eq!(
             narrow.iter().map(|r| &r.spins).collect::<Vec<_>>(),
             wide.iter().map(|r| &r.spins).collect::<Vec<_>>(),
@@ -177,6 +345,17 @@ fn off_grid_graph_runs_on_f32() {
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn real_chunked_fields_keep_fractional_couplings_with_spill() {
+    real_chunked_fields_keep_fractional_couplings_with_spill_case(256);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn real_chunked_fields_keep_fractional_couplings_with_spill_long() {
+    real_chunked_fields_keep_fractional_couplings_with_spill_case(4096);
+}
+
+fn real_chunked_fields_keep_fractional_couplings_with_spill_case(sweeps: usize) {
     let mut device = device();
     device.msa_shared_spins_cap = Some(4);
     let nodes = 24;
@@ -195,6 +374,7 @@ fn real_chunked_fields_keep_fractional_couplings_with_spill() {
     {
         let params = SampleParams {
             num_reads,
+            num_sweeps: sweeps,
             ..params()
         };
         let reads = sample_one_real(&device, &graph, &params).unwrap();
@@ -272,7 +452,7 @@ fn real_sparse_acceptance_matches_replica_oracle() {
             .flat_map(|node| (1..=degree / 2).map(move |d| (node, (node + d) % 64)))
             .collect();
         let graph = IsingGraph::new(vec![0.125_000_01_f64; 64], vec![0.0; edges.len()], edges);
-        assert!(plan(KernelKind::Msa, &graph, device.max_nodes).is_err());
+        assert!(plan(KernelKind::Msa, &graph).is_err());
         for cap in [None, Some(0)] {
             device.msa_shared_spins_cap = cap;
             for num_reads in [63, 64, 65, 128].into_iter().filter(|&r| r <= max_reads) {
@@ -287,7 +467,7 @@ fn real_sparse_acceptance_matches_replica_oracle() {
                 let mut repeated = Vec::new();
                 for _ in 0..2 {
                     let reads = sample_one_real(&device, &graph, &params).unwrap();
-                    assert_eq!(last_storage(&device), Some(MsaStorage::Sparse));
+                    assert_eq!(last_storage(&device), Some(Storage::Sparse));
                     assert_eq!(reads.len(), num_reads);
                     repeated.push(reads.into_iter().map(|read| read.spins).collect::<Vec<_>>());
                 }
