@@ -17,6 +17,7 @@
 pub mod accept_table;
 pub mod bench;
 pub mod capacity;
+pub mod cluster;
 pub mod coefficients;
 pub mod corpus;
 pub mod cuda_device;
