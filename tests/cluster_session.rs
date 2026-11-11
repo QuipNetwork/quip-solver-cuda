@@ -767,7 +767,6 @@ mod canonical {
     }
 }
 
-#[cfg(feature = "long-tests")]
 mod gpu {
     use super::canonical::{descriptor, fixture, instance};
     use super::family_session::{lease, target, Session};
@@ -814,9 +813,10 @@ mod gpu {
     #[serial]
     fn synchronized_sweeps_and_descent_match_an_unchunked_run() {
         use quip_solver_cuda::cluster::{
-            device::ClusterDevice, sampler::ClusterWork, PreparedGraph, Weights,
+            device::{ClusterDevice, ClusterSchedule},
+            sampler::ClusterWork,
+            PreparedGraph, Weights,
         };
-        let started = std::time::Instant::now();
         hardware();
         let (base, family_params) = fixture();
         let instance = instance(&base, &family_params, [7; 32]).unwrap();
@@ -842,8 +842,8 @@ mod gpu {
             num_sweeps: 24,
             sweeps_per_beta: 6,
             beta_range: Some((0.1, 1.7)),
+            schedule: quip_solver_core::BetaSchedule::Geometric,
             seed: 73,
-            ..Default::default()
         };
         let prepared = PreparedGraph::from_instance(
             &instance,
@@ -863,16 +863,54 @@ mod gpu {
         assert_eq!(actual.energies.len(), 64);
         for chunk in [2, 4, 6] {
             // 6 runs a whole rung in one launch. 4 also exercises a short tail.
-            // All beta values are shared, so host/device powf rounding cannot
-            // hide a persistence or absolute-sweep-offset regression.
+            // Both paths use the same geometric ladder, with six sweeps per
+            // rung. Chunk boundaries fall both inside and at the end of rungs.
             let expected = device.run_work_with_chunk_for_test(&work, chunk).unwrap();
             assert_eq!(actual.spins, expected.spins, "chunk={chunk}");
             assert_eq!(actual.energies, expected.energies, "chunk={chunk}");
         }
-        assert!(
-            started.elapsed() <= Duration::from_secs(3),
-            "parity test exceeded 3 s"
-        );
+        // The host ladder sets a constant beta per launch. Also exercise
+        // beta_at with a varying device schedule and nonzero sweep offsets.
+        // Both paths evaluate the same betas on the device, so powf rounding
+        // cannot differ between host and device or weaken exact comparison.
+        let schedule = ClusterSchedule {
+            sweeps: 24,
+            chunk: 24,
+            beta_min: 0.1,
+            beta_max: 1.7,
+            ..Default::default()
+        };
+        let (expected, expected_rng) = device
+            .run_before_descent_for_test(&schedule, params.num_reads, params.seed)
+            .unwrap();
+        let expected_final = device
+            .run(&schedule, params.num_reads, params.seed)
+            .unwrap();
+        for chunk in [1, 2, 4, 6, 7] {
+            // Seven does not divide the schedule and leaves a short tail.
+            let chunked = ClusterSchedule {
+                chunk,
+                ..schedule.clone()
+            };
+            let (actual, actual_rng) = device
+                .run_before_descent_for_test(&chunked, params.num_reads, params.seed)
+                .unwrap();
+            assert_eq!(actual.spins, expected.spins, "varying beta chunk={chunk}");
+            assert_eq!(
+                actual.energies, expected.energies,
+                "varying beta chunk={chunk}"
+            );
+            assert_eq!(actual_rng, expected_rng, "varying beta chunk={chunk}");
+            let actual_final = device.run(&chunked, params.num_reads, params.seed).unwrap();
+            assert_eq!(
+                actual_final.spins, expected_final.spins,
+                "descent chunk={chunk}"
+            );
+            assert_eq!(
+                actual_final.energies, expected_final.energies,
+                "descent chunk={chunk}"
+            );
+        }
     }
 
     #[tokio::test]

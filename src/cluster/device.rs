@@ -311,7 +311,6 @@ impl ClusterDevice {
     ///
     /// # Errors
     /// Returns the same validation and device errors as `run_work`.
-    #[cfg(feature = "long-tests")]
     #[doc(hidden)]
     pub fn run_work_with_chunk_for_test(
         &mut self,
