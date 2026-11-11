@@ -1,0 +1,483 @@
+//! Opt-in CU-4 measurement. Run one shape per process on physical GPU 1.
+
+use super::*;
+use crate::capacity::DeviceLimits;
+use crate::cluster::sampler::ClusterWork;
+use cudarc::driver::sys::CUevent_flags;
+use quip_solver_core::ising_generators::descriptor::{
+    admit, params_digest, AdvertisedLimits, SizeBounds,
+};
+use quip_solver_core::ising_generators::family::{
+    admit_topology, generate_instance, BaseTopology, SaltFault,
+};
+use quip_solver_core::ising_generators::ice::{zephyr_lattice, TWISTED_DIMER_V1};
+use quip_solver_core::ising_generators::instance::Instance;
+use quip_solver_core::ising_generators::random::NonceDeriver;
+use quip_solver_core::quip_protocol::lease::{Generator, LeaseSpec};
+use quip_solver_core::{IsingGraph, SampleParams};
+use serde_json::json;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::process::Command;
+use std::time::Instant;
+
+const HOST_RUNS: usize = 20;
+const KERNEL_RUNS: usize = 5;
+
+fn median(values: &[f64]) -> f64 {
+    assert!(!values.is_empty());
+    let mut values = values.to_vec();
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        values[mid - 1].midpoint(values[mid])
+    } else {
+        values[mid]
+    }
+}
+
+fn milliseconds(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+fn command(program: &str, args: &[&str]) -> String {
+    let out = Command::new(program).args(args).output().unwrap();
+    assert!(out.status.success(), "{program} failed");
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+fn telemetry() -> String {
+    command(
+        "nvidia-smi",
+        &[
+            "-i", "1", "--query-gpu=name,uuid,pci.bus_id,driver_version,temperature.gpu,clocks.sm,pstate,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+}
+
+fn parameters(m: u16, t: u8, weak: u16, pairs: u32) -> Vec<u8> {
+    let mut bytes = vec![1];
+    for (tag, value) in [
+        (1_u16, m.to_le_bytes().to_vec()),
+        (2, vec![t]),
+        (3, weak.to_le_bytes().to_vec()),
+        (4, pairs.to_le_bytes().to_vec()),
+    ] {
+        bytes.extend(tag.to_le_bytes());
+        bytes.extend(u32::try_from(value.len()).unwrap().to_le_bytes());
+        bytes.extend(value);
+    }
+    bytes
+}
+
+// FamilyLease has no public constructor. This is its exact generate body:
+// re-admit the saved descriptor, then call the canonical generate_instance.
+fn generate(
+    params: &[u8],
+    digest: &[u8; 32],
+    base: &BaseTopology,
+    bounds: &SizeBounds,
+    nonce: [u8; 32],
+) -> Result<Instance, SaltFault> {
+    let admitted = admit(
+        &[TWISTED_DIMER_V1],
+        TWISTED_DIMER_V1.family_id.as_bytes(),
+        1,
+        params,
+        digest,
+    )
+    .unwrap();
+    generate_instance(&admitted, base, bounds, nonce)
+}
+
+fn limits(ctx: &CudaContext) -> DeviceLimits {
+    DeviceLimits {
+        shared_bytes_per_block: attribute(
+            ctx,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+        )
+        .unwrap(),
+        shared_bytes_per_block_optin: attribute(
+            ctx,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        )
+        .unwrap(),
+        free_bytes: ctx.mem_get_info().unwrap().0,
+        sm_count: attribute(
+            ctx,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        )
+        .unwrap(),
+        threads_per_sm: attribute(
+            ctx,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+        )
+        .unwrap(),
+    }
+}
+
+fn ising_graph(instance: &Instance) -> IsingGraph {
+    IsingGraph {
+        h: instance
+            .h()
+            .iter()
+            .map(|&v| f64::from(v) / 1000.0)
+            .collect(),
+        j: instance
+            .j()
+            .iter()
+            .map(|&v| f64::from(v) / 1000.0)
+            .collect(),
+        edges: instance
+            .edges()
+            .iter()
+            .map(|&(u, v)| (usize::try_from(u).unwrap(), usize::try_from(v).unwrap()))
+            .collect::<Vec<_>>()
+            .into(),
+    }
+}
+
+// Measure the five actual upload buffers that carry coefficients. ELL words
+// also contain neighbor indices, so counting their entire transfer is an
+// optimistic upper bound on the bytes device generation could eliminate.
+fn coefficients(device: &mut ClusterDevice) -> f64 {
+    let stream = &device.stream;
+    let start = stream
+        .context()
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .unwrap();
+    let end = stream
+        .context()
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .unwrap();
+    let d = device.graph.layout();
+    start.record(stream).unwrap();
+    stream
+        .memcpy_htod(&d.weak_ell, &mut device.weak_ell)
+        .unwrap();
+    stream.memcpy_htod(&d.all_ell, &mut device.all_ell).unwrap();
+    stream.memcpy_htod(&d.h, &mut device.h).unwrap();
+    stream.memcpy_htod(&d.tile_w, &mut device.tile_w).unwrap();
+    stream.memcpy_htod(&d.link_w, &mut device.link_w).unwrap();
+    end.record(stream).unwrap();
+    f64::from(start.elapsed_ms(&end).unwrap())
+}
+
+// Use the production per-sweep callback and launch arguments, with events
+// immediately around each launch. Exclude host gaps from the kernel sum.
+fn kernel_ms(device: &ClusterDevice, work: &ClusterWork) -> (f64, Vec<i8>) {
+    let (spin_count, rng_count, blocks) = launch_shape(&device.graph, work.reads).unwrap();
+    let (spins, rng) = initial_state(spin_count, rng_count, work.seed);
+    let mut spins = device.stream.clone_htod(&spins).unwrap();
+    let mut rng = device.stream.clone_htod(&rng).unwrap();
+    device.stream.synchronize().unwrap();
+    let ctx = device.stream.context();
+    let start = ctx
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .unwrap();
+    let end = ctx
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .unwrap();
+    let config = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (512, 1, 1),
+        shared_mem_bytes: u32::try_from(device.graph.dynamic_shared_bytes()).unwrap(),
+    };
+    let params = ClusterSchedule {
+        sweeps: work.betas.len() * work.sweeps_per_beta,
+        chunk: 1,
+        ..ClusterSchedule::default()
+    }
+    .params()
+    .unwrap();
+    let wall = Instant::now();
+    let mut total = 0.0;
+    work.for_each_launch(
+        &|| wall.elapsed().as_secs() >= 40,
+        |sweep, beta, descent| {
+            start.record(&device.stream)?;
+            device.launch(
+                Params {
+                    beta_min: beta,
+                    beta_max: beta,
+                    ..params
+                },
+                i32::try_from(sweep).unwrap(),
+                i32::from(!descent),
+                if descent { 2 } else { 0 },
+                config,
+                &mut spins,
+                &mut rng,
+            )?;
+            end.record(&device.stream)?;
+            device.stream.synchronize()?;
+            total += f64::from(start.elapsed_ms(&end)?);
+            Ok(())
+        },
+    )
+    .unwrap();
+    let spins = device.stream.clone_dtoh(&spins).unwrap();
+    device.stream.synchronize().unwrap();
+    (total, spins)
+}
+
+#[test]
+#[ignore = "CU-4 measurement: requires CUDA_VISIBLE_DEVICES=1 and CU4_SHAPE=m,t,weak,pairs"]
+#[allow(clippy::too_many_lines)] // One sequential measurement keeps GPU phases serialized.
+fn measure_generation_cost() {
+    assert_eq!(std::env::var("CUDA_VISIBLE_DEVICES").as_deref(), Ok("1"));
+    let shape = std::env::var("CU4_SHAPE").expect("set CU4_SHAPE=m,t,weak,pairs");
+    let fields: Vec<_> = shape.split(',').collect();
+    assert_eq!(fields.len(), 4);
+    let (m, t, weak, pairs) = (
+        fields[0].parse().unwrap(),
+        fields[1].parse().unwrap(),
+        fields[2].parse().unwrap(),
+        fields[3].parse().unwrap(),
+    );
+    let output =
+        std::env::var("CU4_OUTPUT").expect("set CU4_OUTPUT to a JSONL path inside this checkout");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = root.join(output);
+    let parent = output.parent().unwrap().canonicalize().unwrap();
+    assert!(parent.starts_with(root.canonicalize().unwrap()));
+    let start_telemetry = telemetry();
+    let kernel = ClusterKernel::load(0).unwrap(); // Visible ordinal 0 is physical GPU 1.
+    let ctx = kernel.stream.context();
+    let limits = limits(ctx);
+    let (nodes, edges) = zephyr_lattice(m, t).unwrap();
+    let base = BaseTopology::new(nodes, &edges).unwrap();
+    let params = parameters(m, t, weak, pairs);
+    let digest = params_digest(&params);
+    let contracts = [TWISTED_DIMER_V1];
+    let admitted = admit(
+        &contracts,
+        TWISTED_DIMER_V1.family_id.as_bytes(),
+        1,
+        &params,
+        &digest,
+    )
+    .unwrap();
+    let bounds = admit_topology(
+        &admitted,
+        &base,
+        base.order_digest(),
+        &AdvertisedLimits {
+            max_nodes: 0,
+            max_edges: 0,
+            max_degree: 0,
+        },
+    );
+    let bounds = match bounds {
+        Ok(bounds) => bounds,
+        Err(error) => {
+            let row = json!({"shape": shape, "nodes": base.node_ids().len(), "edges": base.edges().len(),
+                "family": TWISTED_DIMER_V1.family_id, "revision": 1, "admission_rejection": error.value(),
+                "commit": command("git", &["rev-parse", "HEAD"]), "gpu_start": start_telemetry,
+                "date_utc": command("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])});
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(output)
+                .unwrap();
+            serde_json::to_writer(&mut file, &row).unwrap();
+            writeln!(file).unwrap();
+            println!("CU4 {row}");
+            return;
+        }
+    };
+    let lease = LeaseSpec::new(
+        Generator::FamilyChacha8V1,
+        [1; 32],
+        [2; 32],
+        [3; 32],
+        0,
+        1000,
+    )
+    .unwrap();
+    let nonces = NonceDeriver::new(lease.last_proof_block_hash, lease.miner_account);
+    let sample_params = SampleParams::default();
+    let mut instances = Vec::new();
+    let mut generation = Vec::new();
+    let mut skipped = Vec::new();
+    // Untimed generator warmup. The same lease nonces are used on every rerun.
+    let _warmup = generate(
+        &params,
+        &digest,
+        &base,
+        &bounds,
+        nonces.derive(lease.salt(0).unwrap()),
+    );
+    for index in 0..1000 {
+        let nonce = nonces.derive(lease.salt(index).unwrap());
+        let start = Instant::now();
+        let instance = generate(&params, &digest, &base, &bounds, nonce);
+        let ms = milliseconds(start);
+        match instance {
+            Ok(instance) => {
+                instances.push(instance);
+                generation.push(ms);
+            }
+            Err(SaltFault::Skip(code)) => {
+                skipped.push(json!({"index": index, "code": code.value(), "ms": ms}));
+            }
+            Err(error) => panic!("canonical generator defect: {error:?}"),
+        }
+        if instances.len() == HOST_RUNS {
+            break;
+        }
+    }
+    assert_eq!(instances.len(), HOST_RUNS, "not enough valid jobs");
+    let prepare = |instance: &Instance| {
+        PreparedGraph::from_instance(
+            instance,
+            &TWISTED_DIMER_V1,
+            crate::cluster::Weights::FULL,
+            &limits,
+            sample_params.num_reads,
+        )
+    };
+    let _warmup = prepare(&instances[0]);
+    let mut preparation = Vec::new();
+    let mut prepared = Vec::new();
+    let mut rejection = None;
+    for instance in &instances {
+        let start = Instant::now();
+        let result = prepare(instance);
+        preparation.push(milliseconds(start));
+        match result {
+            Ok(graph) => prepared.push(graph),
+            Err(error) => rejection = Some(error.to_string()),
+        }
+    }
+    let mut row = json!({
+        "date_utc": command("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
+        "commit": command("git", &["rev-parse", "HEAD"]),
+        "source_diff": command("git", &["diff", "--stat"]),
+        "gpu_start": start_telemetry, "family": TWISTED_DIMER_V1.family_id, "revision": 1,
+        "shape": shape, "nodes": base.node_ids().len(), "edges": base.edges().len(),
+        "reads": sample_params.num_reads, "sweeps": sample_params.num_sweeps, "sweeps_per_beta": sample_params.sweeps_per_beta,
+        "host_runs": HOST_RUNS, "generation_ms": median(&generation), "preparation_ms": median(&preparation),
+        "generation_samples_ms": generation, "preparation_samples_ms": preparation,
+        "skipped": skipped, "preparation_rejection": rejection,
+        "shared_budget_bytes": limits.shared_bytes_per_block_optin,
+    });
+    if rejection.is_none() {
+        let gpu_phase = Instant::now();
+        assert_eq!(prepared.len(), HOST_RUNS);
+        // Compilation, allocation initialization, and the first solve are warm.
+        let mut device =
+            ClusterDevice::open_with_kernel(prepare(&instances[0]).unwrap(), &kernel).unwrap();
+        let instance = &instances[0];
+        let graph = ising_graph(instance);
+        let work = ClusterWork::new(&graph, &sample_params).unwrap();
+        let warmup = Instant::now();
+        device
+            .run_work(&work, &|| warmup.elapsed().as_secs() >= 40, &|| false)
+            .unwrap();
+        let warmup_ms = milliseconds(warmup);
+        let mut upload_ms = Vec::new();
+        let mut upload_wall_ms = Vec::new();
+        let mut coefficient_ms = Vec::new();
+        let mut coefficient_wall_ms = Vec::new();
+        for graph in prepared {
+            kernel.stream.synchronize().unwrap();
+            let start_event = ctx
+                .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+                .unwrap();
+            let end_event = ctx
+                .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+                .unwrap();
+            let start = Instant::now();
+            start_event.record(&kernel.stream).unwrap();
+            let next = ClusterDevice::open_with_kernel(graph, &kernel).unwrap();
+            end_event.record(&kernel.stream).unwrap();
+            let ms = f64::from(start_event.elapsed_ms(&end_event).unwrap());
+            upload_wall_ms.push(milliseconds(start));
+            upload_ms.push(ms);
+            device = next;
+            let start = Instant::now();
+            coefficient_ms.push(coefficients(&mut device));
+            coefficient_wall_ms.push(milliseconds(start));
+        }
+        let graph = ising_graph(instances.last().unwrap());
+        let work = ClusterWork::new(&graph, &sample_params).unwrap();
+        let mut kernels = Vec::new();
+        let mut kernel_wall_ms = Vec::new();
+        let mut jobs = Vec::new();
+        let mut results = Vec::new();
+        let mut totals = Vec::new();
+        for _ in 0..KERNEL_RUNS {
+            let start = Instant::now();
+            let (ms, event_spins) = kernel_ms(&device, &work);
+            kernels.push(ms);
+            kernel_wall_ms.push(milliseconds(start));
+            let start = Instant::now();
+            let run = device
+                .run_work(&work, &|| start.elapsed().as_secs() >= 40, &|| false)
+                .unwrap();
+            jobs.push(milliseconds(start));
+            assert_eq!(run.spins.len(), sample_params.num_reads);
+            let expected: Vec<_> = event_spins
+                .chunks_exact(device.graph.original_graph().num_nodes())
+                .map(|spins| device.graph.unpermute(spins).unwrap())
+                .collect();
+            assert_eq!(
+                run.spins, expected,
+                "event instrumentation changed the solve"
+            );
+            results.push(run.energies);
+
+            // An independent end-to-end job includes canonical expansion,
+            // float conversion, CU-1, allocation/upload, schedule construction,
+            // production launches, download, and the sampler's final rescore.
+            let start = Instant::now();
+            let nonce = nonces.derive(lease.salt(u64::try_from(totals.len()).unwrap()).unwrap());
+            let instance = generate(&params, &digest, &base, &bounds, nonce).unwrap();
+            let graph = ising_graph(&instance);
+            let prepared = prepare(&instance).unwrap();
+            let work = ClusterWork::new(&graph, &sample_params).unwrap();
+            let mut complete = ClusterDevice::open_with_kernel(prepared, &kernel).unwrap();
+            let run = complete
+                .run_work(&work, &|| start.elapsed().as_secs() >= 40, &|| false)
+                .unwrap();
+            for spins in &run.spins {
+                let energy = quip_solver_core::quip_protocol::scoring::energy_milli(
+                    spins,
+                    &graph.h,
+                    &graph.j,
+                    &graph.edges,
+                );
+                std::hint::black_box(energy);
+            }
+            totals.push(milliseconds(start));
+        }
+        let total = median(&totals);
+        let saving = median(&generation) + median(&coefficient_ms);
+        row["device"] = json!({
+            "transfer_ms": median(&upload_ms), "upload_wall_ms": median(&upload_wall_ms),
+            "coefficient_transfer_ms": median(&coefficient_ms),
+            "coefficient_wall_ms": median(&coefficient_wall_ms),
+            "kernel_ms": median(&kernels), "run_wall_ms": median(&jobs), "kernel_runs": KERNEL_RUNS,
+            "total_ms": total,
+            "frontend_percent": 100.0 * (median(&generation) + median(&preparation) + median(&upload_ms)) / total,
+            "saving_upper_ms": saving, "saving_upper_percent": 100.0 * saving / total,
+            "threshold_met": saving > 50.0 || saving / total > 0.1,
+            "warmup_ms": warmup_ms, "transfer_samples_ms": upload_ms,
+            "upload_wall_samples_ms": upload_wall_ms, "coefficient_samples_ms": coefficient_ms,
+            "kernel_samples_ms": kernels, "kernel_wall_samples_ms": kernel_wall_ms,
+            "run_wall_samples_ms": jobs, "energies_milli": results,
+            "total_samples_ms": totals, "gpu_phase_ms": milliseconds(gpu_phase),
+        });
+    }
+    row["gpu_end"] = json!(telemetry());
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output)
+        .unwrap();
+    serde_json::to_writer(&mut file, &row).unwrap();
+    writeln!(file).unwrap();
+    println!("CU4 {row}");
+}
