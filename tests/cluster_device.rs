@@ -5,6 +5,9 @@ use quip_solver_cuda::cluster::device::{ClusterDevice, ClusterSchedule};
 use quip_solver_cuda::cluster::{Model, Motifs, PreparedGraph, Weights};
 use serial_test::serial;
 
+#[path = "support/cluster_reference.rs"]
+mod reference;
+
 fn limits() -> DeviceLimits {
     DeviceLimits {
         shared_bytes_per_block: 48 << 10,
@@ -319,6 +322,7 @@ fn optin_shared_memory_with_knee_and_no_periodic_single_spin() {
     let mut device = ClusterDevice::open(0, prepared).unwrap();
     let run = device.run(&schedule, 4, u64::MAX).unwrap();
     assert_eq!(run.spins.len(), 4);
+    assert_eq!(run.energies.len(), 4);
     for (spins, &energy) in run.spins.iter().zip(&run.energies) {
         assert_eq!(spins.len(), 5501);
         assert!(spins.iter().all(|&v| v == 1 || v == -1));
@@ -350,4 +354,148 @@ fn optin_shared_memory_with_knee_and_no_periodic_single_spin() {
             assert!(moved_energy >= energy);
         }
     }
+}
+
+// Missing annealing, wrong residual signs, lost RNG, and omitted tail sweeps
+// must disagree before final descent can hide their effects.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial]
+fn pre_descent_sweeps_match_research_reference() {
+    for weights in [
+        Weights::FULL,
+        Weights {
+            tile_milli: 250,
+            pair_milli: 250,
+        },
+        Weights {
+            tile_milli: 1,
+            pair_milli: 0,
+        },
+    ] {
+        let p = graph(weights);
+        let mut device = ClusterDevice::open(0, graph(weights)).unwrap();
+        for (sweeps, single_every, knee) in [(1, 0, false), (2, 1, false), (7, 2, true)] {
+            let q = ClusterSchedule {
+                sweeps,
+                single_every,
+                chunk: 3,
+                rounds: 3,
+                beta_min: 0.3,
+                beta_max: 4.0,
+                beta_knee: if knee { 1.2 } else { 0.0 },
+                knee_frac: if knee { 0.4 } else { 0.0 },
+            };
+            for seed in [1, u64::MAX] {
+                let (expected, rng) = reference::run(&p, &q, 4, seed);
+                let (actual, actual_rng) = device.run_before_descent_for_test(&q, 4, seed).unwrap();
+                assert_eq!(
+                    actual.spins, expected,
+                    "spins: {q:?}, {weights:?}, seed {seed}"
+                );
+                assert_eq!(actual_rng, rng, "RNG: {q:?}, {weights:?}, seed {seed}");
+                assert_eq!(actual.energies.len(), 4);
+                for (s, &e) in expected.iter().zip(&actual.energies) {
+                    assert_eq!(e, p.energy(s).unwrap());
+                }
+                let unchunked = ClusterSchedule {
+                    chunk: sweeps,
+                    ..q.clone()
+                };
+                let (whole, whole_rng) = device
+                    .run_before_descent_for_test(&unchunked, 4, seed)
+                    .unwrap();
+                assert_eq!(whole.spins, expected);
+                assert_eq!(whole_rng, rng);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial]
+fn union_find_overlapping_tiles_and_links_matches_host_components() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+    // Corner-sharing tiles form two long chains. Links connect those chains,
+    // with cycles and duplicate bonds to contend on shared roots. Node 1100
+    // stays isolated. The 1100-node component crosses warps and block strides.
+    let n = 1101_usize;
+    let mut edges = Vec::new();
+    for offset in [0, 550] {
+        for first in (offset..offset + 549).step_by(3) {
+            let tile = [first, first + 1, first + 2, first + 3];
+            for a in 0..4 {
+                for b in a + 1..4 {
+                    edges.push((tile[a], tile[b]));
+                }
+            }
+        }
+        edges.push((offset + 546, offset + 549));
+    }
+    edges.extend([(0, 550), (31, 590), (500, 1099), (0, 550)]);
+    let expected = reference::components(n, &edges);
+    assert_eq!(expected.iter().filter(|&&r| r == 0).count(), 1100);
+    assert_eq!(expected[1100], 1100);
+    // Append only a test entry point; compile the real production unite and
+    // find_root unchanged. A separate host traversal supplies the oracle.
+    let source = format!(
+        "{}\n{}",
+        include_str!("../kernels/cluster.cu"),
+        r#"
+extern "C" __global__ void test_components(int n, int m, const int2* edges, int* roots) {
+    extern __shared__ int parent[];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) parent[i] = i;
+    __syncthreads();
+    for (int e = threadIdx.x; e < m; e += blockDim.x) unite(parent, edges[e].x, edges[e].y);
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) roots[i] = find_root(parent, i);
+}
+"#
+    );
+    let ctx = CudaContext::new(0).unwrap();
+    let (major, minor) = ctx.compute_capability().unwrap();
+    let ptx = compile_ptx_with_opts(
+        source,
+        CompileOptions {
+            options: vec![format!("--gpu-architecture=compute_{major}{minor}")],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let module = ctx.load_module(ptx).unwrap();
+    let function = module.load_function("test_components").unwrap();
+    let stream = ctx.default_stream();
+    let flat: Vec<i32> = edges
+        .iter()
+        .flat_map(|&(a, b)| [i32::try_from(a).unwrap(), i32::try_from(b).unwrap()])
+        .collect();
+    let device_edges = stream.clone_htod(&flat).unwrap();
+    let mut roots = stream.alloc_zeros::<i32>(n).unwrap();
+    let config = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (512, 1, 1),
+        shared_mem_bytes: u32::try_from(n * 4).unwrap(),
+    };
+    let mut launch = stream.launch_builder(&function);
+    let nodes = i32::try_from(n).unwrap();
+    let bonds = i32::try_from(edges.len()).unwrap();
+    launch
+        .arg(&nodes)
+        .arg(&bonds)
+        .arg(&device_edges)
+        .arg(&mut roots);
+    // SAFETY: Edges are in range, output and shared parent have n entries,
+    // and the argument types match the appended test kernel.
+    unsafe { launch.launch(config) }.unwrap();
+    let actual = stream.clone_dtoh(&roots).unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|&r| i32::try_from(r).unwrap())
+            .collect::<Vec<_>>()
+    );
 }

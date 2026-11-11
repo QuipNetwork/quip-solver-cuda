@@ -233,6 +233,33 @@ impl ClusterDevice {
         anneals: usize,
         seed: u64,
     ) -> Result<ClusterRun, ClusterDeviceError> {
+        self.run_inner(schedule, anneals, seed, true)
+            .map(|(run, _)| run)
+    }
+
+    /// Test access to the state before final descent, with all per-thread RNG
+    /// words in anneal-major order. Spins retain the original node order.
+    /// This skips only final descent and exists for integration-test oracles.
+    ///
+    /// # Errors
+    /// Returns the same validation and CUDA errors as `run`.
+    #[doc(hidden)]
+    pub fn run_before_descent_for_test(
+        &mut self,
+        schedule: &ClusterSchedule,
+        anneals: usize,
+        seed: u64,
+    ) -> Result<(ClusterRun, Vec<u64>), ClusterDeviceError> {
+        self.run_inner(schedule, anneals, seed, false)
+    }
+
+    fn run_inner(
+        &mut self,
+        schedule: &ClusterSchedule,
+        anneals: usize,
+        seed: u64,
+        final_descent: bool,
+    ) -> Result<(ClusterRun, Vec<u64>), ClusterDeviceError> {
         let params = schedule.params()?;
         let ctx = self.stream.context();
         check_shared(
@@ -272,8 +299,15 @@ impl ClusterDevice {
             self.launch(params, start, count, 0, config, &mut spins, &mut rng)?;
             start += count;
         }
-        self.launch(params, 0, 0, 1, config, &mut spins, &mut rng)?;
+        if final_descent {
+            self.launch(params, 0, 0, 1, config, &mut spins, &mut rng)?;
+        }
         let states = self.stream.clone_dtoh(&spins)?;
+        let rng_state = if final_descent {
+            Vec::new()
+        } else {
+            self.stream.clone_dtoh(&rng)?
+        };
         self.stream.synchronize()?;
         let mut result = ClusterRun {
             spins: Vec::with_capacity(anneals),
@@ -284,7 +318,7 @@ impl ClusterDevice {
             result.energies.push(self.graph.energy(&original)?);
             result.spins.push(original);
         }
-        Ok(result)
+        Ok((result, rng_state))
     }
 
     // The flat argument order matches quip_cluster_anneal in kernels/cluster.cu.
