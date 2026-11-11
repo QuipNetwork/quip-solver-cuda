@@ -57,6 +57,19 @@ pub struct ColorBlocks {
     pub(crate) num_colors: i32,
 }
 
+impl ColorBlocks {
+    /// Dense Gibbs updates nodes serially, so every node can own a colour.
+    pub(crate) fn serial(n: usize) -> Self {
+        let num_colors = i32::try_from(n).expect("validated kernel node count");
+        Self {
+            starts: (0..num_colors).collect(),
+            counts: vec![1; n],
+            nodes: (0..num_colors).collect(),
+            num_colors,
+        }
+    }
+}
+
 /// Greedy (Welsh-Powell) coloring of a CSR adjacency: process nodes in
 /// degree-descending order, assign the smallest color unused by any
 /// already-colored neighbor. Not the Zephyr-optimal 4-coloring, but valid
@@ -194,8 +207,9 @@ impl SelfFeedingTopology {
     ///
     /// Host-side adjacency is built entirely in `usize`. Casts to `i32`/`u32`
     /// happen only when packing the CUDA kernel ABI arrays (`row_ptr`,
-    /// `col_ind`, `edge_pos`); graph size is bounded well below `i32::MAX` by
-    /// session limits (`DEFAULT_MAX_EDGES` / `max_nodes`).
+    /// `col_ind`, `edge_pos`); graph size is bounded by the `i32` index range through
+    /// session limits (`capacity::advertised_couplers` / `max_nodes`, and
+    /// `capacity::msa_max_couplers` for msa).
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn build(graph: &IsingGraph) -> Self {
@@ -338,6 +352,24 @@ where
     fill_converted(topology, graph, |v| scaled(v, scale))
 }
 
+pub(crate) fn fill_real_coefficients(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    fill_converted(topology, graph, real_coefficient)
+}
+
+#[allow(clippy::cast_possible_truncation)] // Real entry points explicitly select f32 storage.
+pub(crate) fn real_coefficient(value: f64) -> Result<f32, String> {
+    let narrowed = value as f32;
+    if !narrowed.is_finite() || (value != 0.0 && narrowed.abs() < f32::MIN_POSITIVE) {
+        return Err(format!(
+            "real coefficient {value} is outside the finite f32 range"
+        ));
+    }
+    Ok(narrowed)
+}
+
 fn fill_converted<T: Copy + Default>(
     topology: &SelfFeedingTopology,
     graph: &IsingGraph,
@@ -351,6 +383,11 @@ fn fill_converted<T: Copy + Default>(
             continue;
         };
         if u >= topology.n || v >= topology.n {
+            continue;
+        }
+        // Dense diagonals stay zero. Self-loops are constant terms included
+        // by host scoring and must not contribute to spin-flip deltas.
+        if u == v && topology.row_ptr.is_empty() {
             continue;
         }
         let val = convert(graph.j.get(k).copied().unwrap_or(0.0))?;
@@ -387,6 +424,22 @@ mod tests {
             vec![1.0, -1.0, 1.0, -1.0],
             vec![(0, 1), (1, 2), (2, 3), (3, 0)],
         )
+    }
+
+    #[test]
+    fn gibbs_dense_complete_colouring_is_fast_and_total() {
+        let start = std::time::Instant::now();
+        // A complete graph requires a unique colour for each node. Dense
+        // topology builds this partition directly, without materializing CSR.
+        let colors = ColorBlocks::serial(9_583);
+        assert_eq!(colors.counts.iter().sum::<i32>(), 9_583);
+        assert_eq!(colors.num_colors, 9_583);
+        for node in 0..9_583 {
+            assert_eq!(colors.starts[node], i32::try_from(node).unwrap());
+            assert_eq!(colors.counts[node], 1);
+            assert_eq!(colors.nodes[node], i32::try_from(node).unwrap());
+        }
+        assert!(start.elapsed().as_secs() < 30);
     }
 
     #[test]
@@ -488,6 +541,27 @@ mod tests {
         // Self-loop J appears once; (0,1) appears twice.
         assert_eq!(j.iter().filter(|&&v| v == 7).count(), 1);
         assert_eq!(j.iter().filter(|&&v| v == 2).count(), 2);
+    }
+
+    #[test]
+    fn dense_coefficients_leave_diagonal_zero() {
+        let graph = IsingGraph::new(vec![1.0, 0.0], vec![7.0, 2.0], vec![(0, 0), (0, 1)]);
+        let topology = SelfFeedingTopology {
+            n: 2,
+            nnz: 4,
+            row_ptr: vec![],
+            col_ind: vec![],
+            edge_pos: vec![(0, 0), (1, 2)],
+            colors: ColorBlocks {
+                starts: vec![],
+                counts: vec![],
+                nodes: vec![],
+                num_colors: 0,
+            },
+        };
+        let (j, h) = fill_coefficients::<i8>(&topology, &graph, 1000).unwrap();
+        assert_eq!(j, vec![0, 2, 2, 0]);
+        assert_eq!(h, vec![1, 0]);
     }
 
     #[test]

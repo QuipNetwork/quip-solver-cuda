@@ -6,10 +6,12 @@
 //! `config.toml` with `[cuda.N] binary = "<path>/quip-cuda-msa"`.
 
 use clap::{Parser, Subcommand};
-use quip_solver_core::{run, CommonArgs, OpenError};
+use quip_solver_core::{run, CommonArgs};
 use quip_solver_cuda::bench::{run_bench, BenchAction};
-use quip_solver_cuda::capacity::{self, advertised_nodes, MSA_DEFAULT_NODES, MSA_REPLICA_WORDS};
-use quip_solver_cuda::cuda_device::{device_label_mismatch, probe_msa_replica_words, CudaDevice};
+use quip_solver_cuda::capacity::{
+    max_reads, msa_max_couplers, msa_max_nodes, resolve, MSA_DEFAULT_NODES,
+};
+use quip_solver_cuda::cuda_device::{device_label_mismatch, CudaDevice};
 use quip_solver_cuda::nvml_gov::UtilGovernor;
 use quip_solver_cuda::{cuda_msa_identity, KernelKind, MsaSampler};
 use std::process::ExitCode;
@@ -21,6 +23,8 @@ struct Cli {
     command: Option<Command>,
     #[command(flatten)]
     common: CommonArgs,
+    #[command(flatten)]
+    stall: quip_solver_cuda::streaming::StallConfig,
     /// CUDA device index (one process per GPU). Default 0 → miner id `cuda-0`.
     #[arg(long, default_value_t = 0)]
     device: usize,
@@ -33,12 +37,17 @@ struct Cli {
     /// exceeds --utilization. Load from this miner is excluded.
     #[arg(long, default_value_t = false)]
     yielding: bool,
-    /// Largest node count to accept. The miner opens its device before the
-    /// coordinator sends a topology, so this cannot come from the wire. Values
-    /// below the default are raised to it; a value above the device's opt-in
-    /// shared-memory budget is an error at open, never a silent clamp.
-    #[arg(long, default_value_t = MSA_DEFAULT_NODES)]
-    max_nodes: usize,
+    /// Optional lower cap on the node limit derived from device memory.
+    /// Values below 5000 are raised to 5000. A value above the device limit
+    /// is an error at open. Without this flag the full device limit applies.
+    #[arg(long)]
+    max_nodes: Option<usize>,
+    /// Print the device capacity grid and exit without starting a session.
+    #[arg(long)]
+    probe_capacity: bool,
+    /// Emit the capacity grid as a single JSON object.
+    #[arg(long, requires = "probe_capacity")]
+    json: bool,
 }
 
 /// Top-level subcommands. Absent → the ordinary coordinator-driven miner
@@ -98,23 +107,40 @@ fn main() -> ExitCode {
             cli.device
         );
     }
-    // The identity is built before the device opens, so probe the one device
-    // attribute that decides the read count. A device that cannot be inspected
-    // — no driver, no such ordinal — declares the two-word ceiling and is
-    // refused at open if it really cannot hold it (quip-miner-cuda-9p5).
-    let nodes = advertised_nodes(KernelKind::Msa, cli.max_nodes);
-    let words = probe_msa_replica_words(cli.device, nodes).unwrap_or(MSA_REPLICA_WORDS);
-    let msa_max_reads = u32::try_from(capacity::msa_max_reads(words))
-        .expect("msa read cap is at most MSA_LANES * MSA_REPLICA_WORDS");
-    run(cuda_msa_identity(nodes, msa_max_reads), &cli.common, || {
-        let device = CudaDevice::open_with_nodes(cli.device, KernelKind::Msa, cli.max_nodes)
-            .map_err(|e| OpenError(format!("device {}: {e}", cli.device)))?;
+    // MSA has no compiled node array. Open at the floor to read device
+    // limits, then apply the optional cap to the same memory snapshot.
+    let mut device =
+        match CudaDevice::open_with_nodes(cli.device, KernelKind::Msa, MSA_DEFAULT_NODES) {
+            Ok(device) => device,
+            Err(e) => {
+                tracing::error!("device {}: {e}", cli.device);
+                return ExitCode::FAILURE;
+            }
+        };
+    let reads = max_reads(KernelKind::Msa, &device.limits);
+    if cli.probe_capacity {
+        quip_solver_cuda::probe::print_probe(&device, cli.json);
+        return ExitCode::SUCCESS;
+    }
+    if let Some(cap) = cli.max_nodes {
+        if let Err(e) = resolve(KernelKind::Msa, cap, &device.limits) {
+            tracing::error!("device {}: {e}", cli.device);
+            return ExitCode::FAILURE;
+        }
+    }
+    let nodes = msa_max_nodes(&device.limits, reads)
+        .min(cli.max_nodes.unwrap_or(usize::MAX).max(MSA_DEFAULT_NODES));
+    let edges = msa_max_couplers(&device.limits, reads);
+    device.max_nodes = nodes;
+    let mut identity = cuda_msa_identity(nodes, edges);
+    identity.adapt = quip_solver_cuda::cuda_msa_adapt(u32::try_from(reads).unwrap_or(128));
+    run(identity, &cli.common, || {
         // The governor binds by PCI bus id, not by ordinal: NVML's index
         // space is PCI-ordered and does not track the CUDA ordinal this
         // process opened. Taking it from the opened device means both
         // APIs name the same physical GPU by construction.
         let gov = UtilGovernor::start(&device.pci_bus_id, cli.utilization, cli.yielding);
-        Ok(MsaSampler::new(device, gov))
+        Ok(MsaSampler::new(device, gov, cli.stall))
     })
 }
 
@@ -124,17 +150,63 @@ mod cli_tests {
     use clap::Parser;
 
     #[test]
-    fn parses_max_nodes() {
-        let cli = Cli::parse_from(["quip-cuda-msa", "--max-nodes", "5640"]);
-        assert_eq!(cli.max_nodes, 5640);
+    fn parses_stall_flags() {
+        let defaults = Cli::parse_from(["quip-cuda-msa"]);
+        assert!((defaults.stall.stall_secs_per_sweep - 0.0004).abs() < f64::EPSILON);
+        assert_eq!(defaults.stall.stall_floor_secs, None);
+        let cli = Cli::parse_from([
+            "quip-cuda-msa",
+            "--stall-secs-per-sweep",
+            "0.001",
+            "--stall-floor-secs",
+            "1800",
+        ]);
+        assert!((cli.stall.stall_secs_per_sweep - 0.001).abs() < f64::EPSILON);
+        assert_eq!(cli.stall.stall_floor_secs, Some(1800));
+        assert_eq!(
+            cli.stall.floor(8_388_608),
+            std::time::Duration::from_mins(30)
+        );
+        for value in ["0", "-0.1", "NaN", "inf", "-inf"] {
+            assert!(
+                Cli::try_parse_from(["quip-cuda-msa", &format!("--stall-secs-per-sweep={value}"),])
+                    .is_err(),
+                "accepted seconds per sweep: {value}"
+            );
+        }
+        for value in ["0", "-1", "1.5"] {
+            assert!(
+                Cli::try_parse_from(["quip-cuda-msa", &format!("--stall-floor-secs={value}"),])
+                    .is_err(),
+                "accepted floor seconds: {value}"
+            );
+        }
     }
 
-    /// Absent flag must land on the msa floor, so a plain invocation opens
-    /// exactly what it always did.
     #[test]
-    fn max_nodes_defaults_to_the_kernel_floor() {
+    fn parses_probe_capacity_flags() {
+        assert!(Cli::try_parse_from([
+            "quip-cuda-msa",
+            "--probe-capacity",
+            "--device",
+            "0",
+            "--json"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["quip-cuda-msa", "--json"]).is_err());
+    }
+
+    #[test]
+    fn parses_max_nodes() {
+        let cli = Cli::parse_from(["quip-cuda-msa", "--max-nodes", "5640"]);
+        assert_eq!(cli.max_nodes, Some(5640));
+    }
+
+    /// Absent flag lets the device determine the capacity.
+    #[test]
+    fn max_nodes_defaults_to_the_device_limit() {
         let cli = Cli::parse_from(["quip-cuda-msa"]);
-        assert_eq!(cli.max_nodes, quip_solver_cuda::capacity::MSA_DEFAULT_NODES);
+        assert_eq!(cli.max_nodes, None);
     }
 
     #[test]
@@ -142,6 +214,35 @@ mod cli_tests {
         let cli = Cli::parse_from(["quip-cuda-msa", "--device", "1"]);
         assert!(cli.command.is_none());
         assert_eq!(cli.device, 1);
+    }
+
+    #[test]
+    fn parses_dense_bench_flags() {
+        let cli = Cli::parse_from([
+            "quip-cuda-msa",
+            "bench",
+            "run",
+            "--nodes",
+            "200000",
+            "--degree",
+            "40",
+            "--shuffle",
+            "--nonces",
+            "48",
+            "--msa-shared-spins",
+            "0",
+            "--sweeps",
+            "64",
+            "--out",
+            "/tmp/x",
+        ]);
+        let Some(Command::Bench(BenchAction::Run(args))) = cli.command else {
+            panic!("expected a parsed `bench run`");
+        };
+        assert_eq!(args.degree, 40);
+        assert!(args.shuffle);
+        assert_eq!(args.nonces, 48);
+        assert_eq!(args.msa_shared_spins, Some(0));
     }
 
     #[test]

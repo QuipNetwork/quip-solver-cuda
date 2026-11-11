@@ -20,18 +20,6 @@ fn check_capacity(topology: &TopologyView, max_nodes: usize) -> Result<(), Sampl
     if topology.num_nodes > max_nodes {
         return Err(SampleError::Capacity);
     }
-    // Use the full solver's CSR degree calculation. Coefficients do not
-    // affect admission, and the field vector supplies only the node count.
-    let graph = IsingGraph::new(
-        vec![0.0; topology.num_nodes],
-        Vec::new(),
-        topology.edges.clone(),
-    );
-    if crate::topology::SelfFeedingTopology::build(&graph).max_degree()
-        > crate::capacity::MSA_MAX_DEGREE
-    {
-        return Err(SampleError::Capacity);
-    }
     Ok(())
 }
 
@@ -378,6 +366,7 @@ fn run_full_batch(
             out_tx,
             cancel.clone(),
             &sampler.gov,
+            sampler.stall,
         );
         drop(session_done);
         watcher
@@ -488,25 +477,22 @@ mod tests {
     use quip_solver_core::Sampler;
 
     #[test]
-    fn capacity_check_uses_full_msa_degree_and_opened_node_limits() {
+    fn capacity_check_admits_dense_degrees_within_opened_node_limits() {
         let mut topology = TopologyView {
-            num_nodes: 22,
-            edges: (1..22).map(|node| (0, node)).collect(),
+            num_nodes: 64,
+            edges: (1..64).map(|node| (0, node)).collect(),
             allowed_h_milli: vec![0],
             allowed_j_milli: vec![-1000, 1000],
         };
-        assert!(matches!(
-            check_capacity(&topology, 22),
-            Err(SampleError::Capacity)
-        ));
+        assert!(check_capacity(&topology, 64).is_ok());
         topology.edges.pop();
-        assert!(check_capacity(&topology, 22).is_ok());
+        assert!(check_capacity(&topology, 64).is_ok());
         assert!(matches!(
-            check_capacity(&topology, 21),
+            check_capacity(&topology, 63),
             Err(SampleError::Capacity)
         ));
-        topology.num_nodes = 21;
-        assert!(check_capacity(&topology, 21).is_ok());
+        topology.num_nodes = 63;
+        assert!(check_capacity(&topology, 63).is_ok());
     }
 
     #[test]
@@ -516,7 +502,12 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let device = crate::cuda_device::CudaDevice::open(0).unwrap();
         let gov = crate::nvml_gov::UtilGovernor::start(&device.pci_bus_id, 100, false);
-        let sampler = CudaSampler::new(device, gov, KernelKind::Msa);
+        let sampler = CudaSampler::new(
+            device,
+            gov,
+            KernelKind::Msa,
+            crate::streaming::StallConfig::default(),
+        );
         let count = sampler.stream_width() * 3;
         let (jobs, incoming) = channel(count);
         let n = 1024;

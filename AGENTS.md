@@ -1,19 +1,18 @@
-# Agent Instructions
+# Project rules
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+This project uses **bd** (beads) for issue tracking. Run `bd prime` for the workflow context.
 
-> **Architecture in one line:** Issues live in a local Dolt database
-> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
-> git-compatible protocol), stored under `refs/dolt/data` on your git
-> remote — separate from `refs/heads/*` where your code lives.
-> `.beads/issues.jsonl` is a passive export, not the wire protocol.
->
-> See [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md)
-> for the one-screen overview and anti-patterns (don't treat JSONL as the
-> source of truth; don't `bd import` during normal operation; don't
-> reach for third-party Dolt hosting before trying the default).
+Issues live in a local Dolt database at `.beads/dolt/`.
+Cross-machine sync uses `bd dolt push/pull`, a git-compatible protocol.
+It stores data under `refs/dolt/data` on the git remote.
+Code lives under `refs/heads/*`. The `.beads/issues.jsonl` file is a passive export.
+The wire protocol does not use this file.
 
-## Quick Reference
+See [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md) for an overview.
+Treat the Dolt database as the source of truth. Do not use `bd import` during normal work.
+Try the default sync before third-party Dolt hosting.
+
+## Quick reference
 
 ```bash
 bd ready              # Find available work
@@ -23,11 +22,11 @@ bd close <id>         # Complete work
 bd dolt push          # Push beads data to remote
 ```
 
-## Non-Interactive Shell Commands
+## Shell commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
 
-Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
+Some systems alias `cp`, `mv`, and `rm` to include `-i` for interactive mode. These commands can then wait for y/n input.
 
 **Use these forms instead:**
 ```bash
@@ -49,22 +48,47 @@ cp -rf source dest          # NOT: cp -r source dest
 
 
 
-## Card support requirement
+## Card support
 
 Supported GPUs: compute capability 7.0 (Volta) through 12.1 (consumer
 Blackwell). The floor is a kernel property (all three kernels use `__nanosleep`,
-an sm_70+ instruction); the ceiling comes from NVRTC 12.9, which the
+an sm_70+ instruction). The ceiling comes from NVRTC 12.9, which the
 `cuda-12090` cudarc pin in `Cargo.toml` selects. The pin decides which
 `libnvrtc.so.N` the miner dlopens at runtime, so it moves together with the
 `cuda-nvrtc-12-9` package in quip-solver's `docker/Dockerfile.quip-solver-cuda`. `SUPPORTED_ARCHS` in
-`src/cuda_device.rs` is the contract; `tests/arch_coverage.rs` compiles every
+`src/cuda_device.rs` is the contract. The test in `tests/arch_coverage.rs` compiles every
 kernel for every entry (`make test-archs`). Changing card support is a
 reviewed edit to that list, never a side effect of a toolkit bump.
 
-`quip-cuda-msa` keeps its spin state in dynamic shared memory, so the opt-in
-shared memory per block sets both the node ceiling and the read count. A device
-with at least 96 KB holds two 64-lane replica words per spin and serves 128
-reads. Turing (sm_75, 64 KB) holds one word and serves 64. The binary probes
-the device before it builds its identity, so the adapt envelope declares the
-count the device can serve. A device that cannot hold the resolved capacity at
-even one word still refuses to open, with a message that names the budget.
+`quip-cuda-msa` keeps the first spins in shared memory and spills the rest to
+a per-nonce global buffer. The opt-in shared memory per block sets how many
+spins stay on chip. It does not set the node ceiling.
+The device probe selects 64 reads on Turing and 128 reads with larger shared-memory budgets.
+Node and coupler limits come from device memory divided among instances,
+one per SM. With 15 GiB free, 48 SMs and 128 reads, the A4000
+advertises 3,987,504 uncoupled nodes or 44,486,028 dense couplers at 9,433 complete nodes.
+These independent Binary limits use the default 64-beta schedule. Each model
+must pass the memory check with its own precision and schedule length.
+The miner refuses a session whose buffers exceed device memory. At
+200,000 nodes and 4,000,000 edges with 48 models, the A4000 measured about 2 GiB
+for unit models and 5.2 GiB for weighted i32 models (see the
+[A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)).
+
+SA and Gibbs derive their limits from device memory split among instances.
+SA uses one SM per instance. Gibbs uses four SMs per instance.
+A device with 48 SMs runs 48 SA instances or 12 Gibbs instances.
+
+SA uses local state for sparse models through 5,000 nodes. Larger sparse models use global state.
+Gibbs keeps its static shared array for sparse models through 4,800 nodes.
+Other Gibbs models keep a shared spin prefix. The rest of the spins use device memory.
+
+Both kernels choose the sparse or dense route that needs less memory.
+Their node limits describe Binary models with no edges. These limits use the default read count and 64 beta entries.
+Each model must fit with its own edges, precision, and beta count.
+Use `--max-nodes` to set a lower node limit.
+
+All three binaries accept `--probe-capacity`, with optional `--json` and `--device N` flags.
+The probe shows degree 20, degree 60, and complete models at all four precisions.
+JSON includes the kernel name. SA uses local, global, and dense tiers.
+Gibbs and MSA use shared, spill, and dense tiers.
+Without measured slowdown data, the probe reports unknown slowdown for SA and Gibbs.

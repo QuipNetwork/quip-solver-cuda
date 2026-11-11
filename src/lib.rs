@@ -30,12 +30,15 @@ mod jit_cache;
 pub mod kernel;
 mod lease;
 mod lease_turn;
+pub mod model_file;
 pub mod nsight;
 pub mod nvml_gov;
+pub mod probe;
 pub mod sampler;
 pub mod schema;
 pub mod screen;
 mod screen_policy;
+mod slowdown_a4000;
 mod stream_pool;
 pub mod streaming;
 pub mod topology;
@@ -43,6 +46,7 @@ pub mod topology;
 pub use kernel::KernelKind;
 pub use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
 pub use sampler::sample_ising;
+pub use streaming::{sample_one_real, RealSample, SampleSet};
 
 use cuda_device::CudaDevice;
 use nvml_gov::UtilGovernor;
@@ -65,9 +69,9 @@ pub struct MsaSampler {
 impl MsaSampler {
     /// Bind an MSA device and governor. Lease turns share this device.
     #[must_use]
-    pub fn new(device: CudaDevice, gov: UtilGovernor) -> Self {
+    pub fn new(device: CudaDevice, gov: UtilGovernor, stall: streaming::StallConfig) -> Self {
         Self {
-            inner: CudaSampler::new(device, gov, KernelKind::Msa),
+            inner: CudaSampler::new(device, gov, KernelKind::Msa, stall),
             turns: lease_turn::LeaseTurns::default(),
             logged_modes: Mutex::default(),
         }
@@ -153,8 +157,6 @@ impl Sampler for MsaSampler {
     }
 }
 
-const DEFAULT_MAX_EDGES: u32 = 1_000_000;
-
 /// Features every kernel advertises: a real `sample_stream` override, the NVML
 /// governor, exact coefficient uploads, and a host-built ladder that honours
 /// `SampleParams::schedule`.
@@ -192,26 +194,27 @@ const CUDA_ADAPT: quip_solver_core::adapt::AdaptBounds = quip_solver_core::adapt
     reads_solution_floor_factor: 0,
 };
 
-/// Narrow a resolved capacity to the wire type.
+/// Narrow a resolved node or coupler limit to the wire type.
 ///
-/// Saturating is safe: every value reaching here has passed
-/// [`capacity::resolve`], which bounds it by the algorithm ceiling or the
-/// device shared-memory budget — both orders of magnitude below `u32::MAX`.
-fn identity_max_nodes(max_nodes: usize) -> u32 {
-    u32::try_from(max_nodes).unwrap_or(u32::MAX)
+/// Saturating is safe: every value reaching here comes from the capacity
+/// model ([`capacity::resolve`], [`capacity::advertised_couplers`]), which
+/// bounds it by kernel index widths or the device memory budget, below
+/// `u32::MAX`.
+fn identity_limit(limit: usize) -> u32 {
+    u32::try_from(limit).unwrap_or(u32::MAX)
 }
 
-/// Backend identity for `quip-cuda-sa` at a resolved capacity. `max_nodes` is
-/// the self-feeding SA kernel's `unpacked_state` size (thread-local array in
-/// `kernels/sa.cu`) — a job over this would overrun kernel-local storage, not
-/// just run slowly, so it must reject `TooLarge` rather than clamp.
+/// Backend identity for `quip-cuda-sa` at its device-memory node limit,
+/// optionally reduced by `--max-nodes`, and its device-memory coupler limit
+/// ([`capacity::advertised_couplers`]). Each model also passes admission
+/// with its own topology, coefficient width, and beta schedule.
 #[must_use]
-pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
+pub fn cuda_sa_identity(max_nodes: usize, max_edges: usize) -> BackendIdentity {
     BackendIdentity {
         backend: Backend::Cuda,
         algorithm: KernelKind::Sa.algorithm(),
-        max_nodes: identity_max_nodes(max_nodes),
-        max_edges: DEFAULT_MAX_EDGES,
+        max_nodes: identity_limit(max_nodes),
+        max_edges: identity_limit(max_edges),
         features: FEATURES,
         adapt: CUDA_ADAPT,
         // SA has no degree bound (`Some(0)` is unbounded).
@@ -255,31 +258,25 @@ pub const fn cuda_msa_adapt(max_reads: u32) -> quip_solver_core::adapt::AdaptBou
     }
 }
 
-/// Backend identity for `quip-cuda-msa` at a resolved capacity and read count.
+/// Backend identity for `quip-cuda-msa` at a resolved capacity.
 ///
-/// `max_nodes` is the shared-memory ceiling `capacity::msa_budget` derived at
-/// open: the kernel keeps its spin state in dynamic shared memory, so a job
-/// over this cannot be launched and must reject `TooLarge` rather than clamp.
-///
-/// `max_reads` is `capacity::msa_max_reads` at the replica words the device
-/// holds, which the binary probes with
-/// `cuda_device::probe_msa_replica_words` before this identity is built. The
-/// envelope is declared before the device opens, so a card that can only serve
-/// 64 reads must say so here rather than accept 128-read jobs it would clamp.
+/// Node and edge limits come from the device's Binary footprint. Spins past
+/// shared memory spill to global memory. Each axis is an independent bound,
+/// and the session checks the full model footprint before allocating.
 #[must_use]
-pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
+pub fn cuda_msa_identity(max_nodes: usize, max_edges: usize) -> BackendIdentity {
     BackendIdentity {
         backend: Backend::Cuda,
         algorithm: KernelKind::Msa.algorithm(),
-        max_nodes: identity_max_nodes(max_nodes),
-        max_edges: DEFAULT_MAX_EDGES,
+        max_nodes: identity_limit(max_nodes),
+        max_edges: u32::try_from(max_edges).unwrap_or(u32::MAX),
         features: FEATURES,
-        adapt: cuda_msa_adapt(max_reads),
+        adapt: cuda_msa_adapt(u32::try_from(capacity::MSA_MAX_READS).unwrap_or(u32::MAX)),
         // Unit models run the unit-weight kernel (by sign, 64 lanes per word).
         // Other models run the weighted kernel at the model's own scale, up to a
         // local field of 2^24 - 1 milli at scale 1, the worst case.
         limits: ModelLimits {
-            max_degree: Some(u32::try_from(capacity::MSA_MAX_DEGREE).unwrap_or(u32::MAX)),
+            max_degree: None,
             max_local_field_milli: Some(
                 u32::try_from(coefficients::MSA_WEIGHTED_MAX_FIELD).unwrap_or(u32::MAX),
             ),
@@ -288,16 +285,17 @@ pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
     }
 }
 
-/// Backend identity for `quip-cuda-gibbs` at a resolved capacity. `max_nodes`
-/// is the self-feeding Gibbs kernel's `shared_state` size in
-/// `kernels/gibbs.cu`.
+/// Backend identity for `quip-cuda-gibbs` at its device-memory node and
+/// coupler limits ([`capacity::advertised_nodes`],
+/// [`capacity::advertised_couplers`]), the node limit optionally reduced by
+/// `--max-nodes`. Each model also passes admission on its own footprint.
 #[must_use]
-pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
+pub fn cuda_gibbs_identity(max_nodes: usize, max_edges: usize) -> BackendIdentity {
     BackendIdentity {
         backend: Backend::Cuda,
         algorithm: KernelKind::Gibbs.algorithm(),
-        max_nodes: identity_max_nodes(max_nodes),
-        max_edges: DEFAULT_MAX_EDGES,
+        max_nodes: identity_limit(max_nodes),
+        max_edges: identity_limit(max_edges),
         features: FEATURES,
         adapt: CUDA_ADAPT,
         // The int8 bound is per coefficient at the model's own scale, which no
@@ -316,17 +314,24 @@ pub struct CudaSampler {
     device: CudaDevice,
     gov: UtilGovernor,
     kernel: KernelKind,
+    stall: streaming::StallConfig,
     screen: Mutex<screen_policy::Selector>,
 }
 
 impl CudaSampler {
     /// Bind an open device and its NVML governor into a sampler for `kernel`.
     #[must_use]
-    pub fn new(device: CudaDevice, gov: UtilGovernor, kernel: KernelKind) -> Self {
+    pub fn new(
+        device: CudaDevice,
+        gov: UtilGovernor,
+        kernel: KernelKind,
+        stall: streaming::StallConfig,
+    ) -> Self {
         Self {
             device,
             gov,
             kernel,
+            stall,
             screen: Mutex::new(screen_policy::Selector::default()),
         }
     }
@@ -354,7 +359,15 @@ impl Sampler for CudaSampler {
         out: tokio::sync::mpsc::Sender<StreamResult>,
         cancel: CancelToken,
     ) {
-        streaming::run_stream(&self.device, self.kernel, jobs, out, cancel, &self.gov);
+        streaming::run_stream(
+            &self.device,
+            self.kernel,
+            jobs,
+            out,
+            cancel,
+            &self.gov,
+            self.stall,
+        );
     }
 
     fn stream_width(&self) -> usize {
@@ -380,7 +393,11 @@ impl Sampler for CudaSampler {
     }
 
     fn max_reads(&self) -> u32 {
-        streaming::max_reads(self.kernel, self.device.msa_replica_words)
+        if self.kernel == KernelKind::Msa {
+            u32::try_from(capacity::msa_device_reads(&self.device.limits)).unwrap_or(128)
+        } else {
+            streaming::max_reads(self.kernel)
+        }
     }
 
     fn apply_config(&self, backend_toml: &str) {

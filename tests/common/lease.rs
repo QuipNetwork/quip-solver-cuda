@@ -223,6 +223,7 @@ impl Session {
     }
 
     /// Receive real session traffic for a fixed benchmark window.
+    #[cfg(feature = "long-tests")]
     pub(crate) async fn collect_until(&mut self, deadline: Instant) {
         loop {
             match tokio::time::timeout_at(deadline, self.inbound.message()).await {

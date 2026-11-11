@@ -43,20 +43,27 @@ pub enum SampleError {
         /// The node ceiling the device opened with.
         limit: usize,
     },
+    /// The model needs more device memory than this kernel's instances can share.
+    #[error("model with {nodes} nodes and {couplers} couplers needs {required_bytes} bytes of device memory, \
+         but {instances} instances leave {available_bytes} usable bytes")]
+    ModelExceedsDeviceMemory {
+        /// Node count of the rejected model.
+        nodes: usize,
+        /// Undirected coupling count of the rejected model.
+        couplers: usize,
+        /// Estimated device memory for the session at full instance count.
+        required_bytes: usize,
+        /// Usable device memory from the limits read at open.
+        available_bytes: usize,
+        /// Instances sharing the device memory budget.
+        instances: usize,
+    },
     /// The graph is well formed but this kernel cannot run it: for msa, a
     /// spin with more neighbours than the kernel's unrolled budget.
     /// Permanent for this graph and harmless to the session, so it maps to
     /// [`quip_solver_core::SampleError::Capacity`] like `GraphTooLarge`.
     #[error("graph unsupported by the kernel: {0}")]
     Unsupported(String),
-    /// The persistent kernel never marked the slot COMPLETE before the
-    /// driver's deadline: the device is wedged. Maps to
-    /// [`quip_solver_core::SampleError::DeviceFault`] (see the `From` impl
-    /// below), which ends the session for a supervisor restart rather than
-    /// rejecting jobs one at a time against a device that will keep failing
-    /// the same way.
-    #[error("self-feeding kernel timed out")]
-    KernelTimeout,
 }
 
 impl SampleError {
@@ -89,9 +96,10 @@ impl From<SampleError> for quip_solver_core::SampleError {
     /// TYPE-4: name every device error variant explicitly, so a variant added
     /// to this enum later cannot silently fall through a wildcard.
     ///
-    /// `GraphTooLarge` and `Unsupported` are permanent per-graph conditions
-    /// (`Capacity`). `OutOfMemory` is transient VRAM pressure from another
-    /// process (`DeviceBusy`: reject this job, keep the session). Every other
+    /// `GraphTooLarge`, `ModelExceedsDeviceMemory` and `Unsupported` are
+    /// permanent per-graph conditions (`Capacity`). `OutOfMemory` is transient
+    /// VRAM pressure from another process (`DeviceBusy`: reject this job, keep
+    /// the session). Every other
     /// variant here is a CUDA driver or kernel condition this backend cannot
     /// tell apart from a genuinely wedged device — cudarc surfaces a raw
     /// driver failure as an opaque string, with nothing to say whether the
@@ -100,11 +108,11 @@ impl From<SampleError> for quip_solver_core::SampleError {
     /// forever against hardware that will never recover.
     fn from(e: SampleError) -> Self {
         match e {
-            SampleError::GraphTooLarge { .. } | SampleError::Unsupported(_) => Self::Capacity,
+            SampleError::GraphTooLarge { .. }
+            | SampleError::ModelExceedsDeviceMemory { .. }
+            | SampleError::Unsupported(_) => Self::Capacity,
             SampleError::OutOfMemory(_) => Self::DeviceBusy,
-            SampleError::KernelTimeout | SampleError::Cuda(_) | SampleError::Driver(_) => {
-                Self::DeviceFault(e.to_string())
-            }
+            SampleError::Cuda(_) | SampleError::Driver(_) => Self::DeviceFault(e.to_string()),
         }
     }
 }
@@ -115,10 +123,10 @@ impl From<SampleError> for quip_solver_core::SampleError {
 ///
 /// - [`SampleError::GraphTooLarge`] if `graph` has more nodes than the chosen
 ///   kernel's fixed-size state supports. Permanent — retrying cannot help.
-/// - [`SampleError::Unsupported`] if no path holds the coefficients exactly,
-///   or the msa topology has a spin with more than 20 neighbours. Permanent.
-/// - [`SampleError::KernelTimeout`] if the persistent kernel never marks the
-///   slot complete before the driver's deadline.
+/// - [`SampleError::ModelExceedsDeviceMemory`] if an msa session exceeds the
+///   usable device memory read at open. Refused before device allocation.
+/// - [`SampleError::Unsupported`] if no path holds the coefficients exactly.
+///   MSA routes degrees above [`crate::capacity::MSA_MAX_DEGREE`] to dense storage.
 /// - [`SampleError::Cuda`] if opening the device or compiling its kernels failed.
 /// - [`SampleError::OutOfMemory`] if the driver could not allocate device
 ///   memory — transient VRAM pressure, rejected per-job.
@@ -138,6 +146,30 @@ pub fn sample_ising(
 mod tests {
     use super::SampleError;
     use cudarc::driver::sys::CUresult;
+
+    #[test]
+    fn model_exceeds_device_memory_maps_to_capacity() {
+        let error = SampleError::ModelExceedsDeviceMemory {
+            nodes: 50_000,
+            couplers: 1_500_000,
+            required_bytes: 512 << 20,
+            available_bytes: 64 << 20,
+            instances: 48,
+        };
+        assert_eq!(
+            quip_solver_core::SampleError::from(error),
+            quip_solver_core::SampleError::Capacity
+        );
+    }
+
+    #[test]
+    fn foreign_oom_stays_device_busy() {
+        let error = SampleError::OutOfMemory("foreign process holds VRAM".to_owned());
+        assert_eq!(
+            quip_solver_core::SampleError::from(error),
+            quip_solver_core::SampleError::DeviceBusy
+        );
+    }
 
     /// VRAM pressure from another process must reject one job, not end the
     /// session: `DeviceFault` here would put the miner in a restart loop for

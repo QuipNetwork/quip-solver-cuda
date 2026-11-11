@@ -1,9 +1,7 @@
 # `quip-solver-cuda`
 
-CUDA Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
-mining protocol: simulated annealing (`quip-cuda-sa`), multi-spin coded
-simulated annealing (`quip-cuda-msa`) and heat-bath Gibbs (`quip-cuda-gibbs`),
-shipped as separate binaries. **amd64 only.**
+CUDA Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3 mining protocol.
+Each solver has its own binary. See the list below. **amd64 only.**
 
 Each process binds one CUDA device (`--device N`) and drives it directly.
 The coordinator takes N from the `[cuda.N]` config section and passes it as
@@ -24,10 +22,46 @@ lower architecture and loads through the driver's forward-compatible PTX JIT.
 `src/cuda_device.rs` is the contract and `tests/arch_coverage.rs` enforces it
 (`make test-archs`). The host scores energies with the canonical
 `quip_protocol::scoring::energy_milli` so results match consensus.
-`quip-cuda-msa` sizes its spin state against the opt-in shared memory per
-block. A device with at least 96 KB holds two replica words per spin and serves
-128 reads. Turing (sm_75, 64 KB) holds one word and serves 64 reads. The miner
-declares the read count it can serve when it starts.
+`quip-cuda-msa` keeps as many spins as fit in the opt-in shared memory per
+block and spills the rest to a per-nonce buffer in device memory. Node and
+coupler limits come from device memory divided among instances,
+one per SM. With 15 GiB free, 48 SMs and 128 reads, the A4000 advertises
+3,987,504 uncoupled nodes. It also fits 44,486,028 dense couplers at 9,433 complete nodes.
+These independent Binary limits use the default 64-beta schedule. A model near both limits can
+exceed memory. The miner checks each model before allocation, including its
+precision and schedule length. Shared memory sets how many spins stay on chip.
+The miner refuses a session whose buffers exceed device memory. At 200,000 nodes
+and 4,000,000 edges with 48 models, the A4000 measured about 2 GiB for unit
+models and 5.2 GiB for weighted i32 models (see the
+[A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)).
+
+SA and Gibbs also derive their limits from device memory split among instances.
+SA uses one SM per instance. Gibbs uses four SMs per instance.
+A device with 48 SMs runs 48 SA instances or 12 Gibbs instances.
+
+SA uses local state for sparse models through 5,000 nodes. Larger sparse models use global state.
+Gibbs keeps its static shared array for sparse models through 4,800 nodes.
+Other Gibbs models keep a shared spin prefix. The rest of the spins use device memory.
+
+Both kernels choose the sparse or dense route that needs less memory.
+Their node limits describe Binary models with no edges. Their coupler limits describe complete Binary models.
+These limits use the default read count and 64 beta entries.
+Each model must fit with its own edges, precision, and beta count.
+Use `--max-nodes` to set a lower node limit.
+
+Run `quip-cuda-sa --probe-capacity`, `quip-cuda-gibbs --probe-capacity`, or `quip-cuda-msa --probe-capacity` to show the device capacity grid.
+Add `--device N` to select a GPU or `--json` for machine-readable output.
+The JSON includes the kernel name.
+
+The grid uses the read cap and 64 beta entries.
+It shows Binary, Int8, Int32, and Float32 limits for degree 20, degree 60, and complete models.
+Precision applies to both fields and couplers. Int32 also counts its integer acceptance tables where required.
+
+Each cell shows variables, couplers, bytes per instance, and the storage tier.
+SA tiers are local, global, and dense. Gibbs and MSA use shared, spill, and dense tiers.
+Without measured slowdown data, the probe reports unknown slowdown for SA and Gibbs.
+Use `quip-cuda-msa bench run --complete N --precision int8 --out DIR` to benchmark a complete graph.
+The precision options are `binary`, `int8`, `int32`, and `float`.
 
 ## Binaries
 
@@ -44,22 +78,27 @@ provides prebuilt `amd64` binaries.
 
 All three binaries list `exact-coefficients` in `--capabilities`.
 They refuse any model that they cannot represent exactly, with a capacity error.
-The model scale is the greatest common divisor, or `GCD`, of its nonzero coefficients in milli units.
+
+The model scale is the greatest common divisor (`GCD`) of its nonzero coefficients.
+The scale uses milli units.
+
 At each spin, add `|h|` and all `|J|` on its edges.
 The local field bound is the largest of these sums.
 
 - **SA:** solves every whole-milli model up to a local field of 536,870,911 milli.
   SA uses the int8 kernel when `max_i(|h_i| + sum_j |J_ij|) / GCD_step <= 63`.
   This bound keeps the flip delta within int8 because `2 * field <= 127`.
-  Other models use the fixed-point wide kernel.
-  A complete graph with unit couplings and zero fields has field 63 at 64 nodes and uses int8.
+  Larger deltas use i32 arithmetic, with i8 coefficients when the scaled values fit.
+  Wider coefficients use the fixed-point wide kernel.
+  A complete graph with unit couplings and zero fields has field 63 at 64 nodes. It uses int8.
   At 65 nodes, its field is 64 and it uses wide.
   Its accept decision uses integers only, so the same seed gives the same decision on every GPU.
   The SA identity advertises 536,870,910 milli because `quip-solver-core` 0.0.3 `--solve` does not round coefficients (QUI-1813).
   The wide kernel cannot accept a move whose Metropolis probability is below about 7.6e-6.
-- **Gibbs:** accepts models whose absolute coefficients are at most 127 times the model's GCD step.
-  Gibbs refuses models that need a wide path.
-- **MSA:** accepts models of degree at most 20.
+- **Gibbs:** uses i8 storage when absolute coefficients are at most 127 times the model's GCD step.
+  Wider whole-milli coefficients use i32 storage and field arithmetic.
+  The wide path accepts local fields up to 536,870,911 milli.
+- **MSA:** uses sparse storage through degree 62 and dense storage for higher degrees.
   Models with `h` in {-1, 0, 1} and `J` in {-1, 1} use the unit-weight kernel.
   Other models use the weighted kernel at the model's GCD step.
   Its local field bound is 16,777,215 times that step, or 16,777,215 milli at scale 1.
@@ -117,28 +156,28 @@ in `quip-solver-cpu`'s `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer,
 two words. The Metropolis test is an integer comparison against a per-rung
 threshold table. Spins update one color class at a time, with the same greedy
 coloring the Gibbs kernel uses. One block anneals one problem in shared
-memory. The full MSA kernel computes no energies. The host rescores every sample with
+memory with a global spill buffer. The full MSA kernel computes no energies. The host rescores every sample with
 `energy_milli`, so results are consensus-scored like the other kernels.
 
 The unit kernel uses couplings and fields by sign. Consensus problems have
 `J` in {-1, 1} and `h` in {-1, 0, 1}, which it represents exactly.
 Other supported whole-milli models use the weighted kernel at their own scale.
 The miner refuses any model that exceeds the coefficient or local field bounds.
-A spin with more than 20 neighbors cannot run on either MSA kernel.
-The miner rejects such a job as `TooLarge`.
+The CUDA MSA solver uses dense storage for spins with more than 62 neighbors.
 
-Node capacity comes from the device. The spin state uses `dynamic shared memory`,
-so the ceiling is the opt-in shared memory per block less 8720 bytes, divided
-by 8 times the replica words. At two words that is 5791 spins on a 99 KB part
-and 5599 on Volta. `--max-nodes` greater than the ceiling is an error at open, never a
-silent clamp.
-
-Replica words fall back from two to one when the device cannot hold the
-resolved capacity at two. The read count halves with them, because each 64-bit
-word carries 64 replicas. Turing is the case this serves. A 4577-spin topology
-needs 73232 bytes at two words and 36616 at one, under a 64 KB ceiling. The
-miner then pins reads at the resolved count, so no job asks for more than the
-device holds.
+The first K spins live in shared memory. To get K, subtract 8720 bytes from the opt-in shared memory per block.
+Divide by 8 times the number of replica words. At 128 reads, two words use 16 bytes per spin.
+A 99 KB part holds 5791 spins.
+Turing uses 64 reads and holds 7102 spins in shared memory.
+Spins past K live in a per-nonce global buffer,
+which reaches L2 and then DRAM as the graph grows. Placement does not change
+the samples: a spilled run returns the same reads as an all-shared run of the
+same seed. Without `--max-nodes`, the miner uses its device-derived node limit.
+The flag sets a lower cap. A value that exceeds the device limit fails at open.
+The error names the largest capacity that fits. MSA `--capabilities`
+opens the selected device to read its memory limits.
+See the [A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)
+for the throughput at each size.
 
 Two host-side changes came with it and apply to `quip-cuda-sa` too:
 
@@ -220,13 +259,23 @@ with, so a wait inside the session holds the device for no work. After the
 pipeline stays empty for 2 seconds, the driver ends the session and parks in a
 blocking receive. The next seed starts a new session.
 
-No slot completes. The host waits for a slot to complete while the kernel waits
-for a slot to become ready. Any divergence between the two parks both sides, and
-each side behaves as written, so nothing below them can detect it. The driver
-measures the longest gap between completions and sets the cutoff at 4 times that
-gap, with a floor of 10 minutes. Past the cutoff it rejects the jobs it holds,
-which refunds their credits at the coordinator, and starts a new session. It
-logs one line:
+No slot completes. The host waits for a slot to complete. The kernel waits for a slot to become ready.
+If these states diverge, both sides wait. Each side behaves as written. Neither can detect the stall. The driver
+sets the cutoff to the larger of the floor and 4 times the longest gap between completions.
+The default floor is the larger of 600 seconds and the job's total sweep count times 0.0004 seconds.
+The total sweep count is the number of beta entries times the sweeps per beta in the built schedule.
+Jobs in one session share these sweep settings.
+At 8,388,608 sweeps, the default floor is 3,355.4432 seconds, about 56 minutes.
+
+All three binaries accept `--stall-secs-per-sweep <SECONDS>` to change the per-sweep allowance.
+Only positive, finite values are valid.
+
+Use `--stall-floor-secs <SECONDS>` to set a fixed floor of at least 1 whole second.
+This flag replaces the scaled floor and its 600-second lower bound.
+The cutoff can still grow to 4 times the longest observed completion gap.
+The driver rejects held jobs once the cutoff passes. It then starts a new session.
+The coordinator refunds the credits for those jobs.
+The driver logs one line:
 
 ```text
 quip-solver-cuda: no slot completed in 612.4s; rebuilding the self-feeding session
@@ -283,6 +332,7 @@ temperature loses core clock, and that loss looks like a software decay.
 ```sh
 cargo test --release                       # host-only tests
 cargo test --release -- --include-ignored  # adds the CUDA-device tests
+make test-long                            # adds the manual long GPU tests
 ```
 
 The ten-minute `pipeline::whole_pipeline` benchmark skips unless `LEASE_PIPELINE_OUT`

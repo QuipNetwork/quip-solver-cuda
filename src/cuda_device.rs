@@ -3,10 +3,11 @@
 //! One process owns one device (`[cuda.N]` → device N / miner id `cuda-N`).
 
 use crate::capacity;
+use crate::coefficients::CoefficientPath;
 use crate::jit_cache;
 use crate::kernel::KernelKind;
 use crate::stream_pool::StreamPool;
-use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute_enum};
+use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute_enum, CUshared_carveout_enum};
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
 use std::fmt;
@@ -17,15 +18,25 @@ use tracing::trace_span;
 const SA_SRC: &str = include_str!("../kernels/sa.cu");
 /// NVRTC define selecting the wide SA coefficient and delta types.
 pub const SA_WIDE_DEFINE: &str = "-DQUIP_SA_WIDE";
+/// NVRTC define selecting global SA spin and delta storage.
+pub const SA_GLOBAL_DEFINE: &str = "-DQUIP_SA_GLOBAL_STATE";
+/// NVRTC define selecting i8 SA coefficients with wide integer deltas.
+pub const SA_COEF_I8_DEFINE: &str = "-DQUIP_SA_COEF_I8_DELTA_I32";
+/// NVRTC define selecting real SA coefficients and deltas.
+pub const SA_COEF_F32_DEFINE: &str = "-DQUIP_SA_COEF_F32";
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
 /// Multi-spin coded SA, see `kernels/msa.cu`.
 const MSA_SRC: &str = include_str!("../kernels/msa.cu");
-/// NVRTC define selecting i32 coefficients for weighted MSA.
+/// NVRTC define selecting weighted MSA, with i32 coefficients by default.
 pub const MSA_WEIGHTED_DEFINE: &str = "-DQUIP_MSA_WEIGHTED";
 /// NVRTC define selecting integer lane arithmetic for weighted MSA.
 pub const MSA_LANE_I32_DEFINE: &str = "-DQUIP_MSA_LANE_I32";
 /// NVRTC define selecting floating-point lane arithmetic for weighted MSA.
 pub const MSA_LANE_F32_DEFINE: &str = "-DQUIP_MSA_LANE_F32";
+/// NVRTC define selecting i8 coefficient storage on the weighted integer lane.
+pub const MSA_COEF_I8_DEFINE: &str = "-DQUIP_MSA_COEF_I8";
+/// NVRTC define selecting f32 coefficient storage on the floating-point lane.
+pub const MSA_COEF_F32_DEFINE: &str = "-DQUIP_MSA_COEF_F32";
 
 /// Lane arithmetic used by weighted MSA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,15 +172,23 @@ type CompiledKernels = (
     Option<MsaWeightedKernels>,
 );
 
-/// Both weighted MSA functions and the modules that keep their code alive.
+/// Weighted MSA storage/lane variants and the modules that keep their code alive.
 pub(crate) struct MsaWeightedKernels {
     pub(crate) i32: CudaFunction,
     pub(crate) f32: CudaFunction,
+    pub(crate) int8: CudaFunction,
+    pub(crate) real: CudaFunction,
+    pub(crate) dense_i32: CudaFunction,
+    pub(crate) dense_f32: CudaFunction,
+    pub(crate) dense_int8: CudaFunction,
+    pub(crate) dense_real: CudaFunction,
+    _int8_mod: Arc<CudaModule>,
+    _real_mod: Arc<CudaModule>,
     _integer_mod: Arc<CudaModule>,
     _float_mod: Arc<CudaModule>,
 }
 
-/// Compile the four base kernels and, for MSA opens, both weighted lanes.
+/// Compile the four base kernels and, for MSA opens, the weighted storage variants.
 /// Kept out of [`CudaDevice::open_with_nodes`] to stay under the function-length cap.
 fn compile_all_kernels(
     ctx: &Arc<CudaContext>,
@@ -182,7 +201,7 @@ fn compile_all_kernels(
     let (sa_nodes, msa_nodes, gibbs_nodes) = nodes;
     let _span = trace_span!(
         "jit",
-        kernels = if kernel == KernelKind::Msa { 6 } else { 4 }
+        kernels = if kernel == KernelKind::Msa { 8 } else { 4 }
     )
     .entered();
     let (sa, sa_wide, msa, gibbs) = (
@@ -227,23 +246,48 @@ fn compile_all_kernels(
             || compile_for_arch(GIBBS_SRC, gibbs_nodes, sel, &[]),
         )?,
     );
-    let weighted = |name, lane| {
-        let defines = [MSA_WEIGHTED_DEFINE, lane];
+    let weighted = |name, defines: &[&str]| {
         jit_cache::load_or_compile(
             ctx,
             name,
             MSA_SRC,
-            &defines,
+            defines,
             arch,
             driver_ver,
             msa_nodes,
-            || compile_for_arch(MSA_SRC, msa_nodes, sel, &defines),
+            || compile_for_arch(MSA_SRC, msa_nodes, sel, defines),
         )
     };
     let msa_weighted = if kernel == KernelKind::Msa {
-        let integer_mod = weighted("msa-weighted-i32", MSA_LANE_I32_DEFINE)?;
-        let float_mod = weighted("msa-weighted-f32", MSA_LANE_F32_DEFINE)?;
+        let integer_mod = weighted(
+            "msa-weighted-i32",
+            &[MSA_WEIGHTED_DEFINE, MSA_LANE_I32_DEFINE],
+        )?;
+        let float_mod = weighted(
+            "msa-weighted-f32",
+            &[MSA_WEIGHTED_DEFINE, MSA_LANE_F32_DEFINE],
+        )?;
+        let int8_mod = weighted(
+            "msa-weighted-int8",
+            &[MSA_WEIGHTED_DEFINE, MSA_LANE_I32_DEFINE, MSA_COEF_I8_DEFINE],
+        )?;
+        let real_mod = weighted(
+            "msa-real-f32",
+            &[
+                MSA_WEIGHTED_DEFINE,
+                MSA_LANE_F32_DEFINE,
+                MSA_COEF_F32_DEFINE,
+            ],
+        )?;
         Some(MsaWeightedKernels {
+            dense_i32: integer_mod.load_function("cuda_msa_dense_self_feeding")?,
+            dense_f32: float_mod.load_function("cuda_msa_dense_self_feeding")?,
+            dense_int8: int8_mod.load_function("cuda_msa_dense_self_feeding")?,
+            dense_real: real_mod.load_function("cuda_msa_dense_self_feeding")?,
+            int8: int8_mod.load_function("cuda_msa_self_feeding")?,
+            real: real_mod.load_function("cuda_msa_self_feeding")?,
+            _int8_mod: int8_mod,
+            _real_mod: real_mod,
             i32: integer_mod.load_function("cuda_msa_self_feeding")?,
             f32: float_mod.load_function("cuda_msa_self_feeding")?,
             _integer_mod: integer_mod,
@@ -255,12 +299,160 @@ fn compile_all_kernels(
     Ok((sa, sa_wide, msa, gibbs, msa_weighted))
 }
 
+pub(crate) struct SaVariants {
+    pub global: CudaFunction,
+    pub wide_global: CudaFunction,
+    pub int8: CudaFunction,
+    pub int8_global: CudaFunction,
+    pub real: CudaFunction,
+    pub real_global: CudaFunction,
+    pub dense: CudaFunction,
+    pub int8_dense: CudaFunction,
+    pub wide_dense: CudaFunction,
+    pub real_dense: CudaFunction,
+}
+
+pub(crate) struct GibbsVariants {
+    pub dense: CudaFunction,
+    pub i32_dense: CudaFunction,
+    pub f32_dense: CudaFunction,
+    pub spill: CudaFunction,
+    pub i32: CudaFunction,
+    pub i32_spill: CudaFunction,
+    pub f32: CudaFunction,
+    pub f32_spill: CudaFunction,
+}
+
+/// Compile additional Gibbs variants only for a Gibbs device open.
+fn compile_gibbs_variants(
+    ctx: &Arc<CudaContext>,
+    shared_per_block_optin: usize,
+) -> Result<GibbsVariants, CudaError> {
+    let arch = device_arch(ctx);
+    let arch_name = format!("sm_{arch}");
+    let driver = driver_version()?;
+    let compile = |name, defines: &[&str]| {
+        let function = jit_cache::load_or_compile(
+            ctx,
+            name,
+            GIBBS_SRC,
+            defines,
+            &arch_name,
+            driver,
+            capacity::GIBBS_DEFAULT_NODES,
+            || compile_for_arch(GIBBS_SRC, capacity::GIBBS_DEFAULT_NODES, arch, defines),
+        )?
+        .load_function("cuda_gibbs_self_feeding")?;
+        prefer_gibbs_l1(&function)?;
+        if defines.contains(&"-DQUIP_GIBBS_SPILL") {
+            let static_bytes = usize::try_from(function.shared_size_bytes()?)
+                .map_err(|_| CudaError::Driver("negative Gibbs static shared memory".into()))?;
+            let reserved = capacity::GIBBS_STATIC_SHARED_BYTES
+                + if defines.contains(&"-DQUIP_GIBBS_DENSE") {
+                    capacity::GIBBS_DENSE_REDUCTION_BYTES
+                } else {
+                    0
+                };
+            if static_bytes > reserved {
+                return Err(CudaError::Driver(format!(
+                    "Gibbs static shared memory {static_bytes} exceeds its reserved budget"
+                )));
+            }
+            let dynamic_bytes = shared_per_block_optin.saturating_sub(reserved);
+            function.set_attribute(
+                CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                i32::try_from(dynamic_bytes)
+                    .map_err(|_| CudaError::Driver("Gibbs shared memory exceeds i32".into()))?,
+            )?;
+        }
+        Ok(function)
+    };
+    Ok(GibbsVariants {
+        dense: compile("gibbs-dense", &["-DQUIP_GIBBS_DENSE", "-DQUIP_GIBBS_SPILL"])?,
+        i32_dense: compile(
+            "gibbs-i32-dense",
+            &[
+                "-DQUIP_GIBBS_DENSE",
+                "-DQUIP_GIBBS_SPILL",
+                "-DQUIP_GIBBS_COEF_I32",
+            ],
+        )?,
+        f32_dense: compile(
+            "gibbs-f32-dense",
+            &[
+                "-DQUIP_GIBBS_DENSE",
+                "-DQUIP_GIBBS_SPILL",
+                "-DQUIP_GIBBS_COEF_F32",
+            ],
+        )?,
+        spill: compile("gibbs-spill", &["-DQUIP_GIBBS_SPILL"])?,
+        i32: compile("gibbs-i32", &["-DQUIP_GIBBS_COEF_I32"])?,
+        i32_spill: compile(
+            "gibbs-i32-spill",
+            &["-DQUIP_GIBBS_COEF_I32", "-DQUIP_GIBBS_SPILL"],
+        )?,
+        f32: compile("gibbs-f32", &["-DQUIP_GIBBS_COEF_F32"])?,
+        f32_spill: compile(
+            "gibbs-f32-spill",
+            &["-DQUIP_GIBBS_COEF_F32", "-DQUIP_GIBBS_SPILL"],
+        )?,
+    })
+}
+
+/// Compile additional SA variants only for an SA device open.
+fn compile_sa_variants(ctx: &Arc<CudaContext>) -> Result<SaVariants, CudaError> {
+    let arch = device_arch(ctx);
+    let arch_name = format!("sm_{arch}");
+    let driver = driver_version()?;
+    let compile = |name, defines: &[&str]| {
+        jit_cache::load_or_compile(
+            ctx,
+            name,
+            SA_SRC,
+            defines,
+            &arch_name,
+            driver,
+            capacity::SA_DEFAULT_NODES,
+            || compile_for_arch(SA_SRC, capacity::SA_DEFAULT_NODES, arch, defines),
+        )?
+        .load_function("cuda_sa_self_feeding")
+        .map_err(CudaError::from)
+    };
+    Ok(SaVariants {
+        global: compile("sa-global", &[SA_GLOBAL_DEFINE])?,
+        wide_global: compile("sa-wide-global", &[SA_GLOBAL_DEFINE, SA_WIDE_DEFINE])?,
+        int8: compile("sa-wi8", &[SA_COEF_I8_DEFINE])?,
+        int8_global: compile("sa-wi8-global", &[SA_GLOBAL_DEFINE, SA_COEF_I8_DEFINE])?,
+        real: compile("sa-f32", &[SA_COEF_F32_DEFINE])?,
+        real_global: compile("sa-f32-global", &[SA_GLOBAL_DEFINE, SA_COEF_F32_DEFINE])?,
+        dense: compile("sa-dense", &["-DQUIP_SA_DENSE"])?,
+        int8_dense: compile("sa-wi8-dense", &["-DQUIP_SA_DENSE", SA_COEF_I8_DEFINE])?,
+        wide_dense: compile("sa-wide-dense", &["-DQUIP_SA_DENSE", SA_WIDE_DEFINE])?,
+        real_dense: compile("sa-f32-dense", &["-DQUIP_SA_DENSE", SA_COEF_F32_DEFINE])?,
+    })
+}
+
 /// Verify the loaded msa kernel declares no more static shared
 /// memory than [`capacity::MSA_STATIC_SHARED_BYTES`], opt it in to
 /// `shared_per_block_optin` less that constant, and return that
 /// dynamic-shared-memory budget.
 /// Kept out of [`CudaDevice::open_with_nodes`] to stay under the crate's
 /// function-length cap.
+/// Ask the driver for the smallest shared-memory carve-out that fits one
+/// Gibbs block, leaving the rest of the SM's unified cache to L1.
+///
+/// The Gibbs launch is persistent with one block per SM, so occupancy above
+/// one block buys nothing. Without the hint the driver sizes the carve-out
+/// for the most resident blocks, which on `sm_86` leaves 28 KB of L1 at most
+/// sizes, and the `__ldg` reads of the CSR tables then miss L1.
+fn prefer_gibbs_l1(gibbs: &CudaFunction) -> Result<(), CudaError> {
+    gibbs.set_attribute(
+        CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        CUshared_carveout_enum::CU_SHAREDMEM_CARVEOUT_MAX_L1 as i32,
+    )?;
+    Ok(())
+}
+
 fn configure_msa_shared_memory(
     msa: &CudaFunction,
     shared_per_block_optin: usize,
@@ -288,72 +480,6 @@ fn configure_msa_shared_memory(
         optin,
     )?;
     Ok(msa_dynamic_shared_bytes)
-}
-
-/// Replica words per spin msa sessions on this device may allocate, at
-/// `msa_nodes` spins.
-///
-/// When this process runs msa, [`capacity::resolve`] already refused anything
-/// above the one-word budget, so `None` from
-/// [`capacity::msa_replica_words`] means those two derivations drifted apart;
-/// refusing here keeps the launch from sizing a session the device cannot
-/// hold. When the process runs SA or Gibbs the word count is unused, and a
-/// device too small for the msa default must not fail their open — those get
-/// one word and never read it.
-///
-/// Kept out of [`CudaDevice::open_with_nodes`] to stay under the crate's
-/// function-length cap.
-fn resolve_msa_replica_words(
-    msa_dynamic_shared_bytes: usize,
-    msa_nodes: usize,
-    kernel: KernelKind,
-) -> Result<usize, CudaError> {
-    match capacity::msa_replica_words(msa_dynamic_shared_bytes, msa_nodes) {
-        Some(words) => Ok(words),
-        None if kernel == KernelKind::Msa => Err(CudaError::Capacity(
-            capacity::CapacityError::AboveDeviceBudget {
-                requested: msa_nodes,
-                budget: capacity::msa_budget(msa_dynamic_shared_bytes, 1),
-                resource: capacity::BudgetResource::SharedMemory,
-            },
-        )),
-        None => Ok(1),
-    }
-}
-
-/// Replica words per spin `device_index` would hold for an msa session at
-/// `requested_nodes`, without compiling a kernel or opening a session.
-///
-/// The adapt envelope in [`crate::cuda_msa_identity`] is built before
-/// [`CudaDevice::open_with_nodes`] runs, and it must declare a read count the
-/// device can actually serve: a Turing card holds one replica word where a
-/// 99 KB card holds two, which is 64 reads against 128. Reading the one
-/// attribute that decides it is cheap enough to do first.
-///
-/// `None` when the device cannot be inspected at all — no driver, no such
-/// ordinal, an unreadable attribute — or when it cannot hold `requested_nodes`
-/// at even one word. Callers declare [`capacity::MSA_REPLICA_WORDS`] in that
-/// case: `--capabilities` must answer on a machine with no GPU, and a device
-/// that truly cannot hold the request is refused at open with a message that
-/// names the budget.
-#[must_use]
-pub fn probe_msa_replica_words(device_index: usize, requested_nodes: usize) -> Option<usize> {
-    // cudarc panics on the first driver call when libcuda cannot be loaded,
-    // so a machine with no driver must be caught before `CudaContext::new`.
-    // SAFETY: `is_culib_present` only attempts to `dlopen` the CUDA driver
-    // library by its standard names and drops the handle. Loading it runs the
-    // driver's own initializers, which every later driver call in this process
-    // runs anyway through cudarc's loader; no pointer or state crosses the call.
-    if !unsafe { cudarc::driver::sys::is_culib_present() } {
-        return None;
-    }
-    let ctx = CudaContext::new(device_index).ok()?;
-    let optin = usize::try_from(
-        ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
-            .ok()?,
-    )
-    .ok()?;
-    capacity::msa_replica_words(capacity::msa_dynamic_shared_bytes(optin), requested_nodes)
 }
 
 /// Loaded kernels + streams bound to a single device.
@@ -384,34 +510,47 @@ pub struct CudaDevice {
     pub(crate) sa: CudaFunction,
     /// Wide `cuda_sa_self_feeding`, compiled with [`SA_WIDE_DEFINE`].
     pub(crate) sa_wide: CudaFunction,
+    pub(crate) sa_variants: Option<SaVariants>,
+    pub(crate) kernel: KernelKind,
     /// `cuda_gibbs_self_feeding` — persistent kernel, `sms_per_nonce` blocks
     /// per nonce.
     pub(crate) gibbs: CudaFunction,
+    pub(crate) gibbs_variants: Option<GibbsVariants>,
+    pub(crate) last_gibbs_variant: std::sync::Mutex<Option<&'static str>>,
+    /// Hold at most this many spins in each Gibbs block's shared prefix.
+    /// Setting a cap forces the spill instantiation, including below 4800 nodes.
+    pub gibbs_shared_spins_cap: Option<usize>,
+    /// Force the spill instantiation with the full shared budget for parity tests.
+    #[doc(hidden)]
+    pub gibbs_force_spill: bool,
+    /// Exercise the kernel's Metropolis update mode in parity tests.
+    #[doc(hidden)]
+    pub gibbs_metropolis: bool,
     /// `cuda_msa_self_feeding` — persistent kernel, 1 block (1 SM) per
     /// nonce, 64 reads per replica word.
     pub(crate) msa: CudaFunction,
-    /// Both weighted lanes, available only on MSA opens.
+    pub(crate) msa_dense: CudaFunction,
+    pub(crate) last_storage: std::sync::Mutex<Option<capacity::Storage>>,
+    /// Weighted storage/lane variants, available only on MSA opens.
     pub(crate) msa_weighted: Option<MsaWeightedKernels>,
     /// Dynamic shared memory one msa block may request: the device's opt-in
     /// ceiling less the kernel's static members. `streaming` sizes msa
-    /// sessions against it; `capacity::msa_budget` derives `max_nodes` from
-    /// it when the process runs msa.
+    /// sessions against it.
     pub(crate) msa_dynamic_shared_bytes: usize,
-    /// Replica words per spin msa sessions on this device may allocate, from
-    /// [`capacity::msa_replica_words`] at [`Self::max_nodes`]. Two on a card
-    /// whose opt-in shared memory holds the state at 128 reads, one on a card
-    /// that only holds 64. Meaningless when the process runs SA or Gibbs.
-    ///
-    /// `streaming::algo_limits` reads it for the per-nonce read cap, so the
-    /// envelope this miner declares matches what the device can hold.
-    pub msa_replica_words: usize,
+    /// Hold at most this many spins in shared memory per msa block, spilling
+    /// the rest to global memory. `None` uses the full opt-in budget. Tests
+    /// and `bench run --msa-shared-spins` set it; the miner never does.
+    pub msa_shared_spins_cap: Option<usize>,
     /// SMs on this device (`launch_self_feeding`'s `num_kernels` budget).
     pub max_sms: usize,
-    /// Node capacity the running kernel was compiled for.
+    /// Device memory and launch limits read once at open.
+    pub limits: capacity::DeviceLimits,
+    /// Optional node cap, checked after per-model memory admission.
     pub max_nodes: usize,
-    /// Node budget for wide SA jobs, capped at the compiled SA capacity.
-    /// Zero when this device is opened for msa or Gibbs.
-    pub sa_wide_max_nodes: usize,
+    /// Force the global SA instantiation for parity tests. Defaults to false.
+    pub sa_force_global: bool,
+    /// Force an exact SA coefficient path for parity tests. Defaults to None.
+    pub sa_force_path: Option<CoefficientPath>,
     _sa_mod: Arc<CudaModule>,
     _sa_wide_mod: Arc<CudaModule>,
     _gibbs_mod: Arc<CudaModule>,
@@ -427,7 +566,9 @@ impl fmt::Debug for CudaDevice {
             .field("pci_bus_id", &self.pci_bus_id)
             .field("max_sms", &self.max_sms)
             .field("max_nodes", &self.max_nodes)
-            .field("sa_wide_max_nodes", &self.sa_wide_max_nodes)
+            .field("sa_force_global", &self.sa_force_global)
+            .field("sa_force_path", &self.sa_force_path)
+            .field("kernel", &self.kernel)
             .field("msa_dynamic_shared_bytes", &self.msa_dynamic_shared_bytes)
             .finish_non_exhaustive()
     }
@@ -460,16 +601,17 @@ impl CudaDevice {
         Self::open_with_nodes(device_index, KernelKind::Sa, capacity::SA_DEFAULT_NODES)
     }
 
-    /// [`CudaDevice::open`], compiling `kernel` for `max_nodes`.
+    /// Open the selected kernel with an optional lower node cap.
     ///
-    /// The other two kernels compile at their own defaults. One process
-    /// drives one kernel, so only `kernel` needs the larger array, and a
-    /// bigger array would cost memory for a kernel that never launches here.
+    /// SA always compiles the fixed mining frame and its global variants.
+    /// Gibbs compiles its fixed shared array and, on Gibbs opens, its spill
+    /// variant. MSA has no compiled node array.
     ///
     /// # Errors
     ///
     /// Everything [`CudaDevice::open`] returns, plus [`CudaError::Capacity`]
     /// when `max_nodes` exceeds the kernel's bound on this device.
+    #[allow(clippy::too_many_lines)] // Device discovery and kernel configuration share one context.
     pub fn open_with_nodes(
         device_index: usize,
         kernel: KernelKind,
@@ -508,10 +650,7 @@ impl CudaDevice {
         )
         .map_err(|_| CudaError::Driver("CUDA reported a negative SM count".into()))?;
 
-        // Node capacity is a `-D` on the kernel, so it is resolved before the
-        // compile and must reach both `compile_for_arch` and the cache
-        // key. Gibbs is bounded by this device's shared memory, so the budget
-        // comes from the device rather than a constant.
+        // The opt-in shared budget controls the prefix, not the node limit.
         let shared_per_block = usize::try_from(
             ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
         )
@@ -545,18 +684,14 @@ impl CudaDevice {
                 capacity::default_nodes(k)
             }
         };
-        let sa_nodes = nodes_for(KernelKind::Sa);
-        // The wide local frame is fixed at the compiled `sa_nodes`; only its
-        // four-byte delta workspace scales with the job size. Resolve that
-        // budget here so a device that holds a mining job but no wide job that
-        // large still opens: the wide job is refused per job instead.
-        let sa_wide_max_nodes = if kernel == KernelKind::Sa {
-            capacity::sa_wide_budget(sa_nodes, &limits)
+        let sa_nodes = capacity::SA_DEFAULT_NODES;
+        let sa_variants = if kernel == KernelKind::Sa {
+            Some(compile_sa_variants(&ctx)?)
         } else {
-            0
+            None
         };
         let msa_nodes = nodes_for(KernelKind::Msa);
-        let gibbs_nodes = nodes_for(KernelKind::Gibbs);
+        let gibbs_nodes = capacity::GIBBS_DEFAULT_NODES;
 
         // Detected capability -> clamped compile target. An unreadable
         // attribute degrades to the floor (70) rather than failing the open:
@@ -578,14 +713,26 @@ impl CudaDevice {
         let sa = sa_mod.load_function("cuda_sa_self_feeding")?;
         let sa_wide = sa_wide_mod.load_function("cuda_sa_self_feeding")?;
         let msa = msa_mod.load_function("cuda_msa_self_feeding")?;
+        let msa_dense = msa_mod.load_function("cuda_msa_dense_self_feeding")?;
+        configure_msa_shared_memory(&msa_dense, shared_per_block_optin)?;
         let gibbs = gibbs_mod.load_function("cuda_gibbs_self_feeding")?;
+        prefer_gibbs_l1(&gibbs)?;
+        let gibbs_variants = if kernel == KernelKind::Gibbs {
+            Some(compile_gibbs_variants(&ctx, shared_per_block_optin)?)
+        } else {
+            None
+        };
         let msa_dynamic_shared_bytes = configure_msa_shared_memory(&msa, shared_per_block_optin)?;
         if let Some(weighted) = &msa_weighted {
             configure_msa_shared_memory(&weighted.i32, shared_per_block_optin)?;
             configure_msa_shared_memory(&weighted.f32, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.int8, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.real, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.dense_i32, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.dense_f32, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.dense_int8, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.dense_real, shared_per_block_optin)?;
         }
-        let msa_replica_words =
-            resolve_msa_replica_words(msa_dynamic_shared_bytes, msa_nodes, kernel)?;
 
         // Read before the struct is built so an unreadable attribute fails the
         // open rather than leaving a device whose governor can never bind.
@@ -605,18 +752,37 @@ impl CudaDevice {
             sa,
             sa_wide,
             gibbs,
+            gibbs_variants,
+            last_gibbs_variant: std::sync::Mutex::new(None),
+            gibbs_shared_spins_cap: None,
+            gibbs_force_spill: false,
+            gibbs_metropolis: false,
             msa,
+            msa_dense,
+            last_storage: std::sync::Mutex::new(None),
             msa_weighted,
             msa_dynamic_shared_bytes,
-            msa_replica_words,
+            msa_shared_spins_cap: None,
             max_sms: max_sms.max(1),
+            limits,
             max_nodes: resolved,
-            sa_wide_max_nodes,
+            sa_force_global: false,
+            sa_variants,
+            kernel,
+            sa_force_path: None,
             _sa_mod: sa_mod,
             _sa_wide_mod: sa_wide_mod,
             _gibbs_mod: gibbs_mod,
             _msa_mod: msa_mod,
         })
+    }
+
+    /// Override the memory budget for allocation-refusal tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_limits_for_test(mut self, limits: capacity::DeviceLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Number of CUDA devices visible to this process.
@@ -726,10 +892,118 @@ pub fn device_label_mismatch(miner_id: Option<&str>, device: usize) -> Option<us
 }
 
 #[cfg(test)]
+mod gibbs_wide_gpu_tests {
+    use super::{compile_for_arch, device_arch, driver_version, CudaDevice, GIBBS_SRC};
+    use crate::coefficients::{plan, CoefficientPath};
+    use crate::topology::{fill_coefficients, SelfFeedingTopology};
+    use crate::{capacity, jit_cache, IsingGraph, KernelKind};
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    // Call the production field helper with fixed spins, without sampling noise.
+    const FIELD_PROBE: &str = r#"
+extern "C" __global__ void gibbs_wide_fields_probe(
+    const int* row_ptr, const int* col_ind, const coef_t* j, const coef_t* h,
+    signed char* spill, int shared_spins, float* fields
+) {
+    __shared__ signed char prefix[2];
+#ifdef QUIP_GIBBS_SPILL
+    GibbsState state = {prefix, spill, shared_spins};
+#else
+    volatile signed char* state = prefix;
+#endif
+    for (int sign = -1; sign <= 1; sign += 2) {
+        state[0] = 1;
+        state[1] = (signed char)sign;
+        fields[(sign + 1) / 2] = compute_effective_field_shared(
+            0, state, row_ptr, 0, col_ind, 0, j, 0, h, 0);
+    }
+}
+"#;
+
+    fn check_wide_fields(spill: bool) {
+        let graph = IsingGraph::new(vec![16777.217, -0.001], vec![-16777.216], vec![(0, 1)]);
+        let plan = plan(KernelKind::Gibbs, &graph).unwrap();
+        assert_eq!(plan.path, CoefficientPath::Wide);
+        assert_eq!(plan.scale_milli, 1);
+        let topology = SelfFeedingTopology::build(&graph);
+        let (j, h) = fill_coefficients::<i32>(&topology, &graph, plan.scale_milli).unwrap();
+        assert_eq!(h, [16_777_217, -1]);
+        assert_eq!(j, [-16_777_216; 2]);
+        let device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 4800).unwrap();
+        let arch = device_arch(&device.ctx);
+        let source = format!("{GIBBS_SRC}\n{FIELD_PROBE}");
+        let mut defines = vec!["-DQUIP_GIBBS_COEF_I32"];
+        if spill {
+            defines.push("-DQUIP_GIBBS_SPILL");
+        }
+        let module = jit_cache::load_or_compile(
+            &device.ctx,
+            "gibbs-i32-field-probe",
+            &source,
+            &defines,
+            &format!("sm_{arch}"),
+            driver_version().unwrap(),
+            capacity::GIBBS_DEFAULT_NODES,
+            || compile_for_arch(&source, capacity::GIBBS_DEFAULT_NODES, arch, &defines),
+        )
+        .unwrap();
+        let function = module.load_function("gibbs_wide_fields_probe").unwrap();
+        let stream = &device.stream;
+        let d_rows = stream.clone_htod(&topology.row_ptr).unwrap();
+        let d_cols = stream.clone_htod(&topology.col_ind).unwrap();
+        let d_j = stream.clone_htod(&j).unwrap();
+        let d_h = stream.clone_htod(&h).unwrap();
+        let mut d_spill = stream.alloc_zeros::<i8>(2).unwrap();
+        let mut d_fields = stream.alloc_zeros::<f32>(2).unwrap();
+        for cap in [0_i32, 1, 2] {
+            let mut launch = stream.launch_builder(&function);
+            launch.arg(&d_rows).arg(&d_cols).arg(&d_j).arg(&d_h);
+            launch.arg(&mut d_spill).arg(&cap).arg(&mut d_fields);
+            // SAFETY: the probe receives matching two-node CSR and coefficient
+            // arrays, two output fields, and a tail large enough for every cap.
+            // One thread reads and writes the state. All buffers outlive the launch.
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .unwrap();
+            stream.synchronize().unwrap();
+            let fields = stream.clone_dtoh(&d_fields).unwrap();
+            assert_eq!(
+                fields
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                [33_554_432.0_f32.to_bits(), 1.0_f32.to_bits()],
+                "spill={spill} shared_spins={cap}: {fields:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "requires a CUDA GPU"]
+    fn gibbs_wide_static_preserves_integer_cancellation() {
+        check_wide_fields(false);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "requires a CUDA GPU"]
+    fn gibbs_wide_spill_preserves_integer_cancellation() {
+        check_wide_fields(true);
+    }
+}
+
+#[cfg(test)]
 mod msa_weighted_gpu_tests {
     use super::CudaDevice;
     use crate::{capacity, KernelKind};
 
+    #[cfg(feature = "long-tests")]
     #[test]
     #[serial_test::serial]
     #[ignore = "requires a CUDA GPU"]
@@ -753,22 +1027,20 @@ mod msa_weighted_gpu_tests {
             .collect();
         assert_eq!(
             ptx.len(),
-            6,
+            8,
             "MSA open must cache both weighted lane modules"
         );
-        for name in ["msa-weighted-i32-", "msa-weighted-f32-"] {
+        for name in [
+            "msa-weighted-i32-",
+            "msa-weighted-f32-",
+            "msa-weighted-int8-",
+            "msa-real-f32-",
+        ] {
             assert!(ptx
                 .iter()
                 .any(|entry| entry.file_name().to_string_lossy().starts_with(name)));
         }
-        let weighted = device.msa_weighted.as_ref().expect("weighted MSA kernels");
-        for lane in [&weighted.i32, &weighted.f32] {
-            assert!(
-                usize::try_from(lane.shared_size_bytes().expect("loaded weighted function"))
-                    .expect("nonnegative static shared memory")
-                    <= capacity::MSA_STATIC_SHARED_BYTES
-            );
-        }
+        assert_weighted_functions(&device);
 
         for kind in [KernelKind::Sa, KernelKind::Gibbs] {
             let device = CudaDevice::open_with_nodes(0, kind, 0).expect("non-MSA open");
@@ -779,6 +1051,31 @@ mod msa_weighted_gpu_tests {
         }
         drop(std::fs::remove_dir_all(&dir));
         std::env::remove_var("QUIP_CUDA_CACHE");
+    }
+
+    fn assert_weighted_functions(device: &CudaDevice) {
+        let weighted = device.msa_weighted.as_ref().expect("weighted MSA kernels");
+        for lane in [&weighted.i32, &weighted.f32, &weighted.int8, &weighted.real] {
+            assert!(
+                usize::try_from(lane.shared_size_bytes().expect("loaded weighted function"))
+                    .expect("nonnegative static shared memory")
+                    <= capacity::MSA_STATIC_SHARED_BYTES
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "requires a CUDA GPU"]
+    fn msa_open_loads_weighted_lane_modules_ci() {
+        let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, capacity::MSA_DEFAULT_NODES)
+            .expect("default MSA device");
+        assert_eq!(device.max_nodes, capacity::MSA_DEFAULT_NODES);
+        assert_weighted_functions(&device);
+        for kind in [KernelKind::Sa, KernelKind::Gibbs] {
+            let device = CudaDevice::open_with_nodes(0, kind, 0).expect("non-MSA open");
+            assert!(device.msa_weighted.is_none());
+        }
     }
 }
 

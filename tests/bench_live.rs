@@ -78,17 +78,20 @@ fn bench_one_upload_and_download_are_true_transfer_time_not_host_enqueue() {
     // `download_ns` are event-bracketed on `stream_transfer` and read after a
     // `synchronize()`, so they measure real device transfer time, not the
     // near-instant host enqueue of `memcpy_htod`/`clone_dtoh`. A larger graph
-    // should therefore show a larger (not merely nonzero) transfer time.
+    // should therefore show a larger (not merely nonzero) transfer time. The
+    // sizes differ by more than three orders of magnitude, so host load on a
+    // shared runner cannot reverse the comparison.
     let small = ring(16);
-    let large = ring(2048);
+    let large = ring(50_000);
     let params = SampleParams {
         num_reads: 8,
-        num_sweeps: 256,
+        num_sweeps: 16,
         sweeps_per_beta: 4,
         ..SampleParams::default()
     };
-    let (_, t_small) = bench_one(device(), &small, &params, KernelKind::Sa, None).unwrap();
-    let (_, t_large) = bench_one(device(), &large, &params, KernelKind::Sa, None).unwrap();
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, large.num_nodes()).unwrap();
+    let (_, t_small) = bench_one(&device, &small, &params, KernelKind::Sa, None).unwrap();
+    let (_, t_large) = bench_one(&device, &large, &params, KernelKind::Sa, None).unwrap();
     assert!(t_small.upload_ns > 0);
     assert!(t_large.upload_ns > 0);
     assert!(t_large.upload_ns >= t_small.upload_ns);
@@ -133,4 +136,131 @@ fn bench_one_msa_scores_and_reports_positive_kernel_time() {
     let (reads, timings) = bench_one(device(), &graph, &params, KernelKind::Msa, None).unwrap();
     assert_eq!(reads.len(), 8);
     assert!(timings.kernel_ns > 0);
+}
+
+/// Nonce 0's reads must not depend on how many other nonces share the spill
+/// buffer: a wrong per-nonce offset would let them overwrite it.
+#[test]
+#[ignore = "requires a CUDA device"]
+#[serial]
+fn nonce_zero_reads_ignore_concurrent_spilled_nonces() {
+    use quip_solver_cuda::streaming::{bench_many, stream_width};
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 5000).unwrap();
+    let graph = ring(3000);
+    let params = SampleParams {
+        num_reads: 128,
+        num_sweeps: 32,
+        sweeps_per_beta: 4,
+        seed: 5,
+        ..SampleParams::default()
+    };
+    let (alone, _) = bench_many(&device, &graph, &params, KernelKind::Msa, None, 1).unwrap();
+    device.msa_shared_spins_cap = Some(64);
+    let width = stream_width(&device, KernelKind::Msa);
+    let (crowded, _) = bench_many(&device, &graph, &params, KernelKind::Msa, None, width).unwrap();
+    let a: Vec<_> = alone.iter().map(|r| r.spins.clone()).collect();
+    let c: Vec<_> = crowded.iter().map(|r| r.spins.clone()).collect();
+    assert_eq!(a, c);
+}
+
+/// Real benchmark timing must keep host energies in the original f64 units.
+#[test]
+#[ignore = "requires a CUDA device"]
+#[serial]
+fn bench_real_coefficients_keep_real_energies_and_timing() {
+    use quip_solver_cuda::streaming::bench_many_real;
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 64).unwrap();
+    let graph = IsingGraph::new(
+        vec![std::f64::consts::PI; 12],
+        vec![-std::f64::consts::SQRT_2; 12],
+        (0..12).map(|i| (i, (i + 1) % 12)).collect(),
+    );
+    let params = SampleParams {
+        num_reads: 64,
+        num_sweeps: 256,
+        seed: 7,
+        ..SampleParams::default()
+    };
+    let (reads, timing) = bench_many_real(&device, &graph, &params, 1).unwrap();
+    assert_eq!(reads.len(), 64);
+    assert!(timing.kernel_ns > 0);
+    for read in reads {
+        let fields: f64 = read
+            .spins
+            .iter()
+            .map(|&s| std::f64::consts::PI * f64::from(s))
+            .sum();
+        let pairs: f64 = graph
+            .edges
+            .iter()
+            .map(|&(u, v)| {
+                -std::f64::consts::SQRT_2 * f64::from(read.spins[u]) * f64::from(read.spins[v])
+            })
+            .sum();
+        assert!((read.energy - fields - pairs).abs() < 1e-10);
+    }
+}
+
+/// The device read limit must agree with both the samples and emitted metadata.
+#[test]
+#[ignore = "requires a CUDA device"]
+#[serial]
+fn msa_bench_record_reads_match_returned_samples() {
+    use quip_solver_cuda::capacity::msa_device_reads;
+    use quip_solver_cuda::schema::BenchRecord;
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 64).unwrap();
+    let num_reads = msa_device_reads(&device.limits);
+    let params = SampleParams {
+        num_reads,
+        num_sweeps: 2,
+        ..SampleParams::default()
+    };
+    let (reads, _) = bench_one(&device, &ring(64), &params, KernelKind::Msa, None).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_quip-cuda-msa"))
+        .args([
+            "bench",
+            "run",
+            "--reads",
+            &num_reads.to_string(),
+            "--sweeps",
+            "2",
+            "--warmup",
+            "0",
+            "--repeats",
+            "1",
+            "--out",
+        ])
+        .arg(out.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries: Vec<_> = std::fs::read_dir(out.path()).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    let text = std::fs::read_to_string(entries[0].as_ref().unwrap().path()).unwrap();
+    let record: BenchRecord = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(record.reads, u64::try_from(reads.len()).unwrap());
+    let scores = record
+        .parts
+        .iter()
+        .find(|p| p.part == "energy_score")
+        .unwrap();
+    assert_eq!(scores.count, record.reads);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_quip-cuda-msa"))
+        .args([
+            "bench",
+            "run",
+            "--reads",
+            &(num_reads + 1).to_string(),
+            "--out",
+        ])
+        .arg(out.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("outside"));
 }

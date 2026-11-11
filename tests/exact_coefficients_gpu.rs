@@ -6,10 +6,36 @@
 use quip_protocol::scoring::energy_milli;
 use quip_solver_cuda::cuda_device::{CudaDevice, MsaLane};
 use quip_solver_cuda::sampler::{sample_ising, SampleError};
-use quip_solver_cuda::streaming::{bench_one, max_reads};
+use quip_solver_cuda::streaming::bench_one;
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 use serial_test::serial;
 use std::sync::OnceLock;
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn sa_weighted_int8_matches_wide_samples() {
+    use quip_solver_cuda::coefficients::CoefficientPath;
+    use quip_solver_cuda::streaming::sample_one;
+
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 5000).unwrap();
+    let edges: Vec<_> = (0..70)
+        .flat_map(|u| (u + 1..70).map(move |v| (u, v)))
+        .collect();
+    let graph = IsingGraph::new(vec![0.0; 70], vec![1.0; edges.len()], edges);
+    for global in [false, true] {
+        device.sa_force_global = global;
+        device.sa_force_path = Some(CoefficientPath::Wide);
+        let wide = sample_one(&device, &graph, &params(), KernelKind::Sa).unwrap();
+        device.sa_force_path = Some(CoefficientPath::WeightedInt8);
+        let narrow = sample_one(&device, &graph, &params(), KernelKind::Sa).unwrap();
+        assert_eq!(wide.len(), narrow.len());
+        for (a, b) in wide.iter().zip(narrow) {
+            assert_eq!(a.spins, b.spins, "global={global}");
+            assert_eq!(a.energy_milli, b.energy_milli);
+        }
+    }
+}
 
 fn device(kind: KernelKind) -> &'static CudaDevice {
     static SA: OnceLock<CudaDevice> = OnceLock::new();
@@ -54,6 +80,45 @@ fn params() -> SampleParams {
         num_sweeps: 1024,
         sweeps_per_beta: 4,
         ..SampleParams::default()
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_wide_reaches_exact_ground_states() {
+    use quip_solver_cuda::coefficients::{plan, CoefficientPath};
+    use quip_solver_cuda::streaming::sample_one;
+
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 4800).unwrap();
+    let graphs = [
+        IsingGraph::new(vec![0.0; 3], vec![1.0, 0.001], vec![(0, 1), (1, 2)]),
+        IsingGraph::new(vec![128.0, -0.001], vec![1.0], vec![(0, 1)]),
+        IsingGraph::new(
+            vec![0.001; 12],
+            vec![-1.0; 12],
+            (0..12).map(|i| (i, (i + 1) % 12)).collect(),
+        ),
+    ];
+    for graph in graphs {
+        assert_eq!(
+            plan(KernelKind::Gibbs, &graph).unwrap().path,
+            CoefficientPath::Wide
+        );
+        for metropolis in [false, true] {
+            device.gibbs_metropolis = metropolis;
+            device.gibbs_shared_spins_cap = None;
+            let baseline = sample_one(&device, &graph, &params(), KernelKind::Gibbs).unwrap();
+            assert_ground_state(KernelKind::Gibbs, &graph, &baseline);
+            for cap in [0, 1, graph.num_nodes()] {
+                device.gibbs_shared_spins_cap = Some(cap);
+                let reads = sample_one(&device, &graph, &params(), KernelKind::Gibbs).unwrap();
+                assert_ground_state(KernelKind::Gibbs, &graph, &reads);
+                for (a, b) in baseline.iter().zip(reads) {
+                    assert_eq!(a.spins, b.spins, "cap={cap} metropolis={metropolis}");
+                }
+            }
+        }
     }
 }
 
@@ -143,7 +208,6 @@ fn msa_weighted_f32_reaches_quarter_and_scaled_ground_states() {
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
 fn msa_forced_weighted_lanes_solve_unit_models_at_supported_read_counts() {
     let dev = device(KernelKind::Msa);
-    let read_cap = max_reads(KernelKind::Msa, dev.msa_replica_words);
     let graph = IsingGraph::new(
         vec![0.0; 12],
         vec![1.0; 12],
@@ -151,9 +215,6 @@ fn msa_forced_weighted_lanes_solve_unit_models_at_supported_read_counts() {
     );
     for lane in [MsaLane::I32, MsaLane::F32] {
         for num_reads in [64, 128] {
-            if num_reads == 128 && read_cap < 128 {
-                continue;
-            }
             let params = SampleParams {
                 num_reads,
                 ..params()
@@ -184,25 +245,118 @@ fn weighted_msa_requires_an_msa_device_open() {
     );
 }
 
+/// Ferromagnetic `K_n` with every field -1: all spins +1 is the unique ground
+/// state, at -(n(n-1)/2) * `scale_j` - n * `scale_h`.
+fn ferro_complete(n: usize, scale_j: f64, scale_h: f64) -> IsingGraph {
+    let mut edges = Vec::new();
+    for a in 0..n {
+        for b in a + 1..n {
+            edges.push((a, b));
+        }
+    }
+    let j = vec![-scale_j; edges.len()];
+    IsingGraph::new(vec![-scale_h; n], j, edges)
+}
+
+fn ferro_ground_milli(n: usize, scale_j: i64, scale_h: i64) -> i64 {
+    let n = i64::try_from(n).unwrap();
+    -1000 * (n * (n - 1) / 2 * scale_j + n * scale_h)
+}
+
+/// Every read (one per lane) must sit at the ground energy, so a wrong
+/// field in any lane group of the dense path shows.
+fn assert_all_ground(reads: &[quip_solver_cuda::SamplerResult], ground: i64, what: &str) {
+    for (i, r) in reads.iter().enumerate() {
+        assert_eq!(r.energy_milli, ground, "{what}: read {i}");
+    }
+}
+
+/// Degree 21 is the first two-pass spin and degree 62 the sparse ceiling. Every
+/// lane must reach the ground state, which a wrong carry in the chunked
+/// counter or the chunked weighted field would miss.
+#[cfg(feature = "long-tests")]
 #[test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
-fn msa_refuses_k22_on_unit_and_weighted_paths() {
-    let graph = complete_pm1(22);
-    for lane in [None, Some(MsaLane::I32), Some(MsaLane::F32)] {
-        let err = bench_one(
-            device(KernelKind::Msa),
-            &graph,
-            &params(),
-            KernelKind::Msa,
-            lane,
-        )
-        .unwrap_err();
-        assert!(matches!(err, SampleError::Unsupported(_)), "{err}");
-        assert!(
-            err.to_string().contains("21") && err.to_string().contains("20-neighbour"),
-            "{err}"
-        );
+fn msa_reaches_ground_states_at_degree_21_and_62_on_every_lane() {
+    for nodes in [22, 63] {
+        for lane in [None, Some(MsaLane::I32), Some(MsaLane::F32)] {
+            assert_chunked_ground(nodes, lane, 4096);
+        }
+    }
+}
+
+fn assert_chunked_ground(nodes: usize, lane: Option<MsaLane>, sweeps: usize) {
+    let params = SampleParams {
+        num_reads: 64,
+        num_sweeps: sweeps,
+        seed: 3,
+        ..SampleParams::default()
+    };
+    let (coupling, field) = if lane.is_some() { (2, 3) } else { (1, 1) };
+    let graph = ferro_complete(nodes, f64::from(coupling), f64::from(field));
+    let (reads, _) = bench_one(
+        device(KernelKind::Msa),
+        &graph,
+        &params,
+        KernelKind::Msa,
+        lane,
+    )
+    .unwrap();
+    assert_eq!(reads.len(), params.num_reads);
+    assert_all_ground(
+        &reads,
+        ferro_ground_milli(nodes, i64::from(coupling), i64::from(field)),
+        &format!("{lane:?} K_{nodes}"),
+    );
+}
+
+macro_rules! chunked_ground_tests {
+    ($($name:ident => ($nodes:literal, $lane:expr, $sweeps:literal)),+ $(,)?) => {
+        $(#[test]
+        #[serial]
+        #[ignore = "requires CUDA GPU; run with make test-gpu"]
+        fn $name() { assert_chunked_ground($nodes, $lane, $sweeps); })+
+    };
+}
+
+chunked_ground_tests! {
+    msa_degree_21_unit_ci => (22, None, 4096),
+    msa_degree_21_i32_ci => (22, Some(MsaLane::I32), 4096),
+    msa_degree_21_f32_ci => (22, Some(MsaLane::F32), 4096),
+    msa_degree_62_unit_ci => (63, None, 4096),
+    msa_degree_62_i32_ci => (63, Some(MsaLane::I32), 512),
+    msa_degree_62_f32_ci => (63, Some(MsaLane::F32), 1024),
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn msa_routes_k64_on_unit_and_weighted_paths() {
+    for weighted in [false, true] {
+        let graph = if weighted {
+            ferro_complete(64, 2.0, 3.0)
+        } else {
+            ferro_complete(64, 1.0, 1.0)
+        };
+        let ground = if weighted {
+            ferro_ground_milli(64, 2, 3)
+        } else {
+            ferro_ground_milli(64, 1, 1)
+        };
+        for lane in [None, Some(MsaLane::I32), Some(MsaLane::F32)] {
+            let dev = device(KernelKind::Msa);
+            let (reads, _) = bench_one(dev, &graph, &params(), KernelKind::Msa, lane).unwrap();
+            assert_eq!(
+                reads.iter().map(|r| r.energy_milli).min(),
+                Some(ground),
+                "dense K64 {lane:?}, weighted={weighted}"
+            );
+            assert_eq!(
+                quip_solver_cuda::streaming::last_storage(dev),
+                Some(quip_solver_cuda::capacity::Storage::Dense)
+            );
+        }
     }
 }
 
@@ -211,7 +365,7 @@ fn msa_refuses_k22_on_unit_and_weighted_paths() {
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
 fn non_representable_models_are_refused() {
     let sub_milli = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
-    let wide_gibbs = IsingGraph::new(vec![128.0, 0.0], vec![1.0], vec![(0, 1)]);
+    let wide_gibbs = IsingGraph::new(vec![536_870.911, 0.0], vec![0.001], vec![(0, 1)]);
     for (kind, g) in [
         (KernelKind::Sa, &sub_milli),
         (KernelKind::Gibbs, &sub_milli),
@@ -264,7 +418,15 @@ fn assert_stream_separates_scales(kind: KernelKind) {
     let driver = std::thread::spawn(move || {
         let device = device(kind);
         let gov = UtilGovernor::start(&device.pci_bus_id, 90, false);
-        run_stream(device, kind, job_rx, res_tx, CancelToken::default(), &gov);
+        run_stream(
+            device,
+            kind,
+            job_rx,
+            res_tx,
+            CancelToken::default(),
+            &gov,
+            quip_solver_cuda::streaming::StallConfig::default(),
+        );
     });
     let mut seen = [false; 2];
     while let Some(result) = res_rx.blocking_recv() {
@@ -297,7 +459,7 @@ fn assert_stream_separates_scales(kind: KernelKind) {
 #[test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
-fn sa_stream_mixes_unit_wide_refused_and_unit_jobs() {
+fn sa_stream_mixes_unit_weighted_wide_refused_and_unit_jobs() {
     assert_stream_mixes_paths_and_refusal(KernelKind::Sa);
 }
 
@@ -319,41 +481,49 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
     // Field 66 exceeds SA's int8 delta bound and MSA's unit coefficients.
     let mut fields = vec![0.0; 12];
     fields[0] = 64.0;
-    let wide = IsingGraph::new(
+    let weighted = IsingGraph::new(
         fields,
         vec![1.0; 12],
         (0..12).map(|i| (i, (i + 1) % 12)).collect(),
     );
     let refused = IsingGraph::new(vec![1e-19, 0.0], vec![1.0], vec![(0, 1)]);
     let dev = device(kind);
-    let node_budget = match kind {
-        KernelKind::Sa => dev.sa_wide_max_nodes,
-        KernelKind::Msa => dev.max_nodes,
-        KernelKind::Gibbs => unreachable!("this test covers SA and MSA"),
-    };
+    assert_eq!(plan(kind, &unit).unwrap().path, CoefficientPath::Int8);
     assert_eq!(
-        plan(kind, &unit, node_budget).unwrap().path,
-        CoefficientPath::Int8
-    );
-    assert_eq!(
-        plan(kind, &wide, node_budget).unwrap().path,
-        CoefficientPath::Wide
+        plan(kind, &weighted).unwrap().path,
+        CoefficientPath::WeightedInt8
     );
 
-    let mut graphs = vec![unit.clone()];
+    let mut wide = weighted.clone();
+    wide.h[0] = 64.001;
+    assert_eq!(plan(kind, &wide).unwrap().path, CoefficientPath::Wide);
+    let mut graphs = vec![unit.clone(), wide];
     // Fill cold-start admission so the refusal reaches the running session's pump.
-    graphs.extend((0..stream_width(dev, kind)).map(|_| wide.clone()));
+    graphs.extend((0..stream_width(dev, kind)).map(|_| weighted.clone()));
     let refused_id = graphs.len();
     graphs.extend([refused, unit]);
     let (job_tx, job_rx) = channel::<StreamJob>(graphs.len());
     let (res_tx, mut res_rx) = channel(16);
     for (id, graph) in graphs.iter().enumerate() {
+        // MSA lanes share one acceptance threshold per node (kernels/msa.cu),
+        // so one uphill draw in the last sweep moves every read of the unit
+        // bond at once: about 0.5% per job at the default cold beta,
+        // ln(200) / 2. A cold beta of 20 puts that flip, an energy rise of 2,
+        // at e^-40.
+        let beta_range = (kind == KernelKind::Msa && graph.j == [1.0] && graph.h == [0.0, 0.0])
+            .then(|| {
+                (
+                    quip_solver_core::beta::default_ising_beta_range(graph).0,
+                    20.0,
+                )
+            });
         job_tx
             .try_send(StreamJob {
                 job_id: vec![u8::try_from(id).unwrap()],
                 graph: graph.clone(),
                 params: SampleParams {
                     num_sweeps: 8192,
+                    beta_range,
                     ..params()
                 },
                 watermark: None,
@@ -363,7 +533,15 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
     drop(job_tx);
     let driver = std::thread::spawn(move || {
         let gov = UtilGovernor::start(&dev.pci_bus_id, 100, false);
-        run_stream(dev, kind, job_rx, res_tx, CancelToken::default(), &gov);
+        run_stream(
+            dev,
+            kind,
+            job_rx,
+            res_tx,
+            CancelToken::default(),
+            &gov,
+            quip_solver_cuda::streaming::StallConfig::default(),
+        );
     });
     let mut seen = vec![false; graphs.len()];
     while let Some(result) = res_rx.blocking_recv() {

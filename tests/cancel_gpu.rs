@@ -29,9 +29,8 @@ const SETTLE: Duration = Duration::from_secs(2);
 /// Upper bound on cancel-to-refund latency.
 const ABORT_DEADLINE: Duration = Duration::from_secs(30);
 
-/// 1024-node ring with alternating couplings: degree 2, so it fits SA and msa.
-fn ring() -> IsingGraph {
-    let n = 1024;
+/// Ring with alternating couplings: degree 2, so it fits SA and msa.
+fn ring(n: usize) -> IsingGraph {
     let edges: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
     let j = (0..n)
         .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
@@ -39,10 +38,10 @@ fn ring() -> IsingGraph {
     IsingGraph::new(vec![0.0; n], j, edges)
 }
 
-fn job(id: u8, reads: usize, sweeps: usize, watermark: u64) -> StreamJob {
+fn job(id: u8, reads: usize, sweeps: usize, watermark: u64, nodes: usize) -> StreamJob {
     StreamJob {
         job_id: vec![id],
-        graph: ring(),
+        graph: ring(nodes),
         params: SampleParams {
             num_reads: reads,
             num_sweeps: sweeps,
@@ -59,7 +58,7 @@ fn job(id: u8, reads: usize, sweeps: usize, watermark: u64) -> StreamJob {
 /// from the next round with a different sweep count so it seeds a new
 /// session. The long job must come back `Cancelled` inside the deadline, and
 /// the next job must complete with samples.
-fn cancel_then_complete(device: &CudaDevice, kernel: KernelKind, reads: usize) {
+fn cancel_then_complete(device: &CudaDevice, kernel: KernelKind, reads: usize, nodes: usize) {
     let gov = UtilGovernor::start(&device.pci_bus_id, 100, false);
     let cancel = CancelToken::default();
     let (job_tx, job_rx) = channel::<StreamJob>(4);
@@ -68,17 +67,27 @@ fn cancel_then_complete(device: &CudaDevice, kernel: KernelKind, reads: usize) {
     thread::scope(|s| {
         let driver_cancel = cancel.clone();
         let gov_ref = &gov;
-        s.spawn(move || run_stream(device, kernel, job_rx, res_tx, driver_cancel, gov_ref));
+        s.spawn(move || {
+            run_stream(
+                device,
+                kernel,
+                job_rx,
+                res_tx,
+                driver_cancel,
+                gov_ref,
+                quip_solver_cuda::streaming::StallConfig::default(),
+            );
+        });
 
         job_tx
-            .blocking_send(job(1, reads, LONG_SWEEPS, 1))
+            .blocking_send(job(1, reads, LONG_SWEEPS, 1, nodes))
             .expect("driver accepts the long job");
         thread::sleep(SETTLE);
 
         let cancelled_at = Instant::now();
         cancel.cancel_through(1);
         job_tx
-            .blocking_send(job(2, reads, 64, 2))
+            .blocking_send(job(2, reads, 64, 2, nodes))
             .expect("driver accepts the next round");
         drop(job_tx);
 
@@ -112,6 +121,7 @@ fn cancel_then_complete(device: &CudaDevice, kernel: KernelKind, reads: usize) {
 }
 
 /// SA with fewer than 256 reads: a partial block, the case the bead names.
+#[cfg(feature = "long-tests")]
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
@@ -121,10 +131,10 @@ fn sa_cancel_aborts_the_active_model_and_the_next_session_completes() {
         return;
     }
     let device = CudaDevice::open(0).expect("open SA");
-    cancel_then_complete(&device, KernelKind::Sa, 64);
+    cancel_then_complete(&device, KernelKind::Sa, 64, 1024);
 }
 
-/// msa at 128 reads, two replica words. Skips on a one-word device.
+/// msa at 128 reads, two replica words.
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
@@ -135,9 +145,29 @@ fn msa_cancel_aborts_the_active_model_and_the_next_session_completes() {
     }
     let device =
         CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_DEFAULT_NODES).expect("open msa");
-    if device.msa_replica_words < 2 {
-        eprintln!("device holds one msa replica word; 128 reads not servable, skipping");
+    cancel_then_complete(&device, KernelKind::Msa, 128, 1024);
+}
+
+/// The abort path leaves the spilled template body early; the next session
+/// must still complete.
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn msa_cancel_with_spilled_spins_aborts_and_the_next_session_completes() {
+    if CudaDevice::device_count().unwrap_or(0) == 0 {
+        eprintln!("no CUDA device visible; skipping");
         return;
     }
-    cancel_then_complete(&device, KernelKind::Msa, 128);
+    let mut device =
+        CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_DEFAULT_NODES).expect("open msa");
+    device.msa_shared_spins_cap = Some(100);
+    cancel_then_complete(&device, KernelKind::Msa, 128, 1024);
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn sa_cancel_aborts_and_next_session_completes_ci() {
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 128).expect("open SA");
+    cancel_then_complete(&device, KernelKind::Sa, 64, 128);
 }

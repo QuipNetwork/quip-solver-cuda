@@ -32,6 +32,8 @@
 //! `ADAPT_MIN_READS=256`) against an Advantage2-scale topology. Everything is
 //! overridable so the light-workload regime from QUI-882 can be soaked too.
 
+#![cfg(feature = "long-tests")]
+
 use quip_solver_core::{CancelToken, IsingGraph, SampleParams, StreamJob};
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::nvml_gov::UtilGovernor;
@@ -265,6 +267,7 @@ fn stream_driver_soak() {
                 res_tx,
                 CancelToken::default(),
                 gov_ref,
+                quip_solver_cuda::streaming::StallConfig::default(),
             );
         });
 

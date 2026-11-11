@@ -1,0 +1,219 @@
+//! Portfolio ground energies from SCIP, checked through MSA, SA, and Gibbs storage paths.
+
+use quip_solver_cuda::capacity::{msa_device_reads, Storage};
+use quip_solver_cuda::cuda_device::CudaDevice;
+use quip_solver_cuda::model_file::read_model;
+use quip_solver_cuda::streaming::{last_storage, sample_one_real, sample_one_real_forced};
+use quip_solver_cuda::{KernelKind, SampleParams};
+use serde::Deserialize;
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
+#[derive(Deserialize)]
+struct GroundState {
+    file: String,
+    n: usize,
+    energy: Option<f64>,
+    gap: Option<f64>,
+    status: String,
+    seconds: f64,
+}
+
+impl GroundState {
+    fn proven(&self) -> bool {
+        self.status == "optimal" && self.gap == Some(0.0)
+    }
+}
+
+fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/portfolio")
+}
+
+fn ground_states() -> Vec<GroundState> {
+    let bytes = std::fs::read(fixtures().join("ground_states.json")).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[test]
+fn portfolio_fixture_manifest_is_complete() {
+    let states = ground_states();
+    assert_eq!(
+        states.len(),
+        108,
+        "expected 24 Family B and 84 Family B2 draws"
+    );
+    assert_eq!(
+        states
+            .iter()
+            .filter(|s| s.file.starts_with("family-b-"))
+            .count(),
+        24
+    );
+    assert_eq!(
+        states
+            .iter()
+            .filter(|s| s.file.starts_with("family-b2-"))
+            .count(),
+        84
+    );
+    let mut names = BTreeSet::new();
+    let mut proven = 0;
+    for state in states {
+        assert_eq!(std::path::Path::new(&state.file).components().count(), 1);
+        assert!(names.insert(state.file.clone()), "duplicate {}", state.file);
+        let model = read_model(&fixtures().join(&state.file)).unwrap();
+        assert_eq!(model.graph.num_nodes(), state.n, "{}", state.file);
+        assert!(state.n > 0 && state.n <= 56, "{}", state.file);
+        assert!(model.graph.j.len() <= state.n * (state.n - 1) / 2);
+        let edges: BTreeSet<_> = model.graph.edges.iter().copied().collect();
+        assert_eq!(edges.len(), model.graph.edges.len());
+        assert!(state.seconds.is_finite() && state.seconds >= 0.0);
+        if state.proven() {
+            assert!(state.energy.unwrap().is_finite(), "{}", state.file);
+            proven += 1;
+        }
+    }
+    assert!(proven > 0, "no proven ground states");
+    let files: BTreeSet<_> = std::fs::read_dir(fixtures())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".qmodel"))
+        .collect();
+    assert_eq!(files, names);
+}
+
+fn verify_portfolio(kernel: KernelKind, forced: bool, count: usize, sweeps: usize) {
+    let mut states = ground_states();
+    assert_eq!(states.len(), 108);
+    states.sort_by(|a, b| (a.n, &a.file).cmp(&(b.n, &b.file)));
+    states.truncate(count);
+    let device = CudaDevice::open_with_nodes(0, kernel, 56).unwrap();
+    let params = SampleParams {
+        num_reads: if kernel == KernelKind::Msa {
+            msa_device_reads(&device.limits)
+        } else {
+            256
+        },
+        num_sweeps: sweeps,
+        sweeps_per_beta: (sweeps / 64).max(1),
+        seed: 42,
+        ..SampleParams::default()
+    };
+    let mut verified = 0;
+    let mut failures = Vec::new();
+    for state in states.iter().filter(|state| state.proven()) {
+        let model = read_model(&fixtures().join(&state.file)).unwrap();
+        let reads = if forced {
+            sample_one_real_forced(&device, &model.graph, &params, Storage::Dense)
+        } else {
+            sample_one_real(&device, &model.graph, &params)
+        }
+        .unwrap_or_else(|error| panic!("{}: {error}", state.file));
+        assert_eq!(reads.len(), params.num_reads, "{}", state.file);
+        // Small complete Gibbs models can have a smaller sparse footprint, so
+        // its automatic route depends on the device's instance count. A forced
+        // run must stay dense on every kernel.
+        if forced || kernel != KernelKind::Gibbs {
+            assert_eq!(
+                last_storage(&device),
+                Some(if forced || kernel == KernelKind::Sa {
+                    Storage::Dense
+                } else {
+                    Storage::Sparse
+                }),
+                "{}",
+                state.file
+            );
+        }
+        let best = reads
+            .iter()
+            .map(|read| read.energy)
+            .fold(f64::INFINITY, f64::min)
+            + model.offset;
+        let expected = state.energy.unwrap();
+        let tolerance = 1e-6 * expected.abs().max(1.0);
+        eprintln!("{}: best={best:.17} proven={expected:.17}", state.file);
+        if (best - expected).abs() > tolerance {
+            failures.push(format!(
+                "{}: best={best:.17}, proven={expected:.17}, tolerance={tolerance}",
+                state.file
+            ));
+        }
+        verified += 1;
+    }
+    assert_eq!(
+        verified, count,
+        "all selected portfolio models must be proven and exercised"
+    );
+    assert!(
+        failures.is_empty(),
+        "{} of {verified} models failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn portfolio_dense_reaches_qubo_ground_state() {
+    verify_portfolio(KernelKind::Msa, false, 108, 8192);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn portfolio_dense_path_forced() {
+    verify_portfolio(KernelKind::Msa, true, 108, 8192);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_reaches_portfolio_ground_states() {
+    verify_portfolio(KernelKind::Sa, false, 108, 8192);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_reaches_portfolio_ground_states() {
+    verify_portfolio(KernelKind::Gibbs, false, 108, 8192);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_dense_path_forced_reaches_portfolio_ground_states() {
+    verify_portfolio(KernelKind::Gibbs, true, 108, 8192);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn portfolio_dense_reaches_qubo_ground_state_ci() {
+    verify_portfolio(KernelKind::Msa, false, 3, 128);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn portfolio_dense_path_forced_ci() {
+    verify_portfolio(KernelKind::Msa, true, 3, 128);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_reaches_portfolio_ground_states_ci() {
+    verify_portfolio(KernelKind::Sa, false, 3, 128);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_reaches_portfolio_ground_states_ci() {
+    verify_portfolio(KernelKind::Gibbs, false, 3, 128);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_dense_path_forced_reaches_portfolio_ground_states_ci() {
+    verify_portfolio(KernelKind::Gibbs, true, 3, 128);
+}

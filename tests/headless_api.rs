@@ -8,7 +8,7 @@
 
 use quip_solver_core::quip_protocol::session::{algorithm_name, backend_name};
 use quip_solver_cuda::capacity::{
-    GIBBS_DEFAULT_NODES, MSA_DEFAULT_NODES, MSA_MAX_READS, MSA_REPLICA_WORDS, SA_DEFAULT_NODES,
+    GIBBS_DEFAULT_NODES, MSA_DEFAULT_NODES, MSA_MAX_READS, SA_DEFAULT_NODES,
 };
 use quip_solver_cuda::streaming::max_reads;
 use quip_solver_cuda::topology::{fill_coefficients, SelfFeedingTopology};
@@ -17,15 +17,11 @@ use quip_solver_cuda::{
 };
 
 /// Read cap advertised by the streaming driver (kernel block size for SA).
-/// msa scales with the replica words its device holds; SA and Gibbs do not.
 #[test]
 fn max_reads_is_the_kernel_read_cap() {
-    assert_eq!(max_reads(KernelKind::Sa, MSA_REPLICA_WORDS), 256);
-    assert_eq!(max_reads(KernelKind::Gibbs, MSA_REPLICA_WORDS), 256);
-    assert_eq!(max_reads(KernelKind::Msa, MSA_REPLICA_WORDS), 128);
-    assert_eq!(max_reads(KernelKind::Sa, 1), 256);
-    assert_eq!(max_reads(KernelKind::Gibbs, 1), 256);
-    assert_eq!(max_reads(KernelKind::Msa, 1), 64);
+    assert_eq!(max_reads(KernelKind::Sa), 256);
+    assert_eq!(max_reads(KernelKind::Gibbs), 256);
+    assert_eq!(max_reads(KernelKind::Msa), 128);
 }
 
 /// Identity `max_nodes` must mirror whatever capacity the process resolved,
@@ -33,20 +29,20 @@ fn max_reads_is_the_kernel_read_cap() {
 /// what the compiled kernel accepts.
 #[test]
 fn identities_report_the_resolved_capacity() {
-    let sa = cuda_sa_identity(SA_DEFAULT_NODES);
+    let sa = cuda_sa_identity(SA_DEFAULT_NODES, 1);
     assert_eq!(backend_name(sa.backend), "cuda");
     assert_eq!(algorithm_name(sa.algorithm), "sa");
     assert_eq!(sa.max_nodes, 5000);
 
-    let gibbs = cuda_gibbs_identity(GIBBS_DEFAULT_NODES);
+    let gibbs = cuda_gibbs_identity(GIBBS_DEFAULT_NODES, 1);
     assert_eq!(backend_name(gibbs.backend), "cuda");
     assert_eq!(algorithm_name(gibbs.algorithm), "gibbs");
     assert_eq!(gibbs.max_nodes, 4800);
 
     // A raised capacity must show through, or a coordinator would keep
     // rejecting jobs the kernel can now accept.
-    assert_eq!(cuda_sa_identity(8192).max_nodes, 8192);
-    assert_eq!(cuda_gibbs_identity(32768).max_nodes, 32768);
+    assert_eq!(cuda_sa_identity(8192, 1).max_nodes, 8192);
+    assert_eq!(cuda_gibbs_identity(32768, 1).max_nodes, 32768);
 }
 
 /// The msa identity pins reads at the kernel's cap; the two must not drift.
@@ -54,7 +50,7 @@ fn identities_report_the_resolved_capacity() {
 /// with difficulty whenever they differ, and msa wants a fixed count.
 #[test]
 fn msa_identity_reads_match_the_kernel_read_cap() {
-    let msa = cuda_msa_identity(MSA_DEFAULT_NODES, 128);
+    let msa = cuda_msa_identity(MSA_DEFAULT_NODES, 123_456);
     assert_eq!(algorithm_name(msa.algorithm), "msa");
     assert_eq!(msa.max_nodes, 5000);
     assert_eq!(msa.adapt.min_reads, msa.adapt.max_reads);
@@ -62,25 +58,26 @@ fn msa_identity_reads_match_the_kernel_read_cap() {
         usize::try_from(msa.adapt.max_reads).expect("small"),
         MSA_MAX_READS
     );
-    assert_eq!(
-        max_reads(KernelKind::Msa, MSA_REPLICA_WORDS),
-        msa.adapt.max_reads
-    );
+    assert_eq!(max_reads(KernelKind::Msa), msa.adapt.max_reads);
 }
 
-/// A device that only holds one replica word declares 64 reads, still pinned.
-/// Declaring 128 there would take 128-read jobs the session would clamp to 64,
-/// reporting work it did not do (quip-miner-cuda-9p5).
 #[test]
-fn msa_identity_declares_the_one_word_read_cap() {
-    let turing = cuda_msa_identity(MSA_DEFAULT_NODES, 64);
-    assert_eq!(turing.adapt.min_reads, 64);
-    assert_eq!(turing.adapt.max_reads, 64);
-    assert_eq!(max_reads(KernelKind::Msa, 1), turing.adapt.max_reads);
-    // The sweep envelope is unchanged by the word count.
-    let full = cuda_msa_identity(MSA_DEFAULT_NODES, 128);
-    assert_eq!(turing.adapt.min_sweeps, full.adapt.min_sweeps);
-    assert_eq!(turing.adapt.max_sweeps, full.adapt.max_sweeps);
+fn sa_and_gibbs_identities_declare_the_resolved_coupler_limit() {
+    let sa = cuda_sa_identity(410_747, 43_893_765);
+    assert_eq!(sa.max_nodes, 410_747);
+    assert_eq!(sa.max_edges, 43_893_765);
+    let gibbs = cuda_gibbs_identity(6_491_600, 183_869_076);
+    assert_eq!(gibbs.max_nodes, 6_491_600);
+    assert_eq!(gibbs.max_edges, 183_869_076);
+}
+
+#[test]
+fn msa_identity_declares_the_resolved_limits() {
+    let id = quip_solver_cuda::cuda_msa_identity(1_234_567, 7_654_321);
+    assert_eq!(id.max_nodes, 1_234_567);
+    assert_eq!(id.max_edges, 7_654_321);
+    assert_eq!(id.adapt.max_reads, 128);
+    assert_eq!(id.limits.max_degree, None);
 }
 
 /// Exercise `SelfFeedingTopology::build` + `fill_coefficients` via the public API only.
