@@ -128,6 +128,50 @@ impl Footprint {
     }
 }
 
+/// Device bytes for independent constrained loop chains.
+/// Includes signed incidence, endpoints, labels, costs, targets, short cycles,
+/// spins, running charges, three BFS arrays, scores, and validation flags.
+/// Products saturate so an oversized launch cannot wrap into admission.
+#[must_use]
+pub fn flow_loop_footprint(
+    links: usize,
+    vertices: usize,
+    cycles: usize,
+    replicas: usize,
+) -> Footprint {
+    Footprint {
+        shared_bytes: POOL_ALLOWANCE_BYTES
+            .saturating_add(links.saturating_mul(17))
+            .saturating_add(vertices.saturating_mul(20))
+            .saturating_add(cycles.saturating_mul(20).max(4)),
+        per_instance_bytes: links
+            .saturating_add(vertices.saturating_mul(16))
+            .saturating_add(20),
+        instances: replicas,
+    }
+}
+
+/// D-static dense matrix, topology, starts, search flags, final states, and trace.
+/// Each trace slot stores a node state, score, 24 link ids, length, and decision.
+/// The kernel keeps local fields and walk scratch in static block shared memory.
+#[must_use]
+pub fn dipolar_footprint(nodes: usize, replicas: usize, proposals: usize) -> Footprint {
+    let n = nodes;
+    let model = n
+        .saturating_mul(n)
+        .saturating_add(n)
+        .saturating_mul(8)
+        .saturating_add(n.saturating_mul(4).saturating_add(16).saturating_mul(4));
+    Footprint {
+        shared_bytes: POOL_ALLOWANCE_BYTES.saturating_add(model),
+        per_instance_bytes: n
+            .saturating_mul(3)
+            .saturating_add(20)
+            .saturating_add(proposals.max(1).saturating_mul(n.saturating_add(112))),
+        instances: replicas,
+    }
+}
+
 /// Threads per cluster anneal, matching `gpucluster.cu:272`.
 pub const CLUSTER_THREADS: usize = 512;
 

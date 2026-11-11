@@ -27,6 +27,7 @@ pub mod cuda_device;
 #[cfg_attr(test, allow(clippy::float_cmp))]
 mod cutoff;
 pub mod driver_budget;
+pub mod families;
 mod jit_cache;
 pub mod kernel;
 mod lease;
