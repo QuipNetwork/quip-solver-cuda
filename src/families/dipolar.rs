@@ -1334,6 +1334,9 @@ impl Rng {
 
 /// Maximum admitted nodes and move length, matching CPU-13 sides 2 and 3.
 pub const MAX_LINKS: usize = 24;
+const MAX_VERTICES: usize = 16;
+const KERNEL_THREADS: u32 = 32;
+const MAX_INCIDENT_LINKS: usize = 4;
 /// Maximum retained proposals per replica.
 pub const MAX_PROPOSALS: usize = 8192;
 /// Maximum independent replicas per batch.
@@ -1384,6 +1387,17 @@ impl Problem {
         replicas: usize,
         free_bytes: usize,
     ) -> Result<crate::capacity::Footprint, DipolarError> {
+        if self.nodes() > MAX_LINKS
+            || self.nodes() > KERNEL_THREADS as usize
+            || self.lattice.vertex_count() as usize > MAX_VERTICES
+            || self.request.labels.len() > MAX_VERTICES
+            || (0..self.lattice.vertex_count())
+                .any(|v| self.lattice.incident(v).len() > MAX_INCIDENT_LINKS)
+        {
+            return Err(DipolarError::Request(
+                "nodes, vertices, or incident links exceed the fixed kernel arrays".into(),
+            ));
+        }
         if replicas == 0
             || replicas > MAX_REPLICAS
             || schedule.proposals > MAX_PROPOSALS
@@ -1594,7 +1608,7 @@ impl DipolarDevice {
             begin.push(p.repair(start)?);
         }
         let flat: Vec<i8> = begin.iter().flatten().copied().collect();
-        let mut topology = Vec::with_capacity(n * 4 + 16);
+        let mut topology = Vec::with_capacity(n * 4 + MAX_VERTICES);
         for head in [false, true] {
             for e in 0..p.lattice.link_count() {
                 let link = p.lattice.link(e).ok_or(DipolarError::Overflow)?;
@@ -1609,7 +1623,7 @@ impl DipolarDevice {
         }
         topology.extend(p.pinned.iter().map(|&b| i32::from(b)));
         topology.extend(p.request.labels.iter().map(|l| i32::from(l.is_none())));
-        topology.resize(n * 4 + 16, 0);
+        topology.resize(n * 4 + MAX_VERTICES, 0);
         let h = self.stream.clone_htod(&p.h).map_err(device_error)?;
         let matrix = self
             .stream
@@ -1688,7 +1702,7 @@ impl DipolarDevice {
                 1,
                 1,
             ),
-            block_dim: (32, 1, 1),
+            block_dim: (KERNEL_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         let setup_seconds = setup.elapsed().as_secs_f64() + self.setup_seconds;
@@ -2133,6 +2147,27 @@ mod tests {
             Evidence::Analytic,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn admission_checks_kernel_arrays_independently_of_side() {
+        let schedule = Schedule::default();
+        let mut p = problem();
+        assert!(p.request.side <= MAX_TESTED_SIDE);
+        p.h.resize(25, 0);
+        assert!(matches!(
+            p.admit(&schedule, 1, usize::MAX),
+            Err(DipolarError::Request(_))
+        ));
+
+        let mut p = problem();
+        p.lattice = SquareLattice::new(4, Boundary::Open).unwrap();
+        assert!(p.request.side <= MAX_TESTED_SIDE);
+        assert_eq!(p.nodes(), 12);
+        assert!(matches!(
+            p.admit(&schedule, 1, usize::MAX),
+            Err(DipolarError::Request(_))
+        ));
     }
 
     #[test]
