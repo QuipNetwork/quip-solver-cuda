@@ -403,3 +403,83 @@ fn gpu_permuted_golden_starts_and_cold_baseline() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial]
+fn gpu_large_instances_strides_and_determinism() {
+    use quip_solver_core::ising_generators::ice::topology::zephyr_lattice;
+
+    let (nodes, edges) = zephyr_lattice(10, 4).unwrap();
+    let topology = BaseTopology::new(nodes, &edges).unwrap();
+    for contract in [FLOW_V1, POLARITON_V1] {
+        let mut params = reference_revision(contract.family_id, contract.revision)
+            .unwrap()
+            .params[0]
+            .to_vec();
+        // Canonical TLV fields: Zephyr m=10, side=18. Keep the family-specific field 4.
+        params[7..9].copy_from_slice(&10_u16.to_le_bytes());
+        params[22..24].copy_from_slice(&18_u16.to_le_bytes());
+        let i = export_instances(&contract, &params, &topology, &[[1; 32]])
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap();
+        let problem = FlowProblem::from_instance(&contract, &params, &i).unwrap();
+        let model = graph(&i);
+        let n = problem.task().positions().len();
+        assert_eq!(n, 684);
+        assert_eq!(problem.task().labels().len(), 361);
+        assert_eq!(LoopLayout::new(problem.task()).cycles().len() / 5, 324);
+        let starts: Vec<Vec<i8>> = (0..16_u64)
+            .map(|k| {
+                let mut state = k + 1;
+                (0..n)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        if state & 1 == 0 {
+                            -1
+                        } else {
+                            1
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        // Two passes cross the shared pass-reset boundary as well as proposal boundaries.
+        let run = problem.run(0, &starts, 2).unwrap();
+        let again = problem.run(0, &starts, 2).unwrap();
+        assert_eq!(run.spins, again.spins);
+        assert_eq!(run.scores, again.scores);
+        assert_eq!(run.energies, again.energies);
+        for result in [&run, &again] {
+            assert_eq!(result.spins.len(), starts.len());
+            assert_eq!(result.scores.len(), starts.len());
+            assert_eq!(result.energies.len(), starts.len());
+            for (k, nodes) in result.spins.iter().enumerate() {
+                let links = problem.task().link_spins(nodes).unwrap();
+                let check = problem.task().check(&links).unwrap();
+                assert_eq!(check.charges.iter().map(|&q| i32::from(q)).sum::<i32>(), 0);
+                let direct = score(problem.task(), &links).unwrap();
+                let start = score(
+                    problem.task(),
+                    &problem.task().link_spins(&starts[k]).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(result.scores[k], direct);
+                assert!(direct <= start);
+                assert_eq!(
+                    result.energies[k],
+                    energy_milli(nodes, &model.h, &model.j, &model.edges)
+                );
+                assert_eq!(result.energies[k], problem.energy(nodes).unwrap());
+            }
+        }
+        eprintln!(
+            "{} large: launch {:?}, transfer {:?}, validation {:?}",
+            contract.family_id, run.launch_time, run.transfer_time, run.validation_time
+        );
+    }
+}

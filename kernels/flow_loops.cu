@@ -185,7 +185,10 @@ extern "C" __global__ void quip_flow_loops(
         for (int v = 0; v < vertices; ++v) {
             if (t == 0) repair_path(v, vertices, ends, inc, labels, spins, charges, scratch, w);
             __syncthreads();
-            if (w.length) try_move(n, vertices, inc, labels, costs, targets, spins, charges, scores, status, w);
+            int length = w.length;
+            // Finish every read before thread 0 builds the next proposal.
+            __syncthreads();
+            if (length) try_move(n, vertices, inc, labels, costs, targets, spins, charges, scores, status, w);
         }
         // CPU-12 flow_loops.rs:561-593: directed short-cycle steepest
         // descent. Evaluate candidates concurrently, first cycle on ties.
@@ -226,8 +229,13 @@ extern "C" __global__ void quip_flow_loops(
         for (int e = 0; e < n; ++e) {
             if (t == 0) worm_path(e, ends, inc, labels, spins, targets, costs, w);
             __syncthreads();
-            if (w.length) try_move(n, vertices, inc, labels, costs, targets, spins, charges, scores, status, w);
+            int length = w.length;
+            __syncthreads();
+            if (length) try_move(n, vertices, inc, labels, costs, targets, spins, charges, scores, status, w);
         }
-        if (!w.changed || *status) break;
+        int stop = !w.changed || *status;
+        // Finish every read before the next pass clears w.changed.
+        __syncthreads();
+        if (stop) break;
     }
 }
