@@ -54,7 +54,7 @@ use crate::streaming::{
 };
 use crate::{IsingGraph, KernelKind, SampleParams};
 use clap::{Args, Subcommand, ValueEnum};
-use quip_protocol::chacha8::ChaCha8Rng;
+use quip_solver_core::ising_generators::rng::ChaCha8Rng;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write as _;

@@ -1,8 +1,8 @@
 //! Collect nonce-aligned probe and production MSA minima on CUDA device 0.
 
 use clap::Parser;
-use quip_protocol::derive::NonceDeriver;
 use quip_solver_core::adapt::adapt_params;
+use quip_solver_core::ising_generators::random::NonceDeriver;
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleParams, StreamJob, StreamOutcome, StreamResult, TopologyView,
 };

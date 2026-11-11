@@ -350,6 +350,8 @@ pub(crate) fn lease(
             base_salt: vec![0x44; 32],
             salt_start,
             salt_count,
+            family: None,
+            topology_order_digest: Vec::new(),
         }),
     }
 }
