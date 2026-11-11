@@ -9,6 +9,9 @@ variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
   # Downloadable binaries live in the generic package registry under this name.
   PKG: quip-solver-cuda
+  # The binaries that a tag publishes. build-amd64 fails when this list and the
+  # manifest's binary targets differ, so a new binary is a deliberate edit here.
+  BINS: quip-cuda-dipolar quip-cuda-flow-loops quip-cuda-gibbs quip-cuda-msa quip-cuda-otsuka quip-cuda-sa
   # The toolchain image the jobs run on, by digest. The
   # build-toolchain-image job prints this line after a rebuild.
   TOOLCHAIN_IMAGE: registry.gitlab.com/quip.network/quip-solver-cuda/ci-toolchain@sha256:5ebdbbd387d4a04a24a439f0ea2f43e41ba04e6ed161360807b8714758e7d885
@@ -107,11 +110,19 @@ test:
 build-amd64:
   extends: [.build, .toolchain]
   script:
+    - |
+      declared=$(cargo metadata --no-deps --format-version 1 | tr '{' '\n' \
+        | sed -n 's/.*"kind":\["bin"\].*"name":"\([^"]*\)".*/\1/p' | LC_ALL=C sort | tr '\n' ' ')
+      listed=$(printf '%s\n' $BINS | LC_ALL=C sort | tr '\n' ' ')
+      if [ "$declared" != "$listed" ]; then
+        echo "BINS does not match the manifest's binary targets" >&2
+        echo "  manifest: $declared" >&2
+        echo "  BINS:     $listed" >&2
+        exit 1
+      fi
     - cargo build --release --bins
     - mkdir -p dist
-    - cp target/release/quip-cuda-sa dist/quip-cuda-sa-linux-amd64
-    - cp target/release/quip-cuda-gibbs dist/quip-cuda-gibbs-linux-amd64
-    - cp target/release/quip-cuda-msa dist/quip-cuda-msa-linux-amd64
+    - for b in $BINS; do cp "target/release/$b" "dist/$b-linux-amd64"; done
 
 # On a tag: upload every built binary to the generic package registry, then cut
 # a Release linking them as downloadable assets.
@@ -137,7 +148,8 @@ release:
   script:
     - |
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
-      release-cli create --name "quip-solver-cuda ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
-        --assets-link "{\"name\":\"quip-cuda-sa-linux-amd64\",\"url\":\"${base}/quip-cuda-sa-linux-amd64\"}" \
-        --assets-link "{\"name\":\"quip-cuda-gibbs-linux-amd64\",\"url\":\"${base}/quip-cuda-gibbs-linux-amd64\"}" \
-        --assets-link "{\"name\":\"quip-cuda-msa-linux-amd64\",\"url\":\"${base}/quip-cuda-msa-linux-amd64\"}"
+      set -- --name "quip-solver-cuda ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}"
+      for b in $BINS; do
+        set -- "$@" --assets-link "{\"name\":\"$b-linux-amd64\",\"url\":\"${base}/$b-linux-amd64\"}"
+      done
+      release-cli create "$@"
