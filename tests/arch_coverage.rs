@@ -22,6 +22,7 @@ const SA_SRC: &str = include_str!("../kernels/sa.cu");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
 const MSA_SRC: &str = include_str!("../kernels/msa.cu");
 const CLUSTER_SRC: &str = include_str!("../kernels/cluster.cu");
+const FLOW_LOOPS_SRC: &str = include_str!("../kernels/flow_loops.cu");
 const SCREEN_SRC: &str = include_str!("../kernels/screen.cu");
 
 // Keep the compiled shapes aligned with the device-open variants.
@@ -151,6 +152,7 @@ const KERNEL_VARIANTS: &[(&str, &str, usize, &[&str])] = &[
     // The screen sizes its shared memory per launch; the node define is unused.
     ("screen", SCREEN_SRC, 0, &[]),
     ("cluster", CLUSTER_SRC, 0, &[]),
+    ("flow_loops", FLOW_LOOPS_SRC, 0, &[]),
 ];
 
 /// Reports whether the caller must return without testing anything, and says
@@ -247,9 +249,9 @@ fn assert_kernel_variants(arch: i32, kernel: &str) {
             }
         }
     }
-    if kernel == "cluster" {
+    if kernel == "cluster" || kernel == "flow_loops" {
         drop(writeln!(std::io::stderr(),
-            "cluster @ compute_{arch}: compile and assembly {:.3}s; device execution UNTESTED (toolkit-only check)",
+            "{kernel} @ compute_{arch}: compile and assembly {:.3}s; device execution UNTESTED (toolkit-only check)",
             started.elapsed().as_secs_f64()));
     }
     assert!(checked > 0, "no variants for {kernel}");
@@ -262,7 +264,7 @@ macro_rules! architecture_tests {
         fn architecture_matrix_matches_support_contract() {
             assert_eq!(&[$($arch),+], SUPPORTED_ARCHS);
             for &(name, ..) in KERNEL_VARIANTS {
-                assert!(matches!(name.split('-').next(), Some("sa" | "gibbs" | "msa" | "screen" | "cluster")));
+                assert!(matches!(name.split('-').next(), Some("sa" | "gibbs" | "msa" | "screen" | "cluster" | "flow_loops")));
             }
         }
 
@@ -286,6 +288,10 @@ macro_rules! architecture_tests {
             #[test]
             #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
             fn cluster() { super::assert_kernel_variants($arch, "cluster"); }
+
+            #[test]
+            #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
+            fn flow_loops() { super::assert_kernel_variants($arch, "flow_loops"); }
         })+
     };
 }

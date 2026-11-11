@@ -128,6 +128,29 @@ impl Footprint {
     }
 }
 
+/// Device bytes for independent constrained loop chains.
+/// Includes signed incidence, endpoints, labels, costs, targets, short cycles,
+/// spins, running charges, three BFS arrays, scores, and validation flags.
+/// Products saturate so an oversized launch cannot wrap into admission.
+#[must_use]
+pub fn flow_loop_footprint(
+    links: usize,
+    vertices: usize,
+    cycles: usize,
+    replicas: usize,
+) -> Footprint {
+    Footprint {
+        shared_bytes: POOL_ALLOWANCE_BYTES
+            .saturating_add(links.saturating_mul(17))
+            .saturating_add(vertices.saturating_mul(20))
+            .saturating_add(cycles.saturating_mul(20).max(4)),
+        per_instance_bytes: links
+            .saturating_add(vertices.saturating_mul(16))
+            .saturating_add(20),
+        instances: replicas,
+    }
+}
+
 /// Threads per cluster anneal, matching `gpucluster.cu:272`.
 pub const CLUSTER_THREADS: usize = 512;
 
