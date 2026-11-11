@@ -12,6 +12,10 @@ use std::sync::Arc;
 
 const SOURCE: &str = include_str!("../../kernels/cluster.cu");
 
+#[cfg(all(test, feature = "long-tests"))]
+#[path = "generation_cost.rs"]
+mod generation_cost;
+
 /// Research schedule and policy defaults from `run_cluster.py:39-46`.
 /// Weights belong to the prepared graph. Research defaults use 250 milli.
 #[derive(Clone, Debug)]
