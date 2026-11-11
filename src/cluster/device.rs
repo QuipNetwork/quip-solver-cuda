@@ -53,6 +53,9 @@ impl Default for ClusterSchedule {
 /// Admission, compilation, allocation, launch, or result failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterDeviceError {
+    /// The session abandoned this job between synchronized launches.
+    #[error("cluster job cancelled")]
+    Cancelled,
     /// A schedule or launch dimension is invalid.
     #[error("invalid cluster parameter: {0}")]
     Parameter(&'static str),
@@ -233,7 +236,7 @@ impl ClusterDevice {
         anneals: usize,
         seed: u64,
     ) -> Result<ClusterRun, ClusterDeviceError> {
-        self.run_inner(schedule, anneals, seed, true)
+        self.run_inner(schedule, anneals, seed, true, None)
             .map(|(run, _)| run)
     }
 
@@ -250,7 +253,32 @@ impl ClusterDevice {
         anneals: usize,
         seed: u64,
     ) -> Result<(ClusterRun, Vec<u64>), ClusterDeviceError> {
-        self.run_inner(schedule, anneals, seed, false)
+        self.run_inner(schedule, anneals, seed, false, None)
+    }
+
+    /// Run a host-built ladder with one synchronized sweep per launch.
+    ///
+    /// # Errors
+    /// Returns admission, device, or cancellation errors without partial output.
+    #[doc(hidden)]
+    pub fn run_work(
+        &mut self,
+        work: &super::sampler::ClusterWork,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ClusterRun, ClusterDeviceError> {
+        let schedule = ClusterSchedule {
+            sweeps: work.betas.len() * work.sweeps_per_beta,
+            chunk: 1,
+            ..Default::default()
+        };
+        self.run_inner(
+            &schedule,
+            work.reads,
+            work.seed,
+            true,
+            Some((work, cancelled)),
+        )
+        .map(|(run, _)| run)
     }
 
     fn run_inner(
@@ -259,6 +287,7 @@ impl ClusterDevice {
         anneals: usize,
         seed: u64,
         final_descent: bool,
+        control: Option<(&super::sampler::ClusterWork, &dyn Fn() -> bool)>,
     ) -> Result<(ClusterRun, Vec<u64>), ClusterDeviceError> {
         let params = schedule.params()?;
         let ctx = self.stream.context();
@@ -293,14 +322,36 @@ impl ClusterDevice {
             shared_mem_bytes: u32::try_from(self.graph.dynamic_shared_bytes())
                 .map_err(|_| ClusterDeviceError::Parameter("shared memory exceeds u32"))?,
         };
-        let mut start = 0;
-        while start < params.sweeps {
-            let count = params.chunk.min(params.sweeps - start);
-            self.launch(params, start, count, 0, config, &mut spins, &mut rng)?;
-            start += count;
-        }
-        if final_descent {
-            self.launch(params, 0, 0, 1, config, &mut spins, &mut rng)?;
+        if let Some((work, cancelled)) = control {
+            work.for_each_launch(cancelled, |start, beta, descent| {
+                let constant_beta = Params {
+                    beta_min: beta,
+                    beta_max: beta,
+                    ..params
+                };
+                self.launch(
+                    constant_beta,
+                    i32::try_from(start)
+                        .map_err(|_| ClusterDeviceError::Parameter("sweep exceeds i32"))?,
+                    i32::from(!descent),
+                    if descent { 2 } else { 0 },
+                    config,
+                    &mut spins,
+                    &mut rng,
+                )?;
+                self.stream.synchronize()?;
+                Ok(())
+            })?;
+        } else {
+            let mut start = 0;
+            while start < params.sweeps {
+                let count = params.chunk.min(params.sweeps - start);
+                self.launch(params, start, count, 0, config, &mut spins, &mut rng)?;
+                start += count;
+            }
+            if final_descent {
+                self.launch(params, 0, 0, 1, config, &mut spins, &mut rng)?;
+            }
         }
         let states = self.stream.clone_dtoh(&spins)?;
         let rng_state = if final_descent {
@@ -314,6 +365,9 @@ impl ClusterDevice {
             energies: Vec::with_capacity(anneals),
         };
         for s in states.chunks_exact(self.graph.original_graph().num_nodes()) {
+            if control.is_some_and(|(_, cancelled)| cancelled()) {
+                return Err(ClusterDeviceError::Cancelled);
+            }
             let original = self.graph.unpermute(s)?;
             result.energies.push(self.graph.energy(&original)?);
             result.spins.push(original);

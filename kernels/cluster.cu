@@ -106,7 +106,9 @@ extern "C" __global__ void quip_cluster_anneal(
     __syncthreads();
 
     if (final_pass) {
-        for (int pass = 0; pass < 256; ++pass) {
+        // Mode 2 lets the host check cancellation between greedy sweeps.
+        int passes = final_pass == 2 ? 1 : 256;
+        for (int pass = 0; pass < passes; ++pass) {
             if (threadIdx.x == 0) *changed = 0;
             __syncthreads();
             metropolis(g, s, 0.0f, rng, true, changed);

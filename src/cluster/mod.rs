@@ -2,11 +2,13 @@
 //!
 //! Validation and the strong/weak split follow the CPU Otsuka graph contract.
 //! Family contexts come from the session after canonical metadata validation.
-//! Preparation performs no CUDA calls and does not enable a sampler route.
+//! Preparation performs no CUDA calls.
 
 /// On-demand device upload and bounded cluster anneals.
 pub mod device;
 mod prepare;
+/// Family routing and production streaming for `quip-cuda-otsuka`.
+pub mod sampler;
 
 use std::collections::HashMap;
 use std::fmt;
