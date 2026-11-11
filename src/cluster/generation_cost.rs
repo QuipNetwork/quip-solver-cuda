@@ -138,6 +138,26 @@ fn ising_graph(instance: &Instance) -> IsingGraph {
     }
 }
 
+fn topology(m: u16, t: u8) -> BaseTopology {
+    if m != 0 || t != 0 {
+        let (nodes, edges) = zephyr_lattice(m, t).unwrap();
+        return BaseTopology::new(nodes, &edges).unwrap();
+    }
+    // Adjacency-mode endpoint: disjoint K4 motifs connected in a ring.
+    // Every node has degree four, with one disjoint dimer per tile.
+    let n = TWISTED_DIMER_V1.limits.max_nodes();
+    let mut edges = Vec::new();
+    for tile in (0..n).step_by(4) {
+        for a in 0..4 {
+            for b in a + 1..4 {
+                edges.push((tile + a, tile + b));
+            }
+        }
+        edges.push((tile + 1, (tile + 4) % n));
+    }
+    BaseTopology::new((0..n).collect(), &edges).unwrap()
+}
+
 // Measure the five actual upload buffers that carry coefficients. ELL words
 // also contain neighbor indices, so counting their entire transfer is an
 // optimistic upper bound on the bytes device generation could eliminate.
@@ -246,8 +266,7 @@ fn measure_generation_cost() {
     let kernel = ClusterKernel::load(0).unwrap(); // Visible ordinal 0 is physical GPU 1.
     let ctx = kernel.stream.context();
     let limits = limits(ctx);
-    let (nodes, edges) = zephyr_lattice(m, t).unwrap();
-    let base = BaseTopology::new(nodes, &edges).unwrap();
+    let base = topology(m, t);
     let params = parameters(m, t, weak, pairs);
     let digest = params_digest(&params);
     let contracts = [TWISTED_DIMER_V1];
@@ -297,8 +316,28 @@ fn measure_generation_cost() {
     )
     .unwrap();
     let nonces = NonceDeriver::new(lease.last_proof_block_hash, lease.miner_account);
-    let sample_params = SampleParams::default();
+    let budget = std::env::var("CU4_BUDGET").unwrap_or_else(|_| "mining-easy".into());
+    let mut sample_params = SampleParams::default();
+    if budget != "api-default" {
+        let target = match budget.as_str() {
+            "mining-easy" => i64::MAX,
+            "mining-hard" => i64::MIN,
+            _ => panic!("CU4_BUDGET must be api-default, mining-easy, or mining-hard"),
+        };
+        let identity = crate::cluster::sampler::cuda_otsuka_identity(&limits, usize::MAX);
+        let adapted = quip_solver_core::adapt::adapt_params(
+            target,
+            1,
+            base.node_ids().len(),
+            base.edges().len(),
+            &[0],
+            &identity.adapt,
+        );
+        sample_params.num_reads = usize::try_from(adapted.num_reads).unwrap();
+        sample_params.num_sweeps = usize::try_from(adapted.num_sweeps).unwrap();
+    }
     let mut instances = Vec::new();
+    let mut instance_nonces = Vec::new();
     let mut generation = Vec::new();
     let mut skipped = Vec::new();
     // Untimed generator warmup. The same lease nonces are used on every rerun.
@@ -317,6 +356,7 @@ fn measure_generation_cost() {
         match instance {
             Ok(instance) => {
                 instances.push(instance);
+                instance_nonces.push(nonce);
                 generation.push(ms);
             }
             Err(SaltFault::Skip(code)) => {
@@ -357,6 +397,7 @@ fn measure_generation_cost() {
         "source_diff": command("git", &["diff", "--stat"]),
         "gpu_start": start_telemetry, "family": TWISTED_DIMER_V1.family_id, "revision": 1,
         "shape": shape, "nodes": base.node_ids().len(), "edges": base.edges().len(),
+        "budget": budget,
         "reads": sample_params.num_reads, "sweeps": sample_params.num_sweeps, "sweeps_per_beta": sample_params.sweeps_per_beta,
         "host_runs": HOST_RUNS, "generation_ms": median(&generation), "preparation_ms": median(&preparation),
         "generation_samples_ms": generation, "preparation_samples_ms": preparation,
@@ -413,35 +454,25 @@ fn measure_generation_cost() {
             let (ms, event_spins) = kernel_ms(&device, &work);
             kernels.push(ms);
             kernel_wall_ms.push(milliseconds(start));
-            let start = Instant::now();
-            let run = device
-                .run_work(&work, &|| start.elapsed().as_secs() >= 40, &|| false)
-                .unwrap();
-            jobs.push(milliseconds(start));
-            assert_eq!(run.spins.len(), sample_params.num_reads);
             let expected: Vec<_> = event_spins
                 .chunks_exact(device.graph.original_graph().num_nodes())
                 .map(|spins| device.graph.unpermute(spins).unwrap())
                 .collect();
-            assert_eq!(
-                run.spins, expected,
-                "event instrumentation changed the solve"
-            );
-            results.push(run.energies);
-
             // An independent end-to-end job includes canonical expansion,
             // float conversion, CU-1, allocation/upload, schedule construction,
             // production launches, download, and the sampler's final rescore.
             let start = Instant::now();
-            let nonce = nonces.derive(lease.salt(u64::try_from(totals.len()).unwrap()).unwrap());
+            let nonce = *instance_nonces.last().unwrap();
             let instance = generate(&params, &digest, &base, &bounds, nonce).unwrap();
             let graph = ising_graph(&instance);
             let prepared = prepare(&instance).unwrap();
             let work = ClusterWork::new(&graph, &sample_params).unwrap();
             let mut complete = ClusterDevice::open_with_kernel(prepared, &kernel).unwrap();
+            let run_start = Instant::now();
             let run = complete
                 .run_work(&work, &|| start.elapsed().as_secs() >= 40, &|| false)
                 .unwrap();
+            jobs.push(milliseconds(run_start));
             for spins in &run.spins {
                 let energy = quip_solver_core::quip_protocol::scoring::energy_milli(
                     spins,
@@ -452,6 +483,12 @@ fn measure_generation_cost() {
                 std::hint::black_box(energy);
             }
             totals.push(milliseconds(start));
+            assert_eq!(run.spins.len(), sample_params.num_reads);
+            assert_eq!(
+                run.spins, expected,
+                "event instrumentation changed the solve"
+            );
+            results.push(run.energies);
         }
         let total = median(&totals);
         let saving = median(&generation) + median(&coefficient_ms);
