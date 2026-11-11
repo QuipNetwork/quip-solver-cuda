@@ -6,15 +6,15 @@ CI_IMAGE := quip-solver-cuda-ci
 # skips without it, because off CUDA 12.9 those tests report the toolkit, not the kernels.
 # GitLab sets CI itself; docker run inherits nothing, so the flag is what keeps
 # `make test-archs` a real run rather than a silent skip.
-RUN_CI   := docker run --rm -e CI=1 -v $(PWD):/src -v quip-cuda-cargo:/root/.cargo/registry \
+RUN_CI   := docker run --rm -e CI=1 -v $(PWD):/src -v quip-cuda-cargo:/opt/cargo/registry \
             -v quip-cuda-target:/src/target -w /src $(CI_IMAGE)
-RUN_GPU  := docker run --rm --gpus all -e CI=1 -v $(PWD):/src -v quip-cuda-cargo:/root/.cargo/registry \
+RUN_GPU  := docker run --rm --gpus all -e CI=1 -v $(PWD):/src -v quip-cuda-cargo:/opt/cargo/registry \
             -v quip-cuda-target:/src/target -w /src $(CI_IMAGE)
 
 .PHONY: ci-image check test test-archs test-gpu test-long bench-arch
 
 ci-image:
-	docker build -f Dockerfile.ci -t $(CI_IMAGE) .
+	docker build -t $(CI_IMAGE) - < .gitlab/ci-toolchain.Dockerfile
 
 check: ci-image
 	$(RUN_CI) sh -c 'cargo fmt --all --check && cargo clippy --release --all-targets --all-features -- -D warnings'
