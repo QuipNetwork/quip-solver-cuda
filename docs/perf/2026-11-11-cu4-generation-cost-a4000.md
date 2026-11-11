@@ -1,16 +1,23 @@
 # Family generation costs
 
-The CU-4 session measurements below supersede the original device-generation recommendation.
-Core 0.0.8 already generates lease instances ahead of the sampler.
-The maintainer selected host overlap instead of device generation.
-Production behavior remains unchanged under the task's measurement-only stop condition.
+Core 0.0.8 already overlaps canonical host generation with device work.
+This work adds no GPU generator, and CU-1 preparation stays serial on the sampler thread.
+CU-4 measures existing behavior without production changes.
 
-The original spike recommended device generation under its stated decision rule.
-At all three registered 4,800-node recipes, generation plus coefficient transfer is 13.47–13.73% of a low-budget mining job.
-Generation alone is 13.39–13.65%, so the conclusion does not depend on counting packed neighbor bits as coefficient transfer.
-The 10% condition passes at mining-relevant sizes. No admitted measured case exceeds the alternative 50 ms saving condition.
-This is an upper-bound opportunity. No device generator exists in this measurement. Its added kernel time would reduce the saving.
-The canonical host generator remains the implemented default. This work adds no generation kernel.
+The measured generation share depends on the job budget:
+
+| Budget | Measured cases | Generation alone / job | Generation + coefficient H2D / job | Full frontend / job |
+|---|---|---:|---:|---:|
+| Mining floor: 64 reads, 256 sweeps | Three registered 4,800-node recipes | 13.39–13.65% | 13.47–13.73% | 21.22–21.79% |
+| Mining ceiling: 256 reads, 2,048 sweeps | Three 4,800-node recipes and one 10,656-node case | 0.72–0.98% | 0.73–0.99% | 1.35–1.55% |
+
+The measurements give host costs and upper bounds on hypothetical savings before overlap.
+For the three registered recipes, the 10% opportunity threshold holds at the measured floor and fails at the measured ceiling.
+The ceiling measures about 0.7–1.6% across generation and full frontend shares.
+Generation alone is smaller than the full frontend, which also includes preparation and H2D.
+Larger kernel times explain the smaller ceiling shares, independent of the observed clock decrease in the largest case.
+No admitted measured case exceeds the alternative 50 ms saving condition.
+A device generator would add kernel time. These bounds do not measure a device-generation speedup or new savings over existing overlap.
 
 ## Measurement environment
 
@@ -18,14 +25,16 @@ Physical GPU 1 is the only GPU used. Every GPU process has `CUDA_VISIBLE_DEVICES
 Visible CUDA ordinal zero selects physical GPU 1. Commands run serially.
 The GPU is NVIDIA RTX A4000, UUID `GPU-83b5eb66-e645-f1bb-23d6-95aa0ea03e09`, PCI `00000000:06:00.0`.
 The driver is 615.71.10. The host CPU is AMD Ryzen 9 5950X. Rust and Cargo are 1.97.1.
-The UTC measurement date is 2026-11-11, which is 2026-11-10 locally.
+The UTC measurement date is 2026-11-11.
+The generation matrix runs on 2026-11-10 locally. The throughput sessions run on 2026-11-11 locally.
 
 The registered low-budget recipes start at 65–68 C and finish at 69–73 C.
 Their GPU phases last 0.88–0.89 seconds. Their reported SM clocks are 1,860–1,905 MHz.
 The largest low-budget GPU phase lasts 3.054 seconds.
-The high-budget sequence reaches 95 C and lower clocks. Treat all high-budget rows as thermally affected sensitivity data.
-The high-budget 10,656-node case takes 52.53 seconds, including a 50.810-second GPU phase: it exceeds the 45-second limit.
-Its SM clock drops from 1,590 to 1,485 MHz. It does not support the recommendation.
+The recorded 10,656-node ceiling case starts at 93 C and 1,590 MHz and ends at 94 C and 1,485 MHz.
+The high-temperature clock decrease is consistent with throttling, although the JSONL does not record throttle-reason flags.
+That historical case takes 52.53 seconds, including a 50.810-second GPU phase, exceeding the 45-second limit.
+The table retains this result. The new throughput runs each stay below the 45-second limit.
 The longest individual complete-job sample is 4.874 seconds. The longest individual instrumented run is 4.622 seconds.
 All 39 case logs report passing tests. The supervisor receives termination after the final row and passing result are present.
 
@@ -125,7 +134,10 @@ The full t=8 lattices at the schema endpoint fail family admission:
 
 ## Mining session ceiling: 256 reads, 2,048 sweeps
 
-These rows are thermally affected. They do not support the recommendation.
+These measured results fall below the 10% opportunity threshold.
+Generation alone is 0.72–0.98% of a complete job. Generation plus coefficient H2D is 0.73–0.99%.
+The full frontend is 1.35–1.55%. Longer device work accounts for these smaller shares.
+The environment section records the observed clock decrease for the 10,656-node case.
 
 | Parameters m,t,weak,pairs | Nodes | Edges | Generation ms | Preparation ms | H2D ms | Coefficient H2D ms | Kernel ms | Total ms | Front % | Save ms | Save % |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -168,14 +180,16 @@ The shape and budget columns in the tables define the recorded matrix.
 
 ## Checks
 
-All required checks pass with zero warnings:
+The requested Rust checks pass with zero compiler or lint warnings:
 
 - `cargo fmt --all --check`
 - `cargo clippy --release --all-targets --all-features -- -D warnings`
 - `cargo clippy --release --all-targets -- -D warnings`
-- `cargo test --release`: 438 passed. The run ignores 258 tests and reports zero failures.
 
-The test run uses `RUST_TEST_THREADS=1` and `CUDA_VISIBLE_DEVICES=1`.
+The record correction reruns these three checks. Both clippy commands report zero warnings.
+Historical session verification records 438 passed and 264 ignored tests for the release suite.
+The ignored total includes six library tests and 258 integration tests, confirmed through `--ignored --list` on existing default-feature binaries.
+That earlier suite uses `RUST_TEST_THREADS=1` and `CUDA_VISIBLE_DEVICES=1`, and the record correction does not rerun it.
 
 ## Existing host generation overlap
 
@@ -186,13 +200,13 @@ It does not generate instances on `quip-sampler`.
 
 The source chain in `quip-solver-core-0.0.8/src/` is:
 
-- `lib.rs:185`: `generates_locally` defaults to false. The Otsuka sampler keeps this default.
+- `lib.rs:187–191`: `generates_locally` defaults to false. The Otsuka sampler keeps this default.
 - `session.rs:1999`: the miner creates the multithread Tokio runtime.
 - `session.rs:1155`: prefetch is twice the live stream width. `lease_depth` uses that bound.
-- `session.rs:1184`: the `quip-sampler` thread consumes the job receiver.
+- `session.rs:1185`: the `quip-sampler` thread consumes the job receiver.
 - `session.rs:1197`: a shared semaphore bounds unfinished lease salts across expanders.
 - `session.rs:1507`: the session spawns `Expander::run` as a Tokio task.
-- `lease.rs:689`: the expander acquires a slot before drawing each salt.
+- `lease.rs:698`: the expander acquires a slot before drawing each salt.
 - `lease.rs:708`: `salt_graph` generates the next instance before sending its job.
 - `lease.rs:636`: `family_graph` calls `FamilyLease::generate` and converts the instance into a graph and family context.
 - `lease.rs:133`: `FamilyLease::generate` admits the saved descriptor and calls `generate_instance` at line 143.
@@ -200,7 +214,7 @@ The source chain in `quip-solver-core-0.0.8/src/` is:
 
 Within this crate, `src/cluster/sampler.rs:442` receives each generated `WarmStreamJob`.
 Line 449 builds `PreparedGraph` on `quip-sampler`, immediately before the synchronous device work at line 450.
-`src/cluster/prepare.rs:290` delegates family preparation to `from_instance`.
+`src/cluster/prepare.rs:296` delegates family preparation to `from_instance`.
 `src/cluster/sampler.rs:466` delegates stream width to SA, which resolves to 48 on the A4000.
 Core permits 96 unfinished lease salts. This bound covers queued and active work.
 This existing bound differs from a proposed new queue of one or two prepared jobs.
@@ -222,8 +236,11 @@ The serial control sends 50 single-salt leases. It waits for each completion and
 The existing core mode sends one 50-salt lease, allowing the expander to generate ahead while the sampler runs.
 The timer includes initial generation, sampling, result transport, lease completion, and refunds.
 It excludes process startup, warmup, independent energy checks, and shutdown.
-The control includes 49 extra lease exchanges and repeated lease admission.
-The throughput difference compares whole sessions and does not isolate generation savings.
+The serial control also includes 49 extra lease exchanges and repeated lease admission.
+The throughput difference is not all generation because the comparison includes those extra exchanges and repeated admissions.
+The original 4,800-node serial control spends 1.878946 seconds outside the sampler, or 38.35 ms per extra exchange.
+That scale exceeds the measured 13.45 ms generation cost per salt.
+The division does not isolate exchange latency because the residual also includes generation and other protocol work.
 Both modes use the same production code.
 
 The measurement checks salt and nonce order, 64 reads per salt, reported sweep counts, and exact energies against regenerated instances.
@@ -231,38 +248,114 @@ It also checks rejection and fatal-error absence, each expected refund, and a su
 Sampler timing sums the 50 reported `device_access_time_us` values.
 This sum includes CU-1, upload, device work, download, and final sampler scoring.
 The remaining wall time includes initial generation, protocol work, and any idle gaps.
+`Session::until` at `tests/common/lease.rs:202–225` awaits incoming protocol frames through `inbound.message()`.
+The helper tests completion after each frame without a fixed polling interval or log-poll quantization.
+The timer ends after the final completion and refund arrive, so network and scheduling delays remain in the wall time.
 
 Raw session records: [2026-11-11-cu4-overlap-a4000.jsonl](2026-11-11-cu4-overlap-a4000.jsonl).
 
 ### Throughput results
 
-These rows use the final timing instrumentation. Each row covers 50 jobs on physical GPU 1.
+The dataset contains all 27 recorded sessions: seven original runs plus all 20 new repeats.
+Rows use their one-based JSONL line number. Each session covers 50 jobs on physical GPU 1.
+The 4,800-node sessions use `12,4,62,1200`, and the 2,176-node sessions use `8,4,62,544`.
+Rows 1–7 use commit `19287e0`. Rows 8–27 use `f403237` without production or benchmark changes.
+N/A means the original record lacks summed sampler timing, so its outside-sampler time is also unknown.
+The wall-time and throughput statistics include every run.
 
-| Nodes | Parameters m,t,weak,pairs | Mode | Wall seconds | Sampler seconds | Outside sampler seconds | Jobs/s |
-|---|---|---|---:|---:|---:|---:|
-| 4,800 | `12,4,62,1200` | Serial single-salt leases | 6.912209 | 5.033263 | 1.878946 | 7.2336 |
-| 4,800 | `12,4,62,1200` | Existing core prefetch | 5.437914 | 5.376243 | 0.061671 | 9.1947 |
-| 2,176 | `8,4,62,544` | Serial single-salt leases | 3.659842 | 2.689768 | 0.970074 | 13.6618 |
-| 2,176 | `8,4,62,544` | Existing core prefetch | 2.994327 | 2.965065 | 0.029262 | 16.6982 |
+| Row | Nodes | Mode | Wall s | Sampler s | Outside sampler s | Jobs/s | Start→end C | End SM MHz |
+|---:|---:|---|---:|---:|---:|---:|---|---:|
+| 1 | 4,800 | `serial` | 10.428149 | N/A | N/A | 4.7947 | 62→66 | 1560 |
+| 2 | 4,800 | `core-prefetch` | 6.141930 | N/A | N/A | 8.1408 | 65→75 | 1890 |
+| 3 | 2,176 | `core-prefetch` | 2.996929 | N/A | N/A | 16.6837 | 64→71 | 1890 |
+| 4 | 2,176 | `serial` | 3.659842 | 2.689768 | 0.970074 | 13.6618 | 65→70 | 1890 |
+| 5 | 2,176 | `core-prefetch` | 2.994327 | 2.965065 | 0.029262 | 16.6982 | 65→72 | 1890 |
+| 6 | 4,800 | `serial` | 6.912209 | 5.033263 | 1.878946 | 7.2336 | 66→75 | 1875 |
+| 7 | 4,800 | `core-prefetch` | 5.437914 | 5.376243 | 0.061671 | 9.1947 | 68→78 | 1860 |
+| 8 | 4,800 | `serial` | 8.576757 | 5.832188 | 2.744569 | 5.8297 | 65→73 | 1710 |
+| 9 | 4,800 | `core-prefetch` | 4.478435 | 4.449387 | 0.029048 | 11.1646 | 66→76 | 1845 |
+| 10 | 2,176 | `serial` | 3.651597 | 2.740495 | 0.911102 | 13.6926 | 65→71 | 1815 |
+| 11 | 2,176 | `core-prefetch` | 2.166600 | 2.150621 | 0.015979 | 23.0776 | 65→73 | 1890 |
+| 12 | 4,800 | `core-prefetch` | 4.452764 | 4.420198 | 0.032566 | 11.2290 | 66→77 | 1860 |
+| 13 | 4,800 | `serial` | 6.213241 | 4.582754 | 1.630487 | 8.0473 | 67→76 | 1860 |
+| 14 | 2,176 | `core-prefetch` | 2.102655 | 2.085974 | 0.016681 | 23.7795 | 66→74 | 1890 |
+| 15 | 2,176 | `serial` | 2.888623 | 2.167726 | 0.720897 | 17.3093 | 66→74 | 1890 |
+| 16 | 4,800 | `serial` | 6.129598 | 4.402014 | 1.727584 | 8.1571 | 67→76 | 1860 |
+| 17 | 4,800 | `core-prefetch` | 4.337379 | 4.311111 | 0.026268 | 11.5277 | 67→77 | 1860 |
+| 18 | 2,176 | `serial` | 2.941636 | 2.232171 | 0.709465 | 16.9973 | 66→73 | 1890 |
+| 19 | 2,176 | `core-prefetch` | 2.021869 | 2.007104 | 0.014765 | 24.7296 | 64→73 | 1890 |
+| 20 | 4,800 | `core-prefetch` | 4.970818 | 4.936391 | 0.034427 | 10.0587 | 66→75 | 1875 |
+| 21 | 4,800 | `serial` | 6.095595 | 4.379600 | 1.715995 | 8.2026 | 67→77 | 1860 |
+| 22 | 2,176 | `core-prefetch` | 2.347470 | 2.323941 | 0.023529 | 21.2995 | 66→74 | 1860 |
+| 23 | 2,176 | `serial` | 2.778961 | 2.113491 | 0.665470 | 17.9923 | 66→73 | 1890 |
+| 24 | 4,800 | `serial` | 6.253384 | 4.355608 | 1.897776 | 7.9957 | 67→76 | 1845 |
+| 25 | 4,800 | `core-prefetch` | 4.335366 | 4.305017 | 0.030349 | 11.5331 | 66→77 | 1860 |
+| 26 | 2,176 | `serial` | 2.853481 | 2.133413 | 0.720068 | 17.5225 | 66→73 | 1890 |
+| 27 | 2,176 | `core-prefetch` | 2.199783 | 2.185566 | 0.014217 | 22.7295 | 65→74 | 1890 |
 
-The prefetched runs spend 98.9% and 99.0% of wall time inside the serial sampler.
-Generation for 50 salts cannot lie serially outside sampling in gaps of only 62 ms and 29 ms.
-The source trace and these gaps show that core already hides generation behind sampling.
-The task's stop condition applies. This measurement adds no production worker or prepared successor.
+The following aggregates include every recorded run for each size and mode.
+These session ratios are indicative because the measurements leave clocks and host scheduling under normal system control.
 
-Session throughput rises by 27.1% and 22.2% over the controls.
-These percentages also include fewer lease exchanges and admission checks.
-They do not estimate a new code change or isolate CU-1 savings.
-The sampler remains serial for family jobs and still prepares each graph immediately before running it.
+| Nodes | Mode | Runs | Median wall s | Full wall range s | Median jobs/s | Full jobs/s range |
+|---|---|---:|---:|---|---:|---|
+| 4,800 | `serial` | 7 | 6.253384 | 6.095595–10.428149 | 7.9957 | 4.7947–8.2026 |
+| 4,800 | `core-prefetch` | 7 | 4.478435 | 4.335366–6.141930 | 11.1646 | 8.1408–11.5331 |
+| 2,176 | `serial` | 6 | 2.915130 | 2.778961–3.659842 | 17.1533 | 13.6618–17.9923 |
+| 2,176 | `core-prefetch` | 7 | 2.199783 | 2.021869–2.996929 | 22.7295 | 16.6837–24.7296 |
 
-The final runs start at 65–68 C and finish at 70–78 C.
-Their final SM clocks range from 1,860 to 1,890 MHz.
-Each timed run lasts under seven seconds. The longest whole measurement test lasts 15.38 seconds.
-That duration includes startup and host checks.
-The seven raw records also keep three initial runs without summed sampler timing.
-The first 4,800-node control ran at 1,560 MHz and took 10.428 seconds.
-The main table uses the later run with summed sampler timing rather than that clock-affected initial control.
-The initial prefetched runs measured 8.1408 jobs/s and 16.6837 jobs/s.
+Median rate ratios, `core-prefetch / serial`: 4,800 nodes: 1.3963× (39.63% higher session throughput). 2,176 nodes: 1.3251× (32.51% higher session throughput).
+
+The five new pairs per size use order `serial, core-prefetch` in rounds 1, 3, and 5.
+Rounds 2 and 4 reverse the order. Each round measures 4,800 nodes before 2,176 nodes.
+The new repeats have the following medians and full ranges, as a separate cohort alongside the all-run aggregates.
+
+| Nodes | Mode | Runs | Median wall s | Full wall range s | Median jobs/s | Full jobs/s range |
+|---|---|---:|---:|---|---:|---|
+| 4,800 | `serial` | 5 | 6.213241 | 6.095595–8.576757 | 8.0473 | 5.8297–8.2026 |
+| 4,800 | `core-prefetch` | 5 | 4.452764 | 4.335366–4.970818 | 11.2290 | 10.0587–11.5331 |
+| 2,176 | `serial` | 5 | 2.888623 | 2.778961–3.651597 | 17.3093 | 13.6926–17.9923 |
+| 2,176 | `core-prefetch` | 5 | 2.166600 | 2.021869–2.347470 | 23.0776 | 21.2995–24.7296 |
+
+Median rate ratios, `core-prefetch / serial`: 4,800 nodes: 1.3954× (39.54% higher session throughput). 2,176 nodes: 1.3333× (33.33% higher session throughput).
+
+Sampler timing is available for six runs per size and mode, including all five new repeats.
+The next table uses every available sampler timing and leaves the three missing values unknown.
+
+| Nodes | Mode | Timed runs | Median sampler s | Full sampler range s | Median outside s | Full outside range s |
+|---|---|---:|---:|---|---:|---|
+| 4,800 | `serial` | 6 | 4.492384 | 4.355608–5.832188 | 1.803265 | 1.630487–2.744569 |
+| 4,800 | `core-prefetch` | 6 | 4.434793 | 4.305017–5.376243 | 0.031457 | 0.026268–0.061671 |
+| 2,176 | `serial` | 6 | 2.199949 | 2.113491–2.740495 | 0.720482 | 0.665470–0.970074 |
+| 2,176 | `core-prefetch` | 6 | 2.168094 | 2.007104–2.965065 | 0.016330 | 0.014217–0.029262 |
+
+Sampler time also differs between modes, so a throughput ratio cannot represent generation alone.
+The original timed pairs show 6.8% more sampler time with prefetch at 4,800 nodes and 10.2% more at 2,176 nodes.
+Rows 6–7 and 4–5 show those differences, but the measurements do not isolate their cause.
+The sampler table shows the full range across all instrumented runs.
+
+Rows 7 and 5 leave only 62 ms and 29 ms outside the sampler.
+These small gaps and the source trace provide evidence that generation already overlaps sampling.
+The session throughput percentages also include the control's extra 49 lease exchanges.
+The ratios measure existing session behavior without isolating savings from generation or CU-1.
+CU-1 preparation stays serial immediately before device work.
+
+The initial 4,800-node core-prefetch run takes 6.141930 seconds, compared with 5.437914 seconds in row 7.
+Final SM readings of 1,890 and 1,860 MHz do not support excluding the first run for clocks.
+All initial results remain in both the raw data and the all-run aggregates.
+
+The repeat supervisor waits at least 45 seconds between processes and checks GPU 1 before each warmup.
+It requires at most 68 C and zero reported GPU activity. After the interruption, it also requires no GPU compute process.
+
+The initial supervisor stops after row 13 when its 44-second process deadline expires.
+That row already contains a valid 6.213241-second timed result, and the test later reports success after 59.66 seconds.
+The initial deadline kills only Cargo, allowing the test child to finish. All recorded session data remains included.
+
+A separate GPU 1 process then appears at 100% GPU activity and 95 C, so the repeat sequence pauses until the card cools.
+After resuming, the supervisor runs the same prebuilt ignored test directly and applies a 44-second deadline to the whole process group.
+
+Possible contention remains unknown because the measurements do not record the start of the other workload.
+All timed sessions stay below 45 seconds, and the statistics include every row despite possible contention.
+The table's start and end readings bracket timed work after warmup.
 
 ### Rerun the session comparison
 
@@ -288,15 +381,14 @@ No new test enters the default suite or the cluster session timing gate.
 
 ### Session verification
 
-The final formatting check and both requested clippy checks pass with zero compiler or lint warnings.
-The release suite passes 438 top-level tests and ignores 264 tests.
-All 45 cluster host, device, and session tests pass with ignored tests enabled on GPU 1.
-The CI timing command passes all 24 cluster session tests. Its longest test takes 4.346 seconds.
+The formatting check and both requested clippy checks pass for this record correction.
+The 20 new ignored benchmark sessions check all 50 timed jobs in each session on physical GPU 1.
+The benchmark checks salt and nonce order, reads, sweeps, energies, refunds, and shutdown.
+The record correction changes neither production code nor benchmark code.
 
-The first release suite run failed during the existing headless routing test's shutdown.
-`tests/common/lease.rs:218` reported an HTTP/2 body-read error.
-The focused reproduction, CI timing run, and fresh full suite pass without changes to that test or transport code.
-The shutdown failure's cause remains unresolved. This work changes no production code.
+The earlier session verification records 438 passed and 264 ignored release tests, including the six ignored library tests.
+It also records 45 passing cluster tests with ignored tests enabled and 24 passing cluster session timing tests.
+These historical checks are distinct from the new throughput repeats and the three rerun host checks.
 
-Vale reports no prose errors. Its four remaining readability warnings reflect technical terms and source references in this record.
-The record keeps those terms for precision.
+Vale reports zero errors and four Readability warnings at `--minAlertLevel=warning`.
+The permitted metrics are ColemanLiau, FleschReadingEase, LIX, and SMOG.
