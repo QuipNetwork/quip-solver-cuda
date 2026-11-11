@@ -294,6 +294,9 @@ macro_rules! architecture_tests {
             #[test]
             #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
             fn flow_loops() { super::assert_kernel_variants($arch, "flow_loops"); }
+
+            #[test]
+            #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
             fn dipolar() { super::assert_kernel_variants($arch, "dipolar"); }
         })+
     };
