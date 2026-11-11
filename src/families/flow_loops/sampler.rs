@@ -1,5 +1,8 @@
 //! Session adapter. CPU-12 flow_loops_sampler.rs:163-234 defines start order,
 //! exact cold starts, and original-model result energies.
+//!
+//! The policy is deterministic and ignores the session seed and sweep count.
+//! Cold reads are identical copies of the exact baseline orientation.
 
 use super::{orient, FlowProblem, LoopError, Outcome};
 use quip_solver_core::families::{Declaration, FamilyClaim, FamilyContext};
@@ -45,13 +48,17 @@ const FAMILIES: &[FamilyClaim] = &[
 const DECLINE: &str = "quip-cuda-flow-loops solves only validated quip/flow-static@1 and quip/polariton-static@1 jobs";
 
 /// Serial family sampler. Device opening is deferred until an admitted job.
+///
+/// Each chain uses up to ten passes, independent of the session seed and sweep
+/// count. Cold reads are identical copies of the exact baseline orientation.
+/// The deterministic policy accepts only strict score improvements.
 #[derive(Debug)]
 pub struct FlowLoopsSampler {
     device: usize,
 }
 
 impl FlowLoopsSampler {
-    /// Use the given visible CUDA device, with ten fixed passes per chain.
+    /// Use the given visible CUDA device, with up to ten passes per chain.
     #[must_use]
     pub const fn new(device: usize) -> Self {
         Self { device }
@@ -160,5 +167,55 @@ impl Sampler for FlowLoopsSampler {
                 energy_milli,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::failure;
+    use crate::families::flow_loops::{LoopError, TaskError};
+    use quip_solver_core::SampleError;
+
+    #[test]
+    fn validation_faults_are_device_faults_and_admission_errors_decline() {
+        for error in [
+            LoopError::Rescore {
+                replica: 3,
+                why: "score differs",
+            },
+            LoopError::Cuda(crate::cuda_device::CudaError::Compile("invalid PTX".into())),
+        ] {
+            assert!(
+                matches!(failure(&error), SampleError::DeviceFault(message) if message == error.to_string())
+            );
+        }
+        for error in [
+            LoopError::Empty,
+            LoopError::Task(TaskError::Metadata),
+            LoopError::Start {
+                index: 2,
+                why: "invalid spin",
+            },
+            LoopError::Parameter("invalid passes"),
+            LoopError::Memory {
+                requested: 10,
+                budget: 1,
+            },
+        ] {
+            assert!(
+                matches!(failure(&error), SampleError::Declined(message) if message == error.to_string())
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA driver library for the error message"]
+    fn driver_errors_are_device_faults() {
+        let error = LoopError::Driver(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN,
+        ));
+        assert!(
+            matches!(failure(&error), SampleError::DeviceFault(message) if message == error.to_string())
+        );
     }
 }

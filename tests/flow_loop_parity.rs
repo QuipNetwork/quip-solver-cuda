@@ -18,6 +18,9 @@ use serde_json::Value;
 use serial_test::serial;
 use std::fmt::Write;
 
+#[path = "support/flow_session.rs"]
+mod flow_session;
+
 fn topology(name: &str) -> BaseTopology {
     let t = quip_solver_conformance::topology(name).unwrap();
     BaseTopology::new(t.nodes, &t.edges).unwrap()
@@ -481,5 +484,137 @@ fn gpu_large_instances_strides_and_determinism() {
             "{} large: launch {:?}, transfer {:?}, validation {:?}",
             contract.family_id, run.launch_time, run.transfer_time, run.validation_time
         );
+    }
+}
+
+#[test]
+fn sampler_declines_mismatched_graphs_before_opening_a_device() {
+    for (family, _) in flow_session::contexts() {
+        let model = graph(family.instance());
+        for part in 0..6 {
+            let mut bad = model.clone();
+            match part {
+                0 => {
+                    bad.h.pop();
+                }
+                1 => bad.h[0] += 0.001,
+                2 => {
+                    bad.j.pop();
+                }
+                3 => bad.j[0] += 0.001,
+                4 => bad.edges = bad.edges[1..].into(),
+                5 => {
+                    std::sync::Arc::make_mut(&mut bad.edges)[0] = (0, 0);
+                }
+                _ => unreachable!(),
+            }
+            assert!(matches!(FlowLoopsSampler::new(usize::MAX).sample_family(
+                &bad, &SampleParams::default(), None, family),
+                Err(SampleError::Declined(message)) if message == "family instance differs from job graph"));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial]
+fn gpu_sampler_cold_count_warm_order_and_fixed_policy() {
+    let sampler = FlowLoopsSampler::new(0);
+    for (family, template) in flow_session::contexts() {
+        let model = graph(family.instance());
+        let p = FlowProblem::from_instance(family.contract(), family.params(), family.instance())
+            .unwrap();
+        let Outcome::Optimal(o) = orient(p.task(), &mut || false).unwrap() else {
+            panic!("feasible")
+        };
+        let baseline = p.task().node_spins(&o.link_spins).unwrap();
+        for reads in [5, 0] {
+            let params = SampleParams {
+                num_reads: reads,
+                ..Default::default()
+            };
+            let cold = sampler
+                .sample_family(&model, &params, None, family)
+                .unwrap();
+            assert_eq!(cold.len(), reads.max(1));
+            for result in cold {
+                assert_eq!(result.spins, baseline);
+                assert!(p
+                    .task()
+                    .check(&p.task().link_spins(&result.spins).unwrap())
+                    .unwrap()
+                    .feasible());
+                assert_eq!(
+                    result.energy_milli,
+                    energy_milli(&result.spins, &model.h, &model.j, &model.edges)
+                );
+            }
+        }
+        let mut warm = template.clone();
+        warm.spins = if family.family_id() == POLARITON_V1.family_id {
+            (0..4096)
+                .filter_map(|bits| {
+                    let links: Vec<i8> = (0..12)
+                        .map(|e| if bits & (1 << e) == 0 { -1 } else { 1 })
+                        .collect();
+                    p.task()
+                        .check(&links)
+                        .unwrap()
+                        .feasible()
+                        .then(|| p.task().node_spins(&links).unwrap())
+                })
+                .take(4)
+                .collect()
+        } else {
+            vec![
+                baseline.clone(),
+                vec![1; baseline.len()],
+                vec![-1; baseline.len()],
+            ]
+        };
+        warm.spins.reverse();
+        let params = SampleParams {
+            num_reads: 5,
+            num_sweeps: 1,
+            seed: 7,
+            ..Default::default()
+        };
+        let run = sampler
+            .sample_family(&model, &params, Some(&warm), family)
+            .unwrap();
+        let changed = SampleParams {
+            seed: u64::MAX,
+            num_sweeps: 1000,
+            ..params
+        };
+        assert_eq!(
+            run,
+            sampler
+                .sample_family(&model, &changed, Some(&warm), family)
+                .unwrap()
+        );
+        let expected = p.run(0, &warm.spins, 10).unwrap();
+        assert_eq!(run.len(), warm.spins.len());
+        if family.family_id() == POLARITON_V1.family_id {
+            assert_eq!(warm.spins.len(), 4);
+            assert!(warm.spins.windows(2).all(|pair| pair[0] != pair[1]));
+            assert_eq!(
+                run.iter().map(|r| r.spins.clone()).collect::<Vec<_>>(),
+                warm.spins
+            );
+        }
+        for (k, result) in run.iter().enumerate() {
+            assert_eq!(result.spins, expected.spins[k]);
+            assert_eq!(result.energy_milli, expected.energies[k]);
+            assert!(p
+                .task()
+                .check(&p.task().link_spins(&result.spins).unwrap())
+                .unwrap()
+                .feasible());
+            assert_eq!(
+                result.energy_milli,
+                energy_milli(&result.spins, &model.h, &model.j, &model.edges)
+            );
+        }
     }
 }

@@ -1,4 +1,7 @@
 //! Constrained CUDA loop search for adapted P and F-static revision 1.
+//!
+//! The deterministic policy uses up to ten passes and ignores the session seed
+//! and sweep count. Cold reads are identical copies of the exact baseline.
 
 use clap::Parser;
 use quip_solver_core::{run, CommonArgs};

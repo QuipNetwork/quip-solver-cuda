@@ -4,6 +4,8 @@
 //! moves and score. This policy uses fixed work and strict improvements.
 //! Every returned replica receives an independent direct check and exact
 //! original-model rescore. Replica positions always retain start order.
+//! The deterministic policy ignores the session seed and sweep count.
+//! Cold reads are identical copies of the exact baseline orientation.
 
 mod device;
 mod sampler;
