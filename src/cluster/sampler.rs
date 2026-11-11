@@ -145,17 +145,37 @@ impl ClusterWork {
         cancelled: &dyn Fn() -> bool,
         mut launch: impl FnMut(usize, f32, bool) -> Result<(), ClusterDeviceError>,
     ) -> Result<(), ClusterDeviceError> {
+        self.for_each_chunk(cancelled, 1, |start, _, beta, descent| {
+            launch(start, beta, descent)
+        })
+    }
+
+    pub(crate) fn for_each_chunk(
+        &self,
+        stopped: &dyn Fn() -> bool,
+        chunk: usize,
+        mut launch: impl FnMut(usize, usize, f32, bool) -> Result<(), ClusterDeviceError>,
+    ) -> Result<(), ClusterDeviceError> {
+        if chunk == 0 {
+            return Err(ClusterDeviceError::Parameter("chunk must be positive"));
+        }
         let mut sweep = 0;
         for &beta in &self.betas {
-            for _ in 0..self.sweeps_per_beta {
-                checkpoint(cancelled)?;
-                launch(sweep, beta, false)?;
-                sweep += 1;
+            let mut remaining = self.sweeps_per_beta;
+            while remaining > 0 {
+                checkpoint(stopped)?;
+                let count = chunk.min(remaining);
+                launch(sweep, count, beta, false)?;
+                sweep += count;
+                remaining -= count;
             }
         }
-        for _ in 0..256 {
-            checkpoint(cancelled)?;
-            launch(0, 1.0, true)?;
+        // Production yields between every greedy pass. The test oracle runs
+        // the original kernel's single 256-pass descent instead.
+        let passes = if chunk == 1 { 1 } else { 256 };
+        for _ in 0..256 / passes {
+            checkpoint(stopped)?;
+            launch(0, passes, 1.0, true)?;
         }
         Ok(())
     }

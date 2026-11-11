@@ -206,6 +206,7 @@ struct WorkControl<'a> {
     work: &'a super::sampler::ClusterWork,
     stopped: &'a dyn Fn() -> bool,
     cancelled: &'a dyn Fn() -> bool,
+    chunk: usize,
 }
 
 impl ClusterDevice {
@@ -302,6 +303,31 @@ impl ClusterDevice {
         stopped: &dyn Fn() -> bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ClusterRun, ClusterDeviceError> {
+        self.run_work_chunked(work, stopped, cancelled, 1)
+    }
+
+    /// Run the identical host ladder with larger launch chunks as a GPU oracle.
+    /// Each chunk stays within one beta rung. Final descent uses one launch.
+    ///
+    /// # Errors
+    /// Returns the same validation and device errors as `run_work`.
+    #[cfg(feature = "long-tests")]
+    #[doc(hidden)]
+    pub fn run_work_with_chunk_for_test(
+        &mut self,
+        work: &super::sampler::ClusterWork,
+        chunk: usize,
+    ) -> Result<ClusterRun, ClusterDeviceError> {
+        self.run_work_chunked(work, &|| false, &|| false, chunk)
+    }
+
+    fn run_work_chunked(
+        &mut self,
+        work: &super::sampler::ClusterWork,
+        stopped: &dyn Fn() -> bool,
+        cancelled: &dyn Fn() -> bool,
+        chunk: usize,
+    ) -> Result<ClusterRun, ClusterDeviceError> {
         let schedule = ClusterSchedule {
             sweeps: work.betas.len() * work.sweeps_per_beta,
             chunk: 1,
@@ -316,6 +342,7 @@ impl ClusterDevice {
                 work,
                 stopped,
                 cancelled,
+                chunk,
             }),
         )
         .map(|(run, _)| run)
@@ -363,9 +390,10 @@ impl ClusterDevice {
                 .map_err(|_| ClusterDeviceError::Parameter("shared memory exceeds u32"))?,
         };
         if let Some(control) = control {
-            control
-                .work
-                .for_each_launch(control.stopped, |start, beta, descent| {
+            control.work.for_each_chunk(
+                control.stopped,
+                control.chunk,
+                |start, count, beta, descent| {
                     let constant_beta = Params {
                         beta_min: beta,
                         beta_max: beta,
@@ -375,15 +403,27 @@ impl ClusterDevice {
                         constant_beta,
                         i32::try_from(start)
                             .map_err(|_| ClusterDeviceError::Parameter("sweep exceeds i32"))?,
-                        i32::from(!descent),
-                        if descent { 2 } else { 0 },
+                        if descent {
+                            0
+                        } else {
+                            i32::try_from(count)
+                                .map_err(|_| ClusterDeviceError::Parameter("chunk exceeds i32"))?
+                        },
+                        if !descent {
+                            0
+                        } else if count == 1 {
+                            2
+                        } else {
+                            1
+                        },
                         config,
                         &mut spins,
                         &mut rng,
                     )?;
                     self.stream.synchronize()?;
                     Ok(())
-                })?;
+                },
+            )?;
         } else {
             let mut start = 0;
             while start < params.sweeps {

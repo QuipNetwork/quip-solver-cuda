@@ -772,6 +772,7 @@ mod gpu {
     use super::canonical::{descriptor, fixture, instance};
     use super::family_session::{lease, target, Session};
     use quip_solver_conformance::families::drive_miner_family;
+    use quip_solver_core::ising_generators::ice::TWISTED_DIMER_V1;
     use quip_solver_core::ising_generators::instance::Instance;
     use quip_solver_core::quip_proto::v1::{coord_msg, EdgeList, GeneratorAlgorithm, Topology};
     use quip_solver_core::quip_protocol::lease::LeaseSpec;
@@ -812,34 +813,66 @@ mod gpu {
     #[ignore = "requires a CUDA GPU"]
     #[serial]
     fn synchronized_sweeps_and_descent_match_an_unchunked_run() {
-        use quip_solver_cuda::cluster::device::{ClusterDevice, ClusterSchedule};
-        use quip_solver_cuda::cluster::sampler::ClusterWork;
+        use quip_solver_cuda::cluster::{
+            device::ClusterDevice, sampler::ClusterWork, PreparedGraph, Weights,
+        };
+        let started = std::time::Instant::now();
         hardware();
+        let (base, family_params) = fixture();
+        let instance = instance(&base, &family_params, [7; 32]).unwrap();
+        let graph = quip_solver_core::IsingGraph::new(
+            instance
+                .h()
+                .iter()
+                .map(|&h| f64::from(h) / 1000.0)
+                .collect(),
+            instance
+                .j()
+                .iter()
+                .map(|&j| f64::from(j) / 1000.0)
+                .collect(),
+            instance
+                .edges()
+                .iter()
+                .map(|&(u, v)| (u as usize, v as usize))
+                .collect(),
+        );
         let params = quip_solver_core::SampleParams {
-            num_reads: 3,
-            num_sweeps: 7,
-            beta_range: Some((0.7, 0.7)),
+            num_reads: 64,
+            num_sweeps: 24,
+            sweeps_per_beta: 6,
+            beta_range: Some((0.1, 1.7)),
             seed: 73,
             ..Default::default()
         };
-        let mut device = ClusterDevice::open(0, super::prepared(&super::HEADLESS_LIMITS)).unwrap();
-        let expected = device
-            .run(
-                &ClusterSchedule {
-                    sweeps: 7,
-                    chunk: 7,
-                    beta_min: 0.7,
-                    beta_max: 0.7,
-                    ..Default::default()
-                },
-                3,
-                73,
-            )
-            .unwrap();
-        let work = ClusterWork::new(&super::graph(), &params).unwrap();
+        let prepared = PreparedGraph::from_instance(
+            &instance,
+            &TWISTED_DIMER_V1,
+            Weights::FULL,
+            &super::HEADLESS_LIMITS,
+            64,
+        )
+        .unwrap();
+        assert!(!prepared.layout().tiles.is_empty());
+        assert!(!prepared.layout().pairs.is_empty());
+        assert!(prepared.layout().weak_deg.iter().any(|&d| d > 0));
+        let mut device = ClusterDevice::open(0, prepared).unwrap();
+        let work = ClusterWork::new(&graph, &params).unwrap();
         let actual = device.run_work(&work, &|| false, &|| false).unwrap();
-        assert_eq!(actual.spins, expected.spins);
-        assert_eq!(actual.energies, expected.energies);
+        assert_eq!(actual.spins.len(), 64);
+        assert_eq!(actual.energies.len(), 64);
+        for chunk in [2, 4, 6] {
+            // 6 runs a whole rung in one launch. 4 also exercises a short tail.
+            // All beta values are shared, so host/device powf rounding cannot
+            // hide a persistence or absolute-sweep-offset regression.
+            let expected = device.run_work_with_chunk_for_test(&work, chunk).unwrap();
+            assert_eq!(actual.spins, expected.spins, "chunk={chunk}");
+            assert_eq!(actual.energies, expected.energies, "chunk={chunk}");
+        }
+        assert!(
+            started.elapsed() <= Duration::from_secs(3),
+            "parity test exceeded 3 s"
+        );
     }
 
     #[tokio::test]
