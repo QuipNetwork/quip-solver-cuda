@@ -567,7 +567,7 @@ mod gpu {
             .await;
         assert!(session.log.rejects.is_empty());
         assert_scores(&session.log.results[0], &instance);
-        assert_eq!(session.shutdown(0).await, 0);
+        assert_eq!(session.shutdown(2000).await, 0);
         assert!(session.stderr().contains("cuda kernel cluster:"));
     }
 
@@ -633,7 +633,7 @@ mod gpu {
         }
         assert!(expected_results > 0);
         assert_eq!(session.log.results.len(), expected_results);
-        assert_eq!(session.shutdown(0).await, 0);
+        assert_eq!(session.shutdown(2000).await, 0);
         assert!(session.stderr().contains("cuda kernel cluster:"));
     }
 
