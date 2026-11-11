@@ -1545,6 +1545,31 @@ pub struct Run {
     pub validation_seconds: f64,
 }
 
+impl Run {
+    fn log(&self) {
+        let errors = self.reads.iter().filter(|r| r.error.is_some()).count();
+        let infeasible = self.reads.iter().filter(|r| !r.feasible).count();
+        let best_energy = self
+            .reads
+            .iter()
+            .filter_map(|r| r.energy.as_ref().ok())
+            .min();
+        tracing::info!(
+            policy = DIPOLAR_POLICY,
+            seed = self.seed,
+            setup_seconds = self.setup_seconds,
+            device_seconds = self.device_seconds,
+            validation_seconds = self.validation_seconds,
+            replicas = self.reads.len(),
+            errors,
+            infeasible,
+            best_energy,
+            "dipolar batch capture"
+        );
+        tracing::debug!(seed=self.seed, reads=?self.reads, "dipolar proposal trace");
+    }
+}
+
 /// Prepared oracle and on-demand kernel. No model buffers exist before admission.
 pub struct DipolarDevice {
     problem: Problem,
@@ -2158,10 +2183,7 @@ impl Sampler for DipolarSampler {
             run_batch(problem, self.device, &starts, &schedule, params.seed).map_err(decline)?;
         capture.setup_seconds =
             setup.elapsed().as_secs_f64() - capture.device_seconds - capture.validation_seconds;
-        // Keep raw states, seeds, errors, and host costs in the session log.
-        tracing::info!(policy=DIPOLAR_POLICY, seed=capture.seed, setup_seconds=capture.setup_seconds,
-            device_seconds=capture.device_seconds, validation_seconds=capture.validation_seconds,
-            reads=?capture.reads, "dipolar batch capture");
+        capture.log();
         let mut results = Vec::with_capacity(capture.reads.len());
         for read in capture.reads {
             if let Some(error) = read.error {
@@ -2353,6 +2375,81 @@ mod tests {
             .unwrap_err(),
             DipolarError::Spins
         );
+    }
+
+    #[test]
+    fn info_logging_keeps_one_summary_and_debug_keeps_proposals() {
+        use std::io::Write;
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let p = problem();
+        let start = p.start_state().unwrap();
+        let score = p.energy(&start).unwrap();
+        let capture = DeviceCapture {
+            finals: start.clone(),
+            scores: vec![score],
+            terminal: start.clone(),
+            terminal_scores: vec![score],
+            raw: start.clone(),
+            raw_scores: vec![score],
+            moves: vec![-1; MAX_LINKS],
+            lengths: vec![0],
+            accepted: vec![0],
+        };
+        let starts = vec![start];
+        let (reads, _) = validate_capture(
+            &p,
+            &starts,
+            &starts,
+            &Schedule {
+                proposals: 1,
+                ..Schedule::default()
+            },
+            7,
+            &capture,
+        )
+        .unwrap();
+        let run = Run {
+            seed: 7,
+            reads,
+            setup_seconds: 0.1,
+            device_seconds: 0.2,
+            validation_seconds: 0.3,
+        };
+        for level in [tracing::Level::INFO, tracing::Level::DEBUG] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let writer = Writer(Arc::clone(&bytes));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(level)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || run.log());
+            let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                text.lines().filter(|line| line.contains(" INFO ")).count(),
+                1
+            );
+            assert!(text.contains("seed=7"));
+            assert!(text.contains("setup_seconds=0.1"));
+            assert!(text.contains("errors=0"));
+            assert!(text.contains("infeasible=0"));
+            assert_eq!(text.contains("Proposal {"), level == tracing::Level::DEBUG);
+            assert_eq!(text.contains("spins:"), level == tracing::Level::DEBUG);
+        }
     }
 
     #[test]
