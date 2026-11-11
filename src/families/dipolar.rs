@@ -435,6 +435,18 @@ pub struct Problem {
 }
 
 impl Problem {
+    // CPU-13:1192-1202 keeps an unrepairable supplied state unchanged.
+    fn prepare_starts(&self, starts: &[Vec<i8>]) -> Result<Vec<Vec<i8>>, DipolarError> {
+        starts
+            .iter()
+            .map(|start| match self.repair(start) {
+                Ok(fixed) => Ok(fixed),
+                Err(DipolarError::Infeasible(_)) => Ok(start.clone()),
+                Err(other) => Err(other),
+            })
+            .collect()
+    }
+
     /// Validate `request` and build its coefficients from the oracle table,
     /// as step 6 of the contract does.
     ///
@@ -1492,22 +1504,24 @@ pub struct Replica {
     pub seed: u64,
     /// Supplied start before repair.
     pub supplied: Vec<i8>,
-    /// Feasible start after repair.
+    /// Start after repair, or the unchanged state when repair fails.
     pub start: Vec<i8>,
     /// Best state visited, in original node order.
     pub spins: Vec<i8>,
     /// Host score of the best state, in milli without the offset.
     pub energy: Result<i64, DipolarError>,
-    /// Device score of the best state.
+    /// Device score of the best state, or the host score for an unsearched read.
     pub device_energy: i64,
     /// Current state after the last proposal.
     pub terminal: Vec<i8>,
     /// Host score of the terminal state.
     pub terminal_energy: Result<i64, DipolarError>,
-    /// Device score of the terminal state, retained even after a check fails.
+    /// Device terminal score, or the host score for an unsearched read.
     pub terminal_device_energy: i64,
     /// Physical energy from the oracle table.
     pub physical_energy: Result<i64, DipolarError>,
+    /// Whether the returned state satisfies the constraints.
+    pub feasible: bool,
     /// Whether the improvement exceeds the rounding bound of CPU-13:668-674.
     pub resolved: bool,
     /// Every raw proposal, in proposal order.
@@ -1575,16 +1589,31 @@ impl DipolarDevice {
     }
 
     /// Search one independent replica per start and retain the entire batch.
-    /// CPU-13 repair runs before upload. Every raw proposal is replayed through
+    /// CPU-13 repair runs before upload. Unrepairable starts stay unchanged as
+    /// infeasible reads. Every raw proposal is replayed through
     /// its direct move check, and every best and terminal state is rescored.
     ///
     /// # Errors
     /// Returns admission or device failures. Replica failures stay in the capture.
-    // Keep buffer allocation, the flat CUDA ABI, and downloads together.
-    #[allow(clippy::too_many_lines)]
     pub fn run(
         &mut self,
         starts: &[Vec<i8>],
+        schedule: &Schedule,
+        seed: u64,
+    ) -> Result<Run, DipolarError> {
+        self.problem.admit(schedule, starts.len(), usize::MAX)?;
+        let setup = Instant::now();
+        let begin = self.problem.prepare_starts(starts)?;
+        self.setup_seconds += setup.elapsed().as_secs_f64();
+        self.run_prepared(starts, &begin, schedule, seed)
+    }
+
+    // Keep buffer allocation, the flat CUDA ABI, and downloads together.
+    #[allow(clippy::too_many_lines)]
+    fn run_prepared(
+        &mut self,
+        starts: &[Vec<i8>],
+        begin: &[Vec<i8>],
         schedule: &Schedule,
         seed: u64,
     ) -> Result<Run, DipolarError> {
@@ -1603,10 +1632,10 @@ impl DipolarDevice {
                 .0,
         )?;
         let slots = replicas.checked_mul(steps).ok_or(DipolarError::Overflow)?;
-        let mut begin = Vec::with_capacity(replicas);
-        for start in starts {
-            begin.push(p.repair(start)?);
-        }
+        let enabled: Vec<i32> = begin
+            .iter()
+            .map(|start| p.violations(start).map(|v| i32::from(v.feasible())))
+            .collect::<Result<_, _>>()?;
         let flat: Vec<i8> = begin.iter().flatten().copied().collect();
         let mut topology = Vec::with_capacity(n * 4 + MAX_VERTICES);
         for head in [false, true] {
@@ -1631,6 +1660,7 @@ impl DipolarDevice {
             .map_err(device_error)?;
         let topology = self.stream.clone_htod(&topology).map_err(device_error)?;
         let inputs = self.stream.clone_htod(&flat).map_err(device_error)?;
+        let enabled = self.stream.clone_htod(&enabled).map_err(device_error)?;
         let mut finals = self
             .stream
             .alloc_zeros::<i8>(replicas * n)
@@ -1684,6 +1714,7 @@ impl DipolarDevice {
             .arg(&matrix)
             .arg(&topology)
             .arg(&inputs)
+            .arg(&enabled)
             .arg(&seed)
             .arg(&p.beta.0)
             .arg(&p.beta.1)
@@ -1740,7 +1771,7 @@ impl DipolarDevice {
             accepted,
         };
         let (reads, validation_seconds) =
-            validate_capture(p, starts, &begin, schedule, seed, &capture)?;
+            validate_capture(p, starts, begin, schedule, seed, &capture)?;
         Ok(Run {
             seed,
             reads,
@@ -1749,6 +1780,33 @@ impl DipolarDevice {
             validation_seconds,
         })
     }
+}
+
+// CPU-13:1220-1231 returns no moves and zero improvement.
+fn unrepaired(
+    p: &Problem,
+    spins: &[i8],
+    replica: usize,
+    seed: u64,
+) -> Result<Replica, DipolarError> {
+    let energy = p.energy(spins)?;
+    Ok(Replica {
+        replica,
+        seed: read_seed(seed, replica as u64),
+        supplied: spins.to_vec(),
+        start: spins.to_vec(),
+        spins: spins.to_vec(),
+        energy: Ok(energy),
+        device_energy: energy,
+        terminal: spins.to_vec(),
+        terminal_energy: Ok(energy),
+        terminal_device_energy: energy,
+        physical_energy: p.physical_energy(spins),
+        feasible: false,
+        resolved: false,
+        trace: Vec::new(),
+        error: None,
+    })
 }
 
 fn validate_capture(
@@ -1765,6 +1823,10 @@ fn validate_capture(
     let steps = schedule.proposals;
     let mut reads = Vec::with_capacity(replicas);
     for r in 0..replicas {
+        if !p.violations(&begin[r])?.feasible() {
+            reads.push(unrepaired(p, &starts[r], r, seed)?);
+            continue;
+        }
         let mut current = begin[r].clone();
         let mut best = (p.energy(&current)?, current.clone());
         let mut trace = Vec::with_capacity(steps);
@@ -1835,6 +1897,7 @@ fn validate_capture(
             supplied: starts[r].clone(),
             start: begin[r].clone(),
             physical_energy: p.physical_energy(&spins),
+            feasible: p.violations(&spins).is_ok_and(Violations::feasible),
             resolved: energy.as_ref().is_ok_and(|&e| {
                 (p.energy(&begin[r]).expect("admitted start") - e).unsigned_abs()
                     > p.rounding_bound_milli()
@@ -1898,6 +1961,7 @@ fn check_proposal(
     p.checked_final(spins, score)
 }
 
+#[derive(Default)]
 struct DeviceCapture {
     finals: Vec<i8>,
     scores: Vec<i64>,
@@ -1958,6 +2022,43 @@ const CLAIMS: &[FamilyClaim] = &[FamilyClaim {
     revisions: &[DEFECTS_V1],
     only_params: &[],
 }];
+
+fn run_batch(
+    problem: Problem,
+    device: usize,
+    starts: &[Vec<i8>],
+    schedule: &Schedule,
+    seed: u64,
+) -> Result<Run, DipolarError> {
+    let setup = Instant::now();
+    problem.admit(schedule, starts.len(), usize::MAX)?;
+    let begin = problem.prepare_starts(starts)?;
+    if begin
+        .iter()
+        .all(|s| problem.violations(s).is_ok_and(|v| !v.feasible()))
+    {
+        let setup_seconds = setup.elapsed().as_secs_f64();
+        let (reads, validation_seconds) = validate_capture(
+            &problem,
+            starts,
+            &begin,
+            schedule,
+            seed,
+            &DeviceCapture::default(),
+        )?;
+        return Ok(Run {
+            seed,
+            reads,
+            setup_seconds,
+            device_seconds: 0.0,
+            validation_seconds,
+        });
+    }
+    let repair_seconds = setup.elapsed().as_secs_f64();
+    let mut device = DipolarDevice::open(device, problem)?;
+    device.setup_seconds += repair_seconds;
+    device.run_prepared(starts, &begin, schedule, seed)
+}
 
 /// Session sampler. Construction and capability discovery do not open a device.
 /// Only validated defects-static revision 1 jobs can reach CUDA.
@@ -2053,10 +2154,8 @@ impl Sampler for DipolarSampler {
             Some(w) => w.spins.clone(),
             None => vec![problem.start_state().map_err(decline)?; count],
         };
-        let mut device = DipolarDevice::open(self.device, problem).map_err(decline)?;
-        let mut capture = device
-            .run(&starts, &schedule, params.seed)
-            .map_err(decline)?;
+        let mut capture =
+            run_batch(problem, self.device, &starts, &schedule, params.seed).map_err(decline)?;
         capture.setup_seconds =
             setup.elapsed().as_secs_f64() - capture.device_seconds - capture.validation_seconds;
         // Keep raw states, seeds, errors, and host costs in the session log.
@@ -2189,6 +2288,71 @@ mod tests {
                 Err(DipolarError::Device(_))
             ));
         }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn an_unrepairable_start_keeps_the_other_gpu_replicas() {
+        let mut p = problem();
+        let good = p.start_state().unwrap();
+        // Block every repair path at the centre to exercise CPU-13:1197-1200.
+        // Revision-1 generation only pins boundary links, so use a host fixture.
+        for &(e, _) in p.lattice.incident(4) {
+            p.pinned[e as usize] = true;
+        }
+        let mut bad = good.clone();
+        let e = p.lattice.incident(4)[0].0;
+        bad[p.node(e)] *= -1;
+        assert!(matches!(p.repair(&bad), Err(DipolarError::Infeasible(_))));
+        let starts = vec![good.clone(), bad.clone(), good];
+        let mut device = DipolarDevice::open(0, p).unwrap();
+        let run = device.run(&starts, &Schedule::default(), 7).unwrap();
+        assert_eq!(run.reads.len(), 3);
+        for r in [0, 2] {
+            assert!(run.reads[r].error.is_none());
+            assert_eq!(run.reads[r].seed, read_seed(7, r as u64));
+            assert_eq!(run.reads[r].trace.len(), 256);
+        }
+        let read = &run.reads[1];
+        assert_eq!(read.spins, bad);
+        assert_eq!(read.terminal, bad);
+        assert_eq!(read.start, bad);
+        assert_eq!(read.supplied, bad);
+        assert!(read.trace.is_empty());
+        assert!(!read.resolved);
+        assert!(!read.feasible);
+        assert!(read.error.is_none());
+        assert_eq!(read.energy, device.problem().energy(&bad));
+        assert_eq!(read.physical_energy, device.problem().physical_energy(&bad));
+    }
+
+    #[test]
+    fn warm_start_preparation_finishes_before_opening_device() {
+        let mut p = problem();
+        let mut bad = p.start_state().unwrap();
+        for &(e, _) in p.lattice.incident(4) {
+            p.pinned[e as usize] = true;
+        }
+        let e = p.lattice.incident(4)[0].0;
+        bad[p.node(e)] *= -1;
+        let run = run_batch(p, usize::MAX, &[bad.clone()], &Schedule::default(), 7).unwrap();
+        assert_eq!(run.reads.len(), 1);
+        assert_eq!(run.reads[0].spins, bad);
+        assert!(!run.reads[0].feasible);
+        assert!(run.reads[0].trace.is_empty());
+        assert!(run.reads[0].error.is_none());
+        assert_eq!(run.device_seconds.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(
+            run_batch(
+                problem(),
+                usize::MAX,
+                &[vec![0; 12]],
+                &Schedule::default(),
+                7
+            )
+            .unwrap_err(),
+            DipolarError::Spins
+        );
     }
 
     #[test]

@@ -14,13 +14,16 @@ __device__ unsigned long long next_random(unsigned long long &state) {
 extern "C" __global__ void quip_dipolar(
     int n, int vertices, int proposals, int max_move,
     const long long *h, const long long *matrix, const int *topology,
-    const signed char *starts, unsigned long long seed, double hot, double cold,
+    const signed char *starts, const int *enabled,
+    unsigned long long seed, double hot, double cold,
     signed char *finals, long long *final_scores,
     signed char *terminal, long long *terminal_scores,
     signed char *raw, long long *raw_scores, int *moves, int *lengths, int *accepted
 ) {
     const int lane = threadIdx.x;
     const int replica = blockIdx.x;
+    // Every lane in this block skips the same unrepairable replica.
+    if (!enabled[replica]) return;
     const int *tail = topology, *head = tail+n, *position = head+n;
     const int *pinned = position+n, *free_vertex = pinned+n;
     __shared__ signed char spin[MAX_LINKS], best[MAX_LINKS];

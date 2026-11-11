@@ -151,7 +151,7 @@ pub fn flow_loop_footprint(
     }
 }
 
-/// D-static dense matrix, topology, starts, best and terminal states, and trace.
+/// D-static dense matrix, topology, starts, search flags, final states, and trace.
 /// Each trace slot stores a node state, score, 24 link ids, length, and decision.
 /// The kernel keeps local fields and walk scratch in static block shared memory.
 #[must_use]
@@ -166,7 +166,7 @@ pub fn dipolar_footprint(nodes: usize, replicas: usize, proposals: usize) -> Foo
         shared_bytes: POOL_ALLOWANCE_BYTES.saturating_add(model),
         per_instance_bytes: n
             .saturating_mul(3)
-            .saturating_add(16)
+            .saturating_add(20)
             .saturating_add(proposals.max(1).saturating_mul(n.saturating_add(112))),
         instances: replicas,
     }

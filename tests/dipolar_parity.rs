@@ -578,6 +578,21 @@ fn overflow_precision_and_memory_fail_before_cuda() {
     let problem = Problem::new(analytic(0), Evidence::Analytic).unwrap();
     let schedule = Schedule::default();
     assert!(problem.admit(&schedule, 4, usize::MAX).is_ok());
+    // Twelve nodes: 3 spin arrays, 2 i64 scores, 1 i32 search flag,
+    // and one trace slot per replica. Model bytes include the dense matrix.
+    let one = Schedule {
+        proposals: 1,
+        ..schedule
+    };
+    let bytes = (32 << 20) + 1504 + 4 * 180;
+    assert!(problem.admit(&one, 4, bytes).is_ok());
+    assert!(matches!(
+        problem.admit(&one, 4, bytes - 1),
+        Err(DipolarError::Capacity {
+            domain: "device",
+            ..
+        })
+    ));
     assert!(problem.admit(&schedule, 4, 1).is_err());
     assert!(problem.admit(&schedule, usize::MAX, usize::MAX).is_err());
     assert!(problem
