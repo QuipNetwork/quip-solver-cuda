@@ -272,11 +272,13 @@ impl Session {
         let started = Instant::now();
         self.send(coord_msg::Msg::Shutdown(Shutdown { grace_ms }))
             .await;
-        // End the command stream so core's final inbound drain can finish.
-        // Leaving it open consumes the grace window before NVML teardown.
-        drop(self.outbound.take());
         let limit = Duration::from_millis(u64::from(grace_ms)) + Duration::from_secs(10);
+        // Work around quip-solver-core 0.0.8's run_session transport-close race:
+        // closing the response first lets core return before the request's
+        // END_STREAM is flushed. Keep core in its final inbound drain until we
+        // receive miner EOF and all final frames, then let that drain finish.
         self.until("shutdown", limit, |log| log.closed).await;
+        drop(self.outbound.take());
         let status = tokio::time::timeout(Duration::from_secs(10), self.child.wait())
             .await
             .expect("miner exits after shutdown")
