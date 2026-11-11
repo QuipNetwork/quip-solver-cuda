@@ -126,7 +126,7 @@ pub enum DipolarError {
         /// Available bytes.
         available: usize,
     },
-    /// A CUDA context, compiler, or driver operation failed.
+    /// A CUDA context, compiler, driver operation, or output check failed.
     Device(String),
 }
 
@@ -1860,8 +1860,8 @@ fn check_replay(
     if terminal == current && spins == best.1 {
         return Ok(());
     }
-    Err(DipolarError::Metadata(
-        "device final states differ from replay",
+    Err(DipolarError::Device(
+        "device final states differ from replay".into(),
     ))
 }
 
@@ -1881,7 +1881,7 @@ fn check_proposal(
         return Err(DipolarError::Move(MoveFault::TooLong));
     }
     if !(0..=1).contains(&accepted) {
-        return Err(DipolarError::Metadata("invalid device decision"));
+        return Err(DipolarError::Device("invalid device decision".into()));
     }
     if !links.is_empty() {
         p.check_move(current, links)?;
@@ -1891,8 +1891,8 @@ fn check_proposal(
         expected[p.node(e)] = -expected[p.node(e)];
     }
     if expected != spins || (links.is_empty() && accepted != 0) {
-        return Err(DipolarError::Metadata(
-            "device proposal differs from its move",
+        return Err(DipolarError::Device(
+            "device proposal differs from its move".into(),
         ));
     }
     p.checked_final(spins, score)
@@ -2168,6 +2168,27 @@ mod tests {
             p.admit(&schedule, 1, usize::MAX),
             Err(DipolarError::Request(_))
         ));
+    }
+
+    #[test]
+    fn replay_and_proposal_mismatches_are_device_errors() {
+        let p = problem();
+        let start = p.start_state().unwrap();
+        let mut other = start.clone();
+        other[0] = -other[0];
+        let best = (p.energy(&start).unwrap(), start.clone());
+        for (terminal, spins) in [(&other, &start), (&start, &other)] {
+            assert!(matches!(
+                check_replay(terminal, &start, spins, &best),
+                Err(DipolarError::Device(_))
+            ));
+        }
+        for (spins, accepted) in [(&start, 2), (&other, 0), (&start, 1)] {
+            assert!(matches!(
+                check_proposal(&p, &start, &[], spins, 0, 24, accepted, best.0),
+                Err(DipolarError::Device(_))
+            ));
+        }
     }
 
     #[test]
