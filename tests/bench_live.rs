@@ -78,17 +78,20 @@ fn bench_one_upload_and_download_are_true_transfer_time_not_host_enqueue() {
     // `download_ns` are event-bracketed on `stream_transfer` and read after a
     // `synchronize()`, so they measure real device transfer time, not the
     // near-instant host enqueue of `memcpy_htod`/`clone_dtoh`. A larger graph
-    // should therefore show a larger (not merely nonzero) transfer time.
+    // should therefore show a larger (not merely nonzero) transfer time. The
+    // sizes differ by more than three orders of magnitude, so host load on a
+    // shared runner cannot reverse the comparison.
     let small = ring(16);
-    let large = ring(2048);
+    let large = ring(50_000);
     let params = SampleParams {
         num_reads: 8,
-        num_sweeps: 256,
+        num_sweeps: 16,
         sweeps_per_beta: 4,
         ..SampleParams::default()
     };
-    let (_, t_small) = bench_one(device(), &small, &params, KernelKind::Sa, None).unwrap();
-    let (_, t_large) = bench_one(device(), &large, &params, KernelKind::Sa, None).unwrap();
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, large.num_nodes()).unwrap();
+    let (_, t_small) = bench_one(&device, &small, &params, KernelKind::Sa, None).unwrap();
+    let (_, t_large) = bench_one(&device, &large, &params, KernelKind::Sa, None).unwrap();
     assert!(t_small.upload_ns > 0);
     assert!(t_large.upload_ns > 0);
     assert!(t_large.upload_ns >= t_small.upload_ns);
