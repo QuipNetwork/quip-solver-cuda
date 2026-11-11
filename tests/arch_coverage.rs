@@ -23,6 +23,7 @@ const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
 const MSA_SRC: &str = include_str!("../kernels/msa.cu");
 const CLUSTER_SRC: &str = include_str!("../kernels/cluster.cu");
 const FLOW_LOOPS_SRC: &str = include_str!("../kernels/flow_loops.cu");
+const DIPOLAR_SRC: &str = include_str!("../kernels/dipolar.cu");
 const SCREEN_SRC: &str = include_str!("../kernels/screen.cu");
 
 // Keep the compiled shapes aligned with the device-open variants.
@@ -153,6 +154,7 @@ const KERNEL_VARIANTS: &[(&str, &str, usize, &[&str])] = &[
     ("screen", SCREEN_SRC, 0, &[]),
     ("cluster", CLUSTER_SRC, 0, &[]),
     ("flow_loops", FLOW_LOOPS_SRC, 0, &[]),
+    ("dipolar", DIPOLAR_SRC, 0, &[]),
 ];
 
 /// Reports whether the caller must return without testing anything, and says
@@ -264,7 +266,7 @@ macro_rules! architecture_tests {
         fn architecture_matrix_matches_support_contract() {
             assert_eq!(&[$($arch),+], SUPPORTED_ARCHS);
             for &(name, ..) in KERNEL_VARIANTS {
-                assert!(matches!(name.split('-').next(), Some("sa" | "gibbs" | "msa" | "screen" | "cluster" | "flow_loops")));
+                assert!(matches!(name.split('-').next(), Some("sa" | "gibbs" | "msa" | "screen" | "cluster" | "flow_loops" | "dipolar")));
             }
         }
 
@@ -292,6 +294,7 @@ macro_rules! architecture_tests {
             #[test]
             #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
             fn flow_loops() { super::assert_kernel_variants($arch, "flow_loops"); }
+            fn dipolar() { super::assert_kernel_variants($arch, "dipolar"); }
         })+
     };
 }

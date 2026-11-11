@@ -34,6 +34,10 @@ path = "src/bin/quip_cuda_otsuka.rs"
 name = "quip-cuda-flow-loops"
 path = "src/bin/quip_cuda_flow_loops.rs"
 
+[[bin]]
+name = "quip-cuda-dipolar"
+path = "src/bin/quip_cuda_dipolar.rs"
+
 # The solver contract is published to crates.io from
 # quip.network/quip-solver-core. Until 0.0.9 is published, these crates
 # follow the revision that adds the F-static, adapted P, and D-static

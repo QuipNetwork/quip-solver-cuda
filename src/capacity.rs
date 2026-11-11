@@ -151,6 +151,27 @@ pub fn flow_loop_footprint(
     }
 }
 
+/// D-static dense matrix, topology, starts, best and terminal states, and trace.
+/// Each trace slot stores a node state, score, 24 link ids, length, and decision.
+/// The kernel keeps local fields and walk scratch in static block shared memory.
+#[must_use]
+pub fn dipolar_footprint(nodes: usize, replicas: usize, proposals: usize) -> Footprint {
+    let n = nodes;
+    let model = n
+        .saturating_mul(n)
+        .saturating_add(n)
+        .saturating_mul(8)
+        .saturating_add(n.saturating_mul(4).saturating_add(16).saturating_mul(4));
+    Footprint {
+        shared_bytes: POOL_ALLOWANCE_BYTES.saturating_add(model),
+        per_instance_bytes: n
+            .saturating_mul(3)
+            .saturating_add(16)
+            .saturating_add(proposals.max(1).saturating_mul(n.saturating_add(112))),
+        instances: replicas,
+    }
+}
+
 /// Threads per cluster anneal, matching `gpucluster.cu:272`.
 pub const CLUSTER_THREADS: usize = 512;
 
