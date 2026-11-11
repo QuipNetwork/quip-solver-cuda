@@ -58,6 +58,6 @@ fn main() -> ExitCode {
     device.max_nodes = identity.max_nodes as usize;
     run(identity, &cli.common, || {
         let gov = UtilGovernor::start(&device.pci_bus_id, cli.utilization, cli.yielding);
-        Ok(OtsukaSampler::new(device, gov, cli.stall))
+        OtsukaSampler::new(device, gov, cli.stall).map_err(|e| OpenError(e.to_string()))
     })
 }

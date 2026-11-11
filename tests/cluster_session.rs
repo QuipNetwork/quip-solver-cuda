@@ -10,6 +10,7 @@ use quip_solver_cuda::cluster::sampler::{
     cuda_otsuka_identity, ClusterBackend, ClusterWork, OtsukaSampler, HEADLESS_LIMITS,
 };
 use quip_solver_cuda::cluster::{Model, Motifs, PreparedGraph, Weights};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Default)]
@@ -19,16 +20,26 @@ struct FakeDevice {
     fail: bool,
     short: bool,
     cancel_after: usize,
+    memory_shortfall: bool,
+    yield_after: Option<Arc<AtomicBool>>,
 }
 
 impl ClusterBackend for FakeDevice {
     fn run(
         &self,
-        _graph: PreparedGraph,
+        graph: PreparedGraph,
         work: &ClusterWork,
+        stopped: &dyn Fn() -> bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ClusterRun, ClusterDeviceError> {
-        work.for_each_launch(cancelled, |_, _, _| {
+        if self.memory_shortfall {
+            return Err(quip_solver_cuda::cluster::PrepareError::DeviceMemory {
+                requested: 1024,
+                budget: 512,
+            }
+            .into());
+        }
+        work.for_each_launch(stopped, |_, _, _| {
             *self.launches.lock().unwrap() += 1;
             if let Some(token) = &self.cancel {
                 if *self.launches.lock().unwrap() >= self.cancel_after {
@@ -40,15 +51,19 @@ impl ClusterBackend for FakeDevice {
             }
             Ok(())
         })?;
+        if let Some(yielding) = &self.yield_after {
+            yielding.store(true, Ordering::SeqCst);
+        }
+        if cancelled() {
+            return Err(ClusterDeviceError::Cancelled);
+        }
         let count = if self.short { 1 } else { work.reads };
         Ok(ClusterRun {
             spins: (0..count)
                 .map(|read| {
-                    if read % 2 == 0 {
-                        vec![1, -1]
-                    } else {
-                        vec![-1, 1]
-                    }
+                    (0..graph.original_graph().num_nodes())
+                        .map(|node| if (read + node) % 2 == 0 { 1 } else { -1 })
+                        .collect()
                 })
                 .collect(),
             energies: vec![123; count], // The sampler must score original coefficients.
@@ -60,6 +75,9 @@ impl ClusterBackend for FakeDevice {
 struct FakeSa {
     calls: Arc<Mutex<usize>>,
     yielding: bool,
+    late_yield: Arc<AtomicBool>,
+    streams: Arc<Mutex<usize>>,
+    batch_size: usize,
 }
 
 impl Sampler for FakeSa {
@@ -77,8 +95,46 @@ impl Sampler for FakeSa {
             .collect())
     }
 
+    fn sample_stream(
+        &self,
+        mut jobs: tokio::sync::mpsc::Receiver<StreamJob>,
+        out: tokio::sync::mpsc::Sender<quip_solver_core::StreamResult>,
+        _cancel: CancelToken,
+    ) {
+        *self.streams.lock().unwrap() += 1;
+        while let Some(first) = jobs.blocking_recv() {
+            let mut batch = vec![first];
+            for _ in 1..self.batch_size {
+                batch.push(
+                    jobs.blocking_recv()
+                        .expect("SA stream must keep its input open"),
+                );
+            }
+            for job in batch {
+                let result = self.sample(&job.graph, &job.params);
+                if out
+                    .blocking_send(quip_solver_core::StreamResult {
+                        job_id: job.job_id,
+                        outcome: StreamOutcome::Completed(result),
+                        device_access_time_us: 1,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn stream_width(&self) -> usize {
+        4
+    }
+    fn declared_stream_width() -> u32 {
+        0
+    }
+
     fn should_throttle(&self) -> bool {
-        self.yielding
+        self.yielding || self.late_yield.load(Ordering::SeqCst)
     }
 }
 
@@ -181,7 +237,7 @@ fn incomplete_device_output_is_rejected() {
         prepared(&HEADLESS_LIMITS),
         &CancelToken::default(),
     );
-    assert!(matches!(result.outcome, StreamOutcome::Completed(Err(_))));
+    assert!(matches!(result.outcome, StreamOutcome::Completed(Err(error)) if error.is_fatal()));
 }
 
 #[test]
@@ -200,7 +256,7 @@ fn plain_jobs_use_the_sa_stream() {
     ));
     assert_eq!(*sa.calls.lock().unwrap(), 1);
     assert_eq!(*device.launches.lock().unwrap(), 0);
-    assert_eq!(sampler.stream_width(), 1);
+    assert_eq!(sampler.stream_width(), 4);
 }
 
 #[test]
@@ -224,6 +280,91 @@ fn governor_yield_is_busy_and_never_opens_the_cluster_device() {
 }
 
 #[test]
+fn job_parameters_are_refusals_and_never_launch() {
+    let device = FakeDevice::default();
+    let sampler = OtsukaSampler::with_backends(device.clone(), FakeSa::default(), HEADLESS_LIMITS);
+    let mut bad_params = vec![];
+    for (sweeps, per_beta) in [(3_000_000_000, 1), (7, 3_000_000_000)] {
+        bad_params.push(SampleParams {
+            num_sweeps: sweeps,
+            sweeps_per_beta: per_beta,
+            ..job().params
+        });
+    }
+    for range in [
+        (f64::NAN, 1.0),
+        (0.0, 1.0),
+        (-1.0, 2.0),
+        (0.1, f64::INFINITY),
+        (0.1, f64::MAX),
+        (f64::MIN_POSITIVE, 1.0),
+    ] {
+        bad_params.push(SampleParams {
+            beta_range: Some(range),
+            ..job().params
+        });
+    }
+    for reads in [0, 257] {
+        bad_params.push(SampleParams {
+            num_reads: reads,
+            ..job().params
+        });
+    }
+    for params in bad_params {
+        let mut request = job();
+        request.params = params;
+        let result = sampler.sample_prepared_for_test(
+            &request,
+            prepared(&HEADLESS_LIMITS),
+            &CancelToken::default(),
+        );
+        assert!(matches!(
+            result.outcome,
+            StreamOutcome::Completed(Err(SampleError::Capacity))
+        ));
+    }
+    assert_eq!(*device.launches.lock().unwrap(), 0);
+}
+
+#[test]
+fn live_memory_shortfall_is_transient() {
+    let device = FakeDevice {
+        memory_shortfall: true,
+        ..Default::default()
+    };
+    let sampler = OtsukaSampler::with_backends(device, FakeSa::default(), HEADLESS_LIMITS);
+    let result = sampler.sample_prepared_for_test(
+        &job(),
+        prepared(&HEADLESS_LIMITS),
+        &CancelToken::default(),
+    );
+    assert!(matches!(
+        result.outcome,
+        StreamOutcome::Completed(Err(SampleError::DeviceBusy))
+    ));
+}
+
+#[test]
+fn governor_yield_after_device_completion_keeps_finished_reads() {
+    let late_yield = Arc::new(AtomicBool::new(false));
+    let device = FakeDevice {
+        yield_after: Some(late_yield.clone()),
+        ..Default::default()
+    };
+    let sa = FakeSa {
+        late_yield,
+        ..Default::default()
+    };
+    let sampler = OtsukaSampler::with_backends(device, sa, HEADLESS_LIMITS);
+    let result = sampler.sample_prepared_for_test(
+        &job(),
+        prepared(&HEADLESS_LIMITS),
+        &CancelToken::default(),
+    );
+    assert!(matches!(result.outcome, StreamOutcome::Completed(Ok(reads)) if reads.len() == 3));
+}
+
+#[test]
 fn capabilities_are_headless_and_bounded() {
     assert!(!<OtsukaSampler as Sampler>::generates_locally());
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_quip-cuda-otsuka"))
@@ -240,7 +381,7 @@ fn capabilities_are_headless_and_bounded() {
     assert_eq!(caps["solverId"], "quip-cuda-otsuka/1");
     assert_eq!(caps["backend"], "cuda");
     assert_eq!(caps["algorithm"], "otsuka");
-    assert_eq!(caps["streamWidth"], 1);
+    assert_eq!(caps["streamWidth"], 0);
     let id = cuda_otsuka_identity(&HEADLESS_LIMITS, usize::MAX);
     assert_eq!(caps["maxNodes"], id.max_nodes);
     assert_eq!(caps["maxEdges"], id.max_edges);
@@ -399,44 +540,159 @@ fn declared_shapes_fit_cu1_and_device_budgets() {
     .unwrap();
 }
 
-#[cfg(feature = "long-tests")]
 #[allow(dead_code)] // The family tests use only part of the shared coordinator.
 #[path = "common/lease.rs"]
 mod family_session;
 
-#[cfg(feature = "long-tests")]
-mod gpu {
-    use super::family_session::{lease, target, Session};
-    use quip_solver_conformance::families::{
-        drive_miner_family, export_instances, reference_revision,
+// The SDK constructs WarmStreamJob and FamilyContext only inside its session.
+// Use the test executable as a headless miner to exercise that exact path.
+#[test]
+fn headless_miner_entry() {
+    let Ok(socket) = std::env::var("CU3_TEST_COORDINATOR") else {
+        return;
     };
-    use quip_solver_core::ising_generators::descriptor::params_digest;
-    use quip_solver_core::ising_generators::family::BaseTopology;
-    use quip_solver_core::ising_generators::ice::TWISTED_DIMER_V1;
-    use quip_solver_core::ising_generators::instance::Instance;
+    let device = FakeDevice::default();
+    let sa = FakeSa {
+        batch_size: 2,
+        ..Default::default()
+    };
+    let sampler = OtsukaSampler::with_backends(device.clone(), sa.clone(), HEADLESS_LIMITS);
+    let args = quip_solver_core::CommonArgs {
+        quip_coordinator: Some(socket),
+        miner_id: Some("headless-cluster".into()),
+        capabilities: false,
+        solve: false,
+        check: false,
+        log_level: "error".into(),
+        sweeps_per_beta: None,
+    };
+    let exit = quip_solver_core::run_code(
+        cuda_otsuka_identity(&HEADLESS_LIMITS, usize::MAX),
+        &args,
+        || Ok(sampler),
+    );
+    assert_eq!(exit as u8, 0);
+    assert_eq!(
+        *sa.streams.lock().unwrap(),
+        1,
+        "plain jobs must share one persistent stream"
+    );
+    assert_eq!(*sa.calls.lock().unwrap(), 2);
+    assert!(
+        *device.launches.lock().unwrap() > 0,
+        "validated family must reach the cluster backend"
+    );
+}
+
+#[tokio::test]
+async fn warm_routing_keeps_sa_width_and_refuses_only_the_bad_family_job() {
+    use family_session::{target, Session};
     use quip_solver_core::quip_proto::v1::{
-        coord_msg, ising_problem, CoefficientEncoding, EdgeList, FamilyBinding, FamilyDescriptor,
-        GeneratorAlgorithm, IsingProblem, Job, JobKind, Topology,
+        coord_msg, ising_problem, CoefficientEncoding, EdgeList, IsingProblem, Job, JobKind,
     };
-    use quip_solver_core::quip_protocol::lease::LeaseSpec;
-    use quip_solver_core::quip_protocol::scoring::energy_from_milli;
-    use quip_solver_core::quip_protocol::wire::{decode_spins_packed, encode_i32_le};
-    use serial_test::serial;
+    use quip_solver_core::quip_protocol::wire::encode_i32_le;
     use std::time::Duration;
-
-    const BIN: &str = env!("CARGO_BIN_EXE_quip-cuda-otsuka");
-    const HASH: [u8; 32] = [0x73; 32];
-
-    fn hardware() {
-        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
-        let (major, minor) = ctx.compute_capability().unwrap();
-        eprintln!(
-            "CU-3 hardware: device=0 name={} compute={major}.{minor}",
-            ctx.name().unwrap()
-        );
+    let mut session = Session::start_with(4, "num_sweeps = 4", |socket| {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "headless_miner_entry", "--nocapture"])
+            .env("CU3_TEST_COORDINATOR", socket)
+            .env("CUDA_VISIBLE_DEVICES", "");
+        command
+    })
+    .await;
+    // The initial credits resolve the live width and permit both jobs before either completes.
+    assert!(session.log.credits[0] >= 4);
+    session
+        .send(coord_msg::Msg::SetTarget(target(i64::MAX, 4)))
+        .await;
+    for id in [b"plain-1", b"plain-2"] {
+        session
+            .send(coord_msg::Msg::Job(Job {
+                job_id: id.to_vec(),
+                kind: JobKind::IsingSample as i32,
+                generation: 1,
+                ising: Some(IsingProblem {
+                    graph: Some(ising_problem::Graph::Edges(EdgeList {
+                        u: vec![0],
+                        v: vec![1],
+                    })),
+                    encoding: CoefficientEncoding::I32 as i32,
+                    scale: 1000,
+                    h: encode_i32_le(&[0, 0]),
+                    j: encode_i32_le(&[-1000]),
+                    num_reads: 3,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await;
     }
+    session
+        .until("both plain jobs", Duration::from_secs(3), |log| {
+            log.results.len() == 2 && log.refunds() == 2
+        })
+        .await;
+    let (base, params) = canonical::fixture();
+    let instance = canonical::instance(&base, &params, [7; 32]).unwrap();
 
-    fn fixture() -> (BaseTopology, Vec<u8>) {
+    session
+        .send(coord_msg::Msg::Job(canonical::job(
+            &instance,
+            &params,
+            b"bad-family",
+            3_000_000_000,
+            3,
+        )))
+        .await;
+    session
+        .until(
+            "bad job refusal and refund",
+            Duration::from_secs(3),
+            |log| log.refunds() == 3 || log.fatal.is_some(),
+        )
+        .await;
+    assert!(session.log.fatal.is_none(), "{:?}", session.log.fatal);
+    assert_eq!(session.log.rejects.len(), 1);
+    assert_eq!(session.log.rejects[0].job_id, b"bad-family");
+    assert_eq!(
+        session.log.rejects[0].reason,
+        quip_solver_core::quip_proto::v1::RejectReason::TooLarge as i32
+    );
+    assert_eq!(session.log.results.len(), 2);
+    session
+        .send(coord_msg::Msg::Job(canonical::job(
+            &instance,
+            &params,
+            b"good-family",
+            4,
+            3,
+        )))
+        .await;
+    session
+        .until(
+            "next family completes in same session",
+            Duration::from_secs(3),
+            |log| log.results.len() == 3 && log.refunds() == 4,
+        )
+        .await;
+    assert_eq!(session.log.results[2].job_id, b"good-family");
+    assert!(session.log.fatal.is_none());
+    assert_eq!(session.log.rejects.len(), 1);
+    assert_eq!(session.shutdown(2000).await, 0);
+}
+
+mod canonical {
+    use quip_solver_conformance::families::{export_instances, reference_revision};
+    use quip_solver_core::ising_generators::{
+        descriptor::params_digest, family::BaseTopology, ice::TWISTED_DIMER_V1, instance::Instance,
+    };
+    use quip_solver_core::quip_proto::v1::{
+        ising_problem, CoefficientEncoding, EdgeList, FamilyBinding, FamilyDescriptor,
+        IsingProblem, Job, JobKind,
+    };
+    use quip_solver_core::quip_protocol::wire::encode_i32_le;
+    pub(super) fn fixture() -> (BaseTopology, Vec<u8>) {
         let reference = reference_revision(TWISTED_DIMER_V1.family_id, 1).unwrap();
         let stored = quip_solver_conformance::topology(reference.topology).unwrap();
         let base = BaseTopology::new(stored.nodes, &stored.edges).unwrap();
@@ -452,7 +708,44 @@ mod gpu {
         (base, params)
     }
 
-    fn descriptor(params: &[u8]) -> FamilyDescriptor {
+    pub(super) fn job(
+        instance: &Instance,
+        params: &[u8],
+        id: &[u8],
+        sweeps: u32,
+        reads: u32,
+    ) -> Job {
+        Job {
+            job_id: id.to_vec(),
+            kind: JobKind::IsingSample as i32,
+            generation: 1,
+            ising: Some(IsingProblem {
+                graph: Some(ising_problem::Graph::Edges(EdgeList {
+                    u: instance.edges().iter().map(|&(u, _)| u).collect(),
+                    v: instance.edges().iter().map(|&(_, v)| v).collect(),
+                })),
+                encoding: CoefficientEncoding::I32 as i32,
+                scale: 1000,
+                h: encode_i32_le(instance.h()),
+                j: encode_i32_le(instance.j()),
+                num_reads: reads,
+                num_sweeps: sweeps,
+                family: Some(FamilyBinding {
+                    family: Some(descriptor(params)),
+                    nonce: vec![7; 32],
+                    instance_digest: instance.digest().to_vec(),
+                    metadata: instance.metadata().to_vec(),
+                    topology_order_digest: instance.topology_order_digest().to_vec(),
+                    node_ids: instance.node_ids().to_vec(),
+                    offset_milli: instance.offset_milli(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn descriptor(params: &[u8]) -> FamilyDescriptor {
         FamilyDescriptor {
             family_id: TWISTED_DIMER_V1.family_id.into(),
             revision: 1,
@@ -461,12 +754,42 @@ mod gpu {
         }
     }
 
-    fn instance(base: &BaseTopology, params: &[u8], nonce: [u8; 32]) -> Option<Instance> {
+    pub(super) fn instance(
+        base: &BaseTopology,
+        params: &[u8],
+        nonce: [u8; 32],
+    ) -> Option<Instance> {
         export_instances(&TWISTED_DIMER_V1, params, base, &[nonce])
             .unwrap()
             .pop()
             .unwrap()
             .ok()
+    }
+}
+
+#[cfg(feature = "long-tests")]
+mod gpu {
+    use super::canonical::{descriptor, fixture, instance};
+    use super::family_session::{lease, target, Session};
+    use quip_solver_conformance::families::drive_miner_family;
+    use quip_solver_core::ising_generators::instance::Instance;
+    use quip_solver_core::quip_proto::v1::{coord_msg, EdgeList, GeneratorAlgorithm, Topology};
+    use quip_solver_core::quip_protocol::lease::LeaseSpec;
+    use quip_solver_core::quip_protocol::scoring::energy_from_milli;
+    use quip_solver_core::quip_protocol::wire::decode_spins_packed;
+    use serial_test::serial;
+    use std::time::Duration;
+
+    const BIN: &str = env!("CARGO_BIN_EXE_quip-cuda-otsuka");
+    const HASH: [u8; 32] = [0x73; 32];
+
+    fn hardware() {
+        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+        let (major, minor) = ctx.compute_capability().unwrap();
+        eprintln!(
+            "CU-3 hardware: device=0 name={} compute={major}.{minor}",
+            ctx.name().unwrap()
+        );
     }
 
     fn assert_scores(result: &quip_solver_core::quip_proto::v1::Result, instance: &Instance) {
@@ -514,9 +837,74 @@ mod gpu {
             )
             .unwrap();
         let work = ClusterWork::new(&super::graph(), &params).unwrap();
-        let actual = device.run_work(&work, &|| false).unwrap();
+        let actual = device.run_work(&work, &|| false, &|| false).unwrap();
         assert_eq!(actual.spins, expected.spins);
         assert_eq!(actual.energies, expected.energies);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial]
+    async fn family_progresses_while_sa_is_active_then_cancels_cleanly() {
+        use quip_solver_core::quip_proto::v1::Cancel;
+        hardware();
+        let (base, params) = fixture();
+        let instance = instance(&base, &params, [7; 32]).unwrap();
+        let mut session = Session::start_with(4, "num_sweeps = 4", |socket| {
+            let mut command = tokio::process::Command::new(BIN);
+            command.args(["--quip-coordinator", socket, "--sweeps-per-beta", "1024"]);
+            command
+        })
+        .await;
+        session
+            .send(coord_msg::Msg::SetTarget(target(i64::MAX, 4)))
+            .await;
+        let mut plain = super::canonical::job(&instance, &params, b"active-sa", 10_000_000, 64);
+        plain.ising.as_mut().unwrap().family = None;
+        session.send(coord_msg::Msg::Job(plain)).await;
+        session
+            .until_stderr("self-feeding session launching", Duration::from_secs(3))
+            .await;
+        session
+            .send(coord_msg::Msg::Job(super::canonical::job(
+                &instance,
+                &params,
+                b"concurrent-family",
+                4,
+                64,
+            )))
+            .await;
+        session
+            .until(
+                "family while SA remains active",
+                Duration::from_secs(3),
+                |log| !log.results_for(b"concurrent-family").is_empty(),
+            )
+            .await;
+        assert!(session.log.results_for(b"active-sa").is_empty());
+        assert!(session.log.rejects.is_empty());
+        assert_scores(session.log.results_for(b"concurrent-family")[0], &instance);
+        session
+            .send(coord_msg::Msg::Cancel(Cancel { max_generation: 1 }))
+            .await;
+        session
+            .until(
+                "family and cancelled SA credits",
+                Duration::from_secs(3),
+                |log| log.refunds() == 2,
+            )
+            .await;
+        let mut next = super::canonical::job(&instance, &params, b"next-sa", 4, 64);
+        next.generation = 2;
+        next.ising.as_mut().unwrap().family = None;
+        session.send(coord_msg::Msg::Job(next)).await;
+        session
+            .until("next SA job", Duration::from_secs(3), |log| {
+                !log.results_for(b"next-sa").is_empty() && log.refunds() == 3
+            })
+            .await;
+        assert!(session.log.fatal.is_none());
+        assert_eq!(session.shutdown(2000).await, 0);
     }
 
     #[tokio::test]
@@ -531,32 +919,13 @@ mod gpu {
             .send(coord_msg::Msg::SetTarget(target(i64::MAX, 4)))
             .await;
         session
-            .send(coord_msg::Msg::Job(Job {
-                job_id: b"explicit-cluster".to_vec(),
-                kind: JobKind::IsingSample as i32,
-                generation: 1,
-                ising: Some(IsingProblem {
-                    graph: Some(ising_problem::Graph::Edges(EdgeList {
-                        u: instance.edges().iter().map(|&(u, _)| u).collect(),
-                        v: instance.edges().iter().map(|&(_, v)| v).collect(),
-                    })),
-                    encoding: CoefficientEncoding::I32 as i32,
-                    scale: 1000,
-                    h: encode_i32_le(instance.h()),
-                    j: encode_i32_le(instance.j()),
-                    family: Some(FamilyBinding {
-                        family: Some(descriptor(&params)),
-                        nonce: vec![7; 32],
-                        instance_digest: instance.digest().to_vec(),
-                        metadata: instance.metadata().to_vec(),
-                        topology_order_digest: instance.topology_order_digest().to_vec(),
-                        node_ids: instance.node_ids().to_vec(),
-                        offset_milli: instance.offset_milli(),
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }))
+            .send(coord_msg::Msg::Job(super::canonical::job(
+                &instance,
+                &params,
+                b"explicit-cluster",
+                4,
+                64,
+            )))
             .await;
         session
             .until(

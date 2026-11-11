@@ -103,7 +103,22 @@ pub(crate) struct Session {
 impl Session {
     /// Spawn `binary`, finish the handshake, and wait for the first credits.
     pub(crate) async fn start(binary: &str, queue_depth: u32, backend_toml: &str) -> Self {
-        let directory = tempfile::tempdir().expect("socket directory");
+        Self::start_with(queue_depth, backend_toml, |socket| {
+            let mut command = Command::new(binary);
+            command.args(["--quip-coordinator", socket]);
+            command.args(["--miner-id", "cuda-0", "--device", "0"]);
+            command
+        })
+        .await
+    }
+
+    /// Start a test miner command against the same coordinator protocol.
+    pub(crate) async fn start_with(
+        queue_depth: u32,
+        backend_toml: &str,
+        command: impl FnOnce(&str) -> Command,
+    ) -> Self {
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("socket directory");
         let path = directory.path().join("coord.sock");
         let listener = UnixListener::bind(&path).expect("bind test coordinator");
         let (send, receive) = oneshot::channel();
@@ -116,9 +131,7 @@ impl Session {
         });
         let stderr = directory.path().join("miner.log");
         let mut log_file = std::fs::File::create(&stderr).expect("miner log");
-        let mut child = Command::new(binary)
-            .args(["--quip-coordinator", &format!("unix://{}", path.display())])
-            .args(["--miner-id", "cuda-0", "--device", "0"])
+        let mut child = command(&format!("unix://{}", path.display()))
             .stderr(Stdio::piped())
             .env(
                 "RUST_LOG",

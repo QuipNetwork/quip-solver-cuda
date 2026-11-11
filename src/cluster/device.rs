@@ -56,6 +56,9 @@ pub enum ClusterDeviceError {
     /// The caller stopped this job between synchronized launches.
     #[error("cluster job cancelled")]
     Cancelled,
+    /// The job supplied an unsupported schedule or read count.
+    #[error("invalid cluster job parameter: {0}")]
+    JobParameter(&'static str),
     /// A schedule or launch dimension is invalid.
     #[error("invalid cluster parameter: {0}")]
     Parameter(&'static str),
@@ -163,22 +166,14 @@ pub struct ClusterDevice {
     link_w: CudaSlice<i32>,
 }
 
-impl ClusterDevice {
-    /// Open a device, check its real budgets, and upload the CU-1 layout.
-    /// Uses an independent context with normal event tracking.
-    ///
-    /// # Errors
-    /// Returns capacity, compilation, allocation, or driver errors.
-    pub fn open(device_index: usize, graph: PreparedGraph) -> Result<Self, ClusterDeviceError> {
+pub(crate) struct ClusterKernel {
+    stream: Arc<CudaStream>,
+    function: CudaFunction,
+}
+
+impl ClusterKernel {
+    pub(crate) fn load(device_index: usize) -> Result<Self, ClusterDeviceError> {
         let ctx = CudaContext::new(device_index)?;
-        check_shared(
-            &graph,
-            attribute(
-                &ctx,
-                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-            )?,
-        )?;
-        check_memory(&graph, graph.footprint().instances, ctx.mem_get_info()?.0)?;
         let arch = device_arch(&ctx);
         let module = jit_cache::load_or_compile(
             &ctx,
@@ -190,6 +185,8 @@ impl ClusterDevice {
             0,
             || compile_for_arch(SOURCE, 0, arch, &[]),
         )?;
+        // Resolve the function before SA launches. Lazy module loading can
+        // synchronize the primary context, even with nonblocking streams.
         let function = module.load_function("quip_cluster_anneal")?;
         let static_shared = usize::try_from(function.shared_size_bytes()?)
             .map_err(|_| ClusterDeviceError::Parameter("negative static shared memory"))?;
@@ -198,12 +195,50 @@ impl ClusterDevice {
                 "static shared memory exceeds CU-1 reservation",
             ));
         }
+        // cudarc synchronizes the context when creating its first stream.
+        // Retain this stream too, so no per-job creation waits on resident SA.
+        let stream = ctx.new_stream()?;
+        Ok(Self { stream, function })
+    }
+}
+
+struct WorkControl<'a> {
+    work: &'a super::sampler::ClusterWork,
+    stopped: &'a dyn Fn() -> bool,
+    cancelled: &'a dyn Fn() -> bool,
+}
+
+impl ClusterDevice {
+    /// Open a device, check its real budgets, and upload the CU-1 layout.
+    /// Retains the device primary context with normal event tracking.
+    ///
+    /// # Errors
+    /// Returns capacity, compilation, allocation, or driver errors.
+    pub fn open(device_index: usize, graph: PreparedGraph) -> Result<Self, ClusterDeviceError> {
+        let kernel = ClusterKernel::load(device_index)?;
+        Self::open_with_kernel(graph, &kernel)
+    }
+
+    pub(crate) fn open_with_kernel(
+        graph: PreparedGraph,
+        kernel: &ClusterKernel,
+    ) -> Result<Self, ClusterDeviceError> {
+        let ctx = kernel.stream.context();
+        check_shared(
+            &graph,
+            attribute(
+                ctx,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            )?,
+        )?;
+        check_memory(&graph, graph.footprint().instances, ctx.mem_get_info()?.0)?;
+        let function = kernel.function.clone();
         function.set_attribute(
             CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             i32::try_from(graph.dynamic_shared_bytes())
                 .map_err(|_| ClusterDeviceError::Parameter("shared memory exceeds i32"))?,
         )?;
-        let stream = ctx.default_stream();
+        let stream = Arc::clone(&kernel.stream);
         let d = graph.layout();
         Ok(Self {
             tiles: upload(&stream, &d.tiles)?,
@@ -264,6 +299,7 @@ impl ClusterDevice {
     pub fn run_work(
         &mut self,
         work: &super::sampler::ClusterWork,
+        stopped: &dyn Fn() -> bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ClusterRun, ClusterDeviceError> {
         let schedule = ClusterSchedule {
@@ -276,7 +312,11 @@ impl ClusterDevice {
             work.reads,
             work.seed,
             true,
-            Some((work, cancelled)),
+            Some(&WorkControl {
+                work,
+                stopped,
+                cancelled,
+            }),
         )
         .map(|(run, _)| run)
     }
@@ -287,7 +327,7 @@ impl ClusterDevice {
         anneals: usize,
         seed: u64,
         final_descent: bool,
-        control: Option<(&super::sampler::ClusterWork, &dyn Fn() -> bool)>,
+        control: Option<&WorkControl<'_>>,
     ) -> Result<(ClusterRun, Vec<u64>), ClusterDeviceError> {
         let params = schedule.params()?;
         let ctx = self.stream.context();
@@ -322,26 +362,28 @@ impl ClusterDevice {
             shared_mem_bytes: u32::try_from(self.graph.dynamic_shared_bytes())
                 .map_err(|_| ClusterDeviceError::Parameter("shared memory exceeds u32"))?,
         };
-        if let Some((work, cancelled)) = control {
-            work.for_each_launch(cancelled, |start, beta, descent| {
-                let constant_beta = Params {
-                    beta_min: beta,
-                    beta_max: beta,
-                    ..params
-                };
-                self.launch(
-                    constant_beta,
-                    i32::try_from(start)
-                        .map_err(|_| ClusterDeviceError::Parameter("sweep exceeds i32"))?,
-                    i32::from(!descent),
-                    if descent { 2 } else { 0 },
-                    config,
-                    &mut spins,
-                    &mut rng,
-                )?;
-                self.stream.synchronize()?;
-                Ok(())
-            })?;
+        if let Some(control) = control {
+            control
+                .work
+                .for_each_launch(control.stopped, |start, beta, descent| {
+                    let constant_beta = Params {
+                        beta_min: beta,
+                        beta_max: beta,
+                        ..params
+                    };
+                    self.launch(
+                        constant_beta,
+                        i32::try_from(start)
+                            .map_err(|_| ClusterDeviceError::Parameter("sweep exceeds i32"))?,
+                        i32::from(!descent),
+                        if descent { 2 } else { 0 },
+                        config,
+                        &mut spins,
+                        &mut rng,
+                    )?;
+                    self.stream.synchronize()?;
+                    Ok(())
+                })?;
         } else {
             let mut start = 0;
             while start < params.sweeps {
@@ -365,7 +407,7 @@ impl ClusterDevice {
             energies: Vec::with_capacity(anneals),
         };
         for s in states.chunks_exact(self.graph.original_graph().num_nodes()) {
-            if control.is_some_and(|(_, cancelled)| cancelled()) {
+            if control.is_some_and(|c| (c.cancelled)()) {
                 return Err(ClusterDeviceError::Cancelled);
             }
             let original = self.graph.unpermute(s)?;

@@ -1,7 +1,7 @@
 //! Otsuka on validated twisted-ice-dimer jobs, production CUDA SA otherwise.
 
-use super::device::{ClusterDevice, ClusterDeviceError, ClusterRun};
-use super::{PreparedGraph, Weights, MAX_PACKED_NODES};
+use super::device::{ClusterDevice, ClusterDeviceError, ClusterKernel, ClusterRun};
+use super::{PrepareError, PreparedGraph, Weights, MAX_PACKED_NODES};
 use crate::capacity::{
     cluster_footprint, ClusterShape, DeviceLimits, CLUSTER_DYNAMIC_PADDING,
     CLUSTER_SHARED_BYTES_PER_NODE, CLUSTER_STATIC_SHARED_BYTES,
@@ -93,7 +93,17 @@ impl ClusterWork {
         if params.num_sweeps > i32::MAX.unsigned_abs() as usize
             || params.sweeps_per_beta > i32::MAX.unsigned_abs() as usize
         {
-            return Err(ClusterDeviceError::Parameter("sweep count exceeds i32"));
+            return Err(ClusterDeviceError::JobParameter("sweep count exceeds i32"));
+        }
+        if params.num_reads == 0
+            || params.num_reads > MAX_READS
+            || params.beta_range.is_some_and(|(hot, cold)| {
+                !hot.is_finite() || !cold.is_finite() || hot <= 0.0 || cold <= 0.0
+            })
+        {
+            return Err(ClusterDeviceError::JobParameter(
+                "invalid read count or beta range",
+            ));
         }
         let per_beta = if params.num_sweeps == 0 {
             params.sweeps_per_beta.max(1)
@@ -109,12 +119,10 @@ impl ClusterWork {
             1.0,
         );
         let total = betas.len().checked_mul(sweeps_per_beta);
-        if params.num_reads == 0
-            || params.num_reads > MAX_READS
-            || total.is_none_or(|n| n == 0 || n > i32::MAX.unsigned_abs() as usize)
+        if total.is_none_or(|n| n == 0 || n > i32::MAX.unsigned_abs() as usize)
             || betas.iter().any(|b| !b.is_finite() || *b <= 0.0)
         {
-            return Err(ClusterDeviceError::Parameter(
+            return Err(ClusterDeviceError::JobParameter(
                 "invalid read count or beta ladder",
             ));
         }
@@ -149,7 +157,7 @@ impl ClusterWork {
             checkpoint(cancelled)?;
             launch(0, 1.0, true)?;
         }
-        checkpoint(cancelled)
+        Ok(())
     }
 }
 
@@ -172,13 +180,14 @@ pub trait ClusterBackend: Send + Sync + 'static {
         &self,
         graph: PreparedGraph,
         work: &ClusterWork,
+        stopped: &dyn Fn() -> bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ClusterRun, ClusterDeviceError>;
 }
 
-/// Lazy cluster backend on the selected CUDA ordinal.
+/// Preloaded cluster function on the selected CUDA device.
 pub struct GpuCluster {
-    device_index: usize,
+    kernel: ClusterKernel,
 }
 
 impl ClusterBackend for GpuCluster {
@@ -186,14 +195,15 @@ impl ClusterBackend for GpuCluster {
         &self,
         graph: PreparedGraph,
         work: &ClusterWork,
+        stopped: &dyn Fn() -> bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ClusterRun, ClusterDeviceError> {
-        checkpoint(cancelled)?;
-        ClusterDevice::open(self.device_index, graph)?.run_work(work, cancelled)
+        checkpoint(stopped)?;
+        ClusterDevice::open_with_kernel(graph, &self.kernel)?.run_work(work, stopped, cancelled)
     }
 }
 
-/// Serial family job stream with production SA fallback and session-owned credits.
+/// Serial family jobs alongside one persistent production SA stream.
 pub struct OtsukaSampler<D = GpuCluster, S = CudaSampler> {
     cluster: D,
     sa: S,
@@ -202,17 +212,23 @@ pub struct OtsukaSampler<D = GpuCluster, S = CudaSampler> {
 
 impl OtsukaSampler {
     /// Bind the selected device, governor, and stall policy.
-    #[must_use]
-    pub fn new(device: CudaDevice, gov: UtilGovernor, stall: StallConfig) -> Self {
+    ///
+    /// # Errors
+    /// Returns cluster compilation or driver errors before streaming starts.
+    pub fn new(
+        device: CudaDevice,
+        gov: UtilGovernor,
+        stall: StallConfig,
+    ) -> Result<Self, ClusterDeviceError> {
         let cluster = GpuCluster {
-            device_index: device.device_index,
+            kernel: ClusterKernel::load(device.device_index)?,
         };
         let limits = device.limits;
-        Self {
+        Ok(Self {
             cluster,
             sa: CudaSampler::new(device, gov, KernelKind::Sa, stall),
             limits,
-        }
+        })
     }
 }
 
@@ -240,7 +256,7 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
         let stopped = || cancelled() || self.sa.should_throttle();
         checkpoint(&stopped)?;
         let work = ClusterWork::new(graph, params)?;
-        let run = self.cluster.run(prepared, &work, &stopped)?;
+        let run = self.cluster.run(prepared, &work, &stopped, cancelled)?;
         if run.spins.len() != params.num_reads
             || run.energies.len() != params.num_reads
             || run
@@ -254,7 +270,7 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
         }
         let mut reads = Vec::with_capacity(params.num_reads);
         for spins in run.spins {
-            checkpoint(&stopped)?;
+            checkpoint(cancelled)?;
             reads.push(SamplerResult {
                 energy_milli: energy_milli(&spins, &graph.h, &graph.j, &graph.edges),
                 spins,
@@ -331,7 +347,9 @@ fn supported(family: &FamilyContext) -> bool {
 
 fn sample_error(error: ClusterDeviceError) -> SampleError {
     match error {
-        ClusterDeviceError::Cancelled => SampleError::DeviceBusy,
+        ClusterDeviceError::Cancelled
+        | ClusterDeviceError::Prepare(PrepareError::DeviceMemory { .. }) => SampleError::DeviceBusy,
+        ClusterDeviceError::JobParameter(_) => SampleError::Capacity,
         ClusterDeviceError::Prepare(e) => {
             tracing::warn!(error = %e, "cluster admission refused");
             SampleError::Capacity
@@ -394,39 +412,43 @@ impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
         out: Sender<StreamResult>,
         cancel: CancelToken,
     ) {
-        while let Some(item) = jobs.blocking_recv() {
-            let job = item.job;
-            if let Some(family) = item.family.as_ref().filter(|f| supported(f)) {
-                let result = Self::finish(&job, &cancel, || {
-                    let prepared = self.prepared(&job.graph, &job.params, family)?;
-                    self.reads(&job.graph, &job.params, prepared, &|| {
-                        cancel.is_cancelled(job.watermark)
-                    })
-                    .map_err(sample_error)
-                });
-                if out.blocking_send(result).is_err() {
-                    break;
-                }
-            } else {
-                let (tx, rx) = channel(1);
-                if tx.blocking_send(job).is_err() {
-                    break;
-                }
-                drop(tx);
-                self.sa.sample_stream(rx, out.clone(), cancel.clone());
+        std::thread::scope(|scope| {
+            // Keep the production self-feeding session alive across plain jobs.
+            let (sa_tx, sa_rx) = channel(self.sa.stream_width().saturating_mul(2).max(1));
+            let sa_out = out.clone();
+            let sa_cancel = cancel.clone();
+            scope.spawn(|| self.sa.sample_stream(sa_rx, sa_out, sa_cancel));
+            while let Some(item) = jobs.blocking_recv() {
                 if out.is_closed() {
                     break;
                 }
+                let job = item.job;
+                if let Some(family) = item.family.as_ref().filter(|f| supported(f)) {
+                    let result = Self::finish(&job, &cancel, || {
+                        let prepared = self.prepared(&job.graph, &job.params, family)?;
+                        self.reads(&job.graph, &job.params, prepared, &|| {
+                            cancel.is_cancelled(job.watermark)
+                        })
+                        .map_err(sample_error)
+                    });
+                    if out.blocking_send(result).is_err() {
+                        break;
+                    }
+                } else if sa_tx.blocking_send(job).is_err() {
+                    break;
+                }
             }
-        }
+            drop(sa_tx);
+        });
     }
 
     fn stream_width(&self) -> usize {
-        1
+        self.sa.stream_width()
     }
     fn declared_stream_width() -> u32 {
-        1
+        S::declared_stream_width()
     }
+
     fn max_reads(&self) -> u32 {
         u32::try_from(MAX_READS).unwrap_or(u32::MAX)
     }
