@@ -13,6 +13,11 @@ use quip_solver_cuda::cluster::{Model, Motifs, PreparedGraph, Weights};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Longest wait for one session phase. It detects a hang, not a slow run:
+/// CI's `--ensure-time` limit of 30 seconds bounds each test's total time,
+/// and a shared runner can take several seconds longer than an idle card.
+const PHASE_LIMIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[derive(Clone, Default)]
 struct FakeDevice {
     launches: Arc<Mutex<usize>>,
@@ -591,7 +596,6 @@ async fn warm_routing_keeps_sa_width_and_refuses_only_the_bad_family_job() {
         coord_msg, ising_problem, CoefficientEncoding, EdgeList, IsingProblem, Job, JobKind,
     };
     use quip_solver_core::quip_protocol::wire::encode_i32_le;
-    use std::time::Duration;
     let mut session = Session::start_with(4, "num_sweeps = 4", |socket| {
         let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
         command
@@ -629,7 +633,7 @@ async fn warm_routing_keeps_sa_width_and_refuses_only_the_bad_family_job() {
             .await;
     }
     session
-        .until("both plain jobs", Duration::from_secs(3), |log| {
+        .until("both plain jobs", PHASE_LIMIT, |log| {
             log.results.len() == 2 && log.refunds() == 2
         })
         .await;
@@ -646,11 +650,9 @@ async fn warm_routing_keeps_sa_width_and_refuses_only_the_bad_family_job() {
         )))
         .await;
     session
-        .until(
-            "bad job refusal and refund",
-            Duration::from_secs(3),
-            |log| log.refunds() == 3 || log.fatal.is_some(),
-        )
+        .until("bad job refusal and refund", PHASE_LIMIT, |log| {
+            log.refunds() == 3 || log.fatal.is_some()
+        })
         .await;
     assert!(session.log.fatal.is_none(), "{:?}", session.log.fatal);
     assert_eq!(session.log.rejects.len(), 1);
@@ -672,7 +674,7 @@ async fn warm_routing_keeps_sa_width_and_refuses_only_the_bad_family_job() {
     session
         .until(
             "next family completes in same session",
-            Duration::from_secs(3),
+            PHASE_LIMIT,
             |log| log.results.len() == 3 && log.refunds() == 4,
         )
         .await;
@@ -770,6 +772,7 @@ mod canonical {
 mod gpu {
     use super::canonical::{descriptor, fixture, instance};
     use super::family_session::{lease, target, Session};
+    use super::PHASE_LIMIT;
     use quip_solver_conformance::families::drive_miner_family;
     use quip_solver_core::ising_generators::ice::TWISTED_DIMER_V1;
     use quip_solver_core::ising_generators::instance::Instance;
@@ -778,7 +781,6 @@ mod gpu {
     use quip_solver_core::quip_protocol::scoring::energy_from_milli;
     use quip_solver_core::quip_protocol::wire::decode_spins_packed;
     use serial_test::serial;
-    use std::time::Duration;
 
     const BIN: &str = env!("CARGO_BIN_EXE_quip-cuda-otsuka");
     const HASH: [u8; 32] = [0x73; 32];
@@ -934,7 +936,7 @@ mod gpu {
         plain.ising.as_mut().unwrap().family = None;
         session.send(coord_msg::Msg::Job(plain)).await;
         session
-            .until_stderr("self-feeding session launching", Duration::from_secs(3))
+            .until_stderr("self-feeding session launching", PHASE_LIMIT)
             .await;
         session
             .send(coord_msg::Msg::Job(super::canonical::job(
@@ -946,11 +948,9 @@ mod gpu {
             )))
             .await;
         session
-            .until(
-                "family while SA remains active",
-                Duration::from_secs(3),
-                |log| !log.results_for(b"concurrent-family").is_empty(),
-            )
+            .until("family while SA remains active", PHASE_LIMIT, |log| {
+                !log.results_for(b"concurrent-family").is_empty()
+            })
             .await;
         assert!(session.log.results_for(b"active-sa").is_empty());
         assert!(session.log.rejects.is_empty());
@@ -959,18 +959,16 @@ mod gpu {
             .send(coord_msg::Msg::Cancel(Cancel { max_generation: 1 }))
             .await;
         session
-            .until(
-                "family and cancelled SA credits",
-                Duration::from_secs(3),
-                |log| log.refunds() == 2,
-            )
+            .until("family and cancelled SA credits", PHASE_LIMIT, |log| {
+                log.refunds() == 2
+            })
             .await;
         let mut next = super::canonical::job(&instance, &params, b"next-sa", 4, 64);
         next.generation = 2;
         next.ising.as_mut().unwrap().family = None;
         session.send(coord_msg::Msg::Job(next)).await;
         session
-            .until("next SA job", Duration::from_secs(3), |log| {
+            .until("next SA job", PHASE_LIMIT, |log| {
                 !log.results_for(b"next-sa").is_empty() && log.refunds() == 3
             })
             .await;
@@ -999,11 +997,9 @@ mod gpu {
             )))
             .await;
         session
-            .until(
-                "explicit result and credit",
-                Duration::from_secs(3),
-                |log| !log.results.is_empty() && log.refunds() == 1,
-            )
+            .until("explicit result and credit", PHASE_LIMIT, |log| {
+                !log.results.is_empty() && log.refunds() == 1
+            })
             .await;
         assert!(session.log.rejects.is_empty());
         assert_scores(&session.log.results[0], &instance);
@@ -1052,7 +1048,7 @@ mod gpu {
             .await;
         session.send(coord_msg::Msg::Job(request)).await;
         session
-            .until("family lease and credit", Duration::from_secs(3), |log| {
+            .until("family lease and credit", PHASE_LIMIT, |log| {
                 log.done_count(b"host-cluster") == 1 && log.refunds() == 1
             })
             .await;
