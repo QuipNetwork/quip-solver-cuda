@@ -1,4 +1,4 @@
-stages: [test, build, release]
+stages: [toolchain, test, build, release]
 
 include:
   - project: quip.network/ci-templates
@@ -26,6 +26,52 @@ default:
 cache:
   key: cargo-$CI_COMMIT_REF_SLUG
   paths: [.cargo/, target/]
+
+# The toolchain image. Its Dockerfile says what it holds. This job runs on a
+# branch push that changes the Dockerfile and is manual otherwise. The jobs
+# pull the image by digest, so after a rebuild copy the digest this job prints
+# into TOOLCHAIN_IMAGE in a commit of its own.
+#
+# The `docker` tag selects the Linux container executors, which run kaniko.
+# Those hosts bind-mount GPU firmware into /lib, so kaniko cannot replace /lib
+# with the base image's merged-usr symlink. It ignores /lib, and the shim
+# keeps the ELF interpreter reachable for each RUN, as in quip-solver-cpu.
+build-toolchain-image:
+  stage: toolchain
+  needs: []
+  tags: [docker, amd64]
+  image:
+    name: ghcr.io/osscontainertools/kaniko:v1.29.1-debug@sha256:ebc38a988e5aa1aaea99240e931aeeeff9d8e6bb5a0bd0e00eaf79973bf0a773
+    entrypoint: [""]
+  cache: []
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - .gitlab/ci-toolchain.Dockerfile
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+      allow_failure: true
+  before_script:
+    - mkdir -p /lib && ln -sfn /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
+    - mkdir -p /kaniko/.docker
+    - |
+      printf '{"auths":{"%s":{"auth":"%s"}}}\n' \
+        "$CI_REGISTRY" \
+        "$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')" \
+        > /kaniko/.docker/config.json
+    # The image copies no project files, so the build context is empty.
+    - mkdir -p /tmp/toolchain-context
+  script:
+    - |
+      /kaniko/executor \
+        --context /tmp/toolchain-context \
+        --dockerfile "$CI_PROJECT_DIR/.gitlab/ci-toolchain.Dockerfile" \
+        --destination "$CI_REGISTRY_IMAGE/ci-toolchain:$CI_COMMIT_SHORT_SHA" \
+        --ignore-path=/lib \
+        --cache=true \
+        --cache-repo "$CI_REGISTRY_IMAGE/ci-toolchain-buildcache" \
+        --digest-file=/tmp/digest
+    - echo "TOOLCHAIN_IMAGE=$CI_REGISTRY_IMAGE/ci-toolchain@$(cat /tmp/digest)"
 
 # The fast suite, on GPU hardware, on every pipeline. The `cuda` tag selects
 # the GPU hosts (lovelace, finney), whose docker runners expose the devices.
