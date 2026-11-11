@@ -57,7 +57,10 @@ impl ClusterBackend for FakeDevice {
 }
 
 #[derive(Clone, Default)]
-struct FakeSa(Arc<Mutex<usize>>);
+struct FakeSa {
+    calls: Arc<Mutex<usize>>,
+    yielding: bool,
+}
 
 impl Sampler for FakeSa {
     fn sample(
@@ -65,13 +68,17 @@ impl Sampler for FakeSa {
         _graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, SampleError> {
-        *self.0.lock().unwrap() += 1;
+        *self.calls.lock().unwrap() += 1;
         Ok((0..params.num_reads)
             .map(|_| SamplerResult {
                 spins: vec![1, 1],
                 energy_milli: -1000,
             })
             .collect())
+    }
+
+    fn should_throttle(&self) -> bool {
+        self.yielding
     }
 }
 
@@ -191,9 +198,29 @@ fn plain_jobs_use_the_sa_stream() {
         results.blocking_recv().unwrap().outcome,
         StreamOutcome::Completed(Ok(_))
     ));
-    assert_eq!(*sa.0.lock().unwrap(), 1);
+    assert_eq!(*sa.calls.lock().unwrap(), 1);
     assert_eq!(*device.launches.lock().unwrap(), 0);
     assert_eq!(sampler.stream_width(), 1);
+}
+
+#[test]
+fn governor_yield_is_busy_and_never_opens_the_cluster_device() {
+    let device = FakeDevice::default();
+    let sa = FakeSa {
+        yielding: true,
+        ..Default::default()
+    };
+    let sampler = OtsukaSampler::with_backends(device.clone(), sa, HEADLESS_LIMITS);
+    let result = sampler.sample_prepared_for_test(
+        &job(),
+        prepared(&HEADLESS_LIMITS),
+        &CancelToken::default(),
+    );
+    assert!(matches!(
+        result.outcome,
+        StreamOutcome::Completed(Err(SampleError::DeviceBusy))
+    ));
+    assert_eq!(*device.launches.lock().unwrap(), 0);
 }
 
 #[test]

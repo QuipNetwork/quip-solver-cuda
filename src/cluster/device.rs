@@ -53,7 +53,7 @@ impl Default for ClusterSchedule {
 /// Admission, compilation, allocation, launch, or result failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterDeviceError {
-    /// The session abandoned this job between synchronized launches.
+    /// The caller stopped this job between synchronized launches.
     #[error("cluster job cancelled")]
     Cancelled,
     /// A schedule or launch dimension is invalid.

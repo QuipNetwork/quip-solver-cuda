@@ -235,9 +235,12 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
         prepared: PreparedGraph,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<SamplerResult>, ClusterDeviceError> {
-        checkpoint(cancelled)?;
+        // A governor yield refuses this job as busy. Only the session token
+        // makes finish() report Cancelled and suppress the upstream result.
+        let stopped = || cancelled() || self.sa.should_throttle();
+        checkpoint(&stopped)?;
         let work = ClusterWork::new(graph, params)?;
-        let run = self.cluster.run(prepared, &work, cancelled)?;
+        let run = self.cluster.run(prepared, &work, &stopped)?;
         if run.spins.len() != params.num_reads
             || run.energies.len() != params.num_reads
             || run
@@ -251,7 +254,7 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
         }
         let mut reads = Vec::with_capacity(params.num_reads);
         for spins in run.spins {
-            checkpoint(cancelled)?;
+            checkpoint(&stopped)?;
             reads.push(SamplerResult {
                 energy_milli: energy_milli(&spins, &graph.h, &graph.j, &graph.edges),
                 spins,
