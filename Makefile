@@ -11,7 +11,7 @@ RUN_CI   := docker run --rm -e CI=1 -v $(PWD):/src -v quip-cuda-cargo:/root/.car
 RUN_GPU  := docker run --rm --gpus all -e CI=1 -v $(PWD):/src -v quip-cuda-cargo:/root/.cargo/registry \
             -v quip-cuda-target:/src/target -w /src $(CI_IMAGE)
 
-.PHONY: ci-image check test test-archs test-gpu bench-arch
+.PHONY: ci-image check test test-archs test-gpu test-long bench-arch
 
 ci-image:
 	docker build -f Dockerfile.ci -t $(CI_IMAGE) .
@@ -26,9 +26,14 @@ test: ci-image
 test-archs: ci-image
 	$(RUN_CI) cargo test --release --test arch_coverage -- --include-ignored
 
-# The #[ignore]d GPU suite, on real hardware.
+# test-gpu runs the fast GPU suite with CI time limits; test-long adds manual long tests.
 test-gpu: ci-image
-	$(RUN_GPU) cargo test --release -- --include-ignored
+	$(RUN_GPU) env RUSTC_BOOTSTRAP=1 RUST_TEST_TIME_UNIT=10000,30000 \
+	    RUST_TEST_TIME_INTEGRATION=10000,30000 RUST_TEST_TIME_DOCTEST=10000,30000 \
+	    cargo test --release -- --include-ignored --test-threads=1 -Z unstable-options --ensure-time
+
+test-long: ci-image
+	$(RUN_GPU) cargo test --release --features long-tests -- --include-ignored
 
 # Benchmark for the spec's D4 gate. OUT differs per run: make bench-arch OUT=bench-out/baseline
 OUT ?= bench-out/run

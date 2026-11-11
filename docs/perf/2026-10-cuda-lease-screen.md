@@ -293,6 +293,8 @@ CUDA_VISIBLE_DEVICES=0 LEASE_PIPELINE_OUT=/evidence \
   --ignored --exact --nocapture
 ```
 
+Run `make test-long` for the manual long GPU tests.
+
 Set `LEASE_PIPELINE_MODE=direct` for the comparison.
 Place `corpus-4096.csv` in `LEASE_PIPELINE_OUT` so the test can compute the target.
 The runner supplies `PIPELINE_COMMIT` and records the source commit in each JSON result.

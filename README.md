@@ -332,6 +332,7 @@ temperature loses core clock, and that loss looks like a software decay.
 ```sh
 cargo test --release                       # host-only tests
 cargo test --release -- --include-ignored  # adds the CUDA-device tests
+make test-long                            # adds the manual long GPU tests
 ```
 
 The ten-minute `pipeline::whole_pipeline` benchmark skips unless `LEASE_PIPELINE_OUT`
