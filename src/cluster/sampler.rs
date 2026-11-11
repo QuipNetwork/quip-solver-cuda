@@ -377,6 +377,7 @@ fn sample_error(error: ClusterDeviceError) -> SampleError {
         ClusterDeviceError::Driver(e) => crate::sampler::SampleError::from(e).into(),
         ClusterDeviceError::Cuda(e) => SampleError::DeviceFault(e.to_string()),
         ClusterDeviceError::Parameter(e) => SampleError::DeviceFault(e.into()),
+        e @ ClusterDeviceError::MemoryPoolsUnsupported => SampleError::DeviceFault(e.to_string()),
         ClusterDeviceError::Spin(e) => SampleError::DeviceFault(e.to_string()),
     }
 }

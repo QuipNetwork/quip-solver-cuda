@@ -53,6 +53,9 @@ impl Default for ClusterSchedule {
 /// Admission, compilation, allocation, launch, or result failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterDeviceError {
+    /// Cluster jobs require allocations that do not synchronize resident SA.
+    #[error("cluster requires CUDA memory pools for asynchronous allocation; use quip-cuda-sa on this device")]
+    MemoryPoolsUnsupported,
     /// The caller stopped this job between synchronized launches.
     #[error("cluster job cancelled")]
     Cancelled,
@@ -174,6 +177,9 @@ pub(crate) struct ClusterKernel {
 impl ClusterKernel {
     pub(crate) fn load(device_index: usize) -> Result<Self, ClusterDeviceError> {
         let ctx = CudaContext::new(device_index)?;
+        // Synchronous allocation can wait for the persistent SA kernel.
+        // Refuse before JIT or stream creation, while SA is still idle.
+        check_async_alloc(ctx.has_async_alloc())?;
         let arch = device_arch(&ctx);
         let module = jit_cache::load_or_compile(
             &ctx,
@@ -515,6 +521,14 @@ fn attribute(ctx: &CudaContext, attr: CUdevice_attribute) -> Result<usize, Clust
         .map_err(|_| ClusterDeviceError::Parameter("negative CUDA attribute"))
 }
 
+fn check_async_alloc(has_async_alloc: bool) -> Result<(), ClusterDeviceError> {
+    if has_async_alloc {
+        Ok(())
+    } else {
+        Err(ClusterDeviceError::MemoryPoolsUnsupported)
+    }
+}
+
 fn check_shared(graph: &PreparedGraph, budget: usize) -> Result<(), ClusterDeviceError> {
     let requested = graph
         .dynamic_shared_bytes()
@@ -600,6 +614,15 @@ mod tests {
     use super::*;
     use crate::capacity::DeviceLimits;
     use crate::cluster::{Model, Motifs, Weights};
+
+    #[test]
+    fn cluster_requires_memory_pools() {
+        assert!(matches!(
+            check_async_alloc(false),
+            Err(ClusterDeviceError::MemoryPoolsUnsupported)
+        ));
+        assert!(check_async_alloc(true).is_ok());
+    }
 
     #[test]
     fn params_match_cuda_value_layout() {
