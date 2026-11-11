@@ -345,6 +345,17 @@ fn off_grid_graph_runs_on_f32() {
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn real_chunked_fields_keep_fractional_couplings_with_spill() {
+    real_chunked_fields_keep_fractional_couplings_with_spill_case(256);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn real_chunked_fields_keep_fractional_couplings_with_spill_long() {
+    real_chunked_fields_keep_fractional_couplings_with_spill_case(4096);
+}
+
+fn real_chunked_fields_keep_fractional_couplings_with_spill_case(sweeps: usize) {
     let mut device = device();
     device.msa_shared_spins_cap = Some(4);
     let nodes = 24;
@@ -363,6 +374,7 @@ fn real_chunked_fields_keep_fractional_couplings_with_spill() {
     {
         let params = SampleParams {
             num_reads,
+            num_sweeps: sweeps,
             ..params()
         };
         let reads = sample_one_real(&device, &graph, &params).unwrap();

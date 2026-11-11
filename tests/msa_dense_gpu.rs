@@ -510,6 +510,18 @@ fn dense_and_sparse_weighted_energies_match_host() {
 #[serial]
 #[ignore = "requires a CUDA GPU"]
 fn dense_weighted_planted_mattis_multi_tile() {
+    dense_weighted_planted_mattis_multi_tile_case(64);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_weighted_planted_mattis_multi_tile_long() {
+    dense_weighted_planted_mattis_multi_tile_case(1024);
+}
+
+fn dense_weighted_planted_mattis_multi_tile_case(sweeps: usize) {
     let device = open();
     let n = 600;
     for precision in [Precision::Int8, Precision::Int32, Precision::Float32] {
@@ -541,7 +553,7 @@ fn dense_weighted_planted_mattis_multi_tile() {
             assert_eq!(Precision::from_plan(plan, false), precision);
         }
         let reads =
-            sample_one_real_forced(&device, &graph, &params(&device, 1_024), Storage::Dense)
+            sample_one_real_forced(&device, &graph, &params(&device, sweeps), Storage::Dense)
                 .unwrap();
         assert_eq!(last_storage(&device), Some(Storage::Dense));
         if precision == Precision::Float32 {

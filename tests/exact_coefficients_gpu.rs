@@ -281,15 +281,15 @@ fn assert_all_ground(reads: &[quip_solver_cuda::SamplerResult], ground: i64, wha
 fn msa_reaches_ground_states_at_degree_21_and_62_on_every_lane() {
     for nodes in [22, 63] {
         for lane in [None, Some(MsaLane::I32), Some(MsaLane::F32)] {
-            assert_chunked_ground(nodes, lane);
+            assert_chunked_ground(nodes, lane, 4096);
         }
     }
 }
 
-fn assert_chunked_ground(nodes: usize, lane: Option<MsaLane>) {
+fn assert_chunked_ground(nodes: usize, lane: Option<MsaLane>, sweeps: usize) {
     let params = SampleParams {
         num_reads: 64,
-        num_sweeps: 4096,
+        num_sweeps: sweeps,
         seed: 3,
         ..SampleParams::default()
     };
@@ -312,21 +312,21 @@ fn assert_chunked_ground(nodes: usize, lane: Option<MsaLane>) {
 }
 
 macro_rules! chunked_ground_tests {
-    ($($name:ident => ($nodes:literal, $lane:expr)),+ $(,)?) => {
+    ($($name:ident => ($nodes:literal, $lane:expr, $sweeps:literal)),+ $(,)?) => {
         $(#[test]
         #[serial]
         #[ignore = "requires CUDA GPU; run with make test-gpu"]
-        fn $name() { assert_chunked_ground($nodes, $lane); })+
+        fn $name() { assert_chunked_ground($nodes, $lane, $sweeps); })+
     };
 }
 
 chunked_ground_tests! {
-    msa_degree_21_unit_ci => (22, None),
-    msa_degree_21_i32_ci => (22, Some(MsaLane::I32)),
-    msa_degree_21_f32_ci => (22, Some(MsaLane::F32)),
-    msa_degree_62_unit_ci => (63, None),
-    msa_degree_62_i32_ci => (63, Some(MsaLane::I32)),
-    msa_degree_62_f32_ci => (63, Some(MsaLane::F32)),
+    msa_degree_21_unit_ci => (22, None, 4096),
+    msa_degree_21_i32_ci => (22, Some(MsaLane::I32), 4096),
+    msa_degree_21_f32_ci => (22, Some(MsaLane::F32), 4096),
+    msa_degree_62_unit_ci => (63, None, 4096),
+    msa_degree_62_i32_ci => (63, Some(MsaLane::I32), 512),
+    msa_degree_62_f32_ci => (63, Some(MsaLane::F32), 1024),
 }
 
 #[test]
