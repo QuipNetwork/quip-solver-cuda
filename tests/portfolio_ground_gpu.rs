@@ -82,9 +82,11 @@ fn portfolio_fixture_manifest_is_complete() {
     assert_eq!(files, names);
 }
 
-fn verify_portfolio(kernel: KernelKind, forced: bool) {
-    let states = ground_states();
+fn verify_portfolio(kernel: KernelKind, forced: bool, count: usize, sweeps: usize) {
+    let mut states = ground_states();
     assert_eq!(states.len(), 108);
+    states.sort_by(|a, b| (a.n, &a.file).cmp(&(b.n, &b.file)));
+    states.truncate(count);
     let device = CudaDevice::open_with_nodes(0, kernel, 56).unwrap();
     let params = SampleParams {
         num_reads: if kernel == KernelKind::Msa {
@@ -92,8 +94,8 @@ fn verify_portfolio(kernel: KernelKind, forced: bool) {
         } else {
             256
         },
-        num_sweeps: 8192,
-        sweeps_per_beta: 128,
+        num_sweeps: sweeps,
+        sweeps_per_beta: (sweeps / 64).max(1),
         seed: 42,
         ..SampleParams::default()
     };
@@ -140,8 +142,8 @@ fn verify_portfolio(kernel: KernelKind, forced: bool) {
         verified += 1;
     }
     assert_eq!(
-        verified, 108,
-        "all portfolio models must be proven and exercised"
+        verified, count,
+        "all selected portfolio models must be proven and exercised"
     );
     assert!(
         failures.is_empty(),
@@ -151,32 +153,67 @@ fn verify_portfolio(kernel: KernelKind, forced: bool) {
     );
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn portfolio_dense_reaches_qubo_ground_state() {
-    verify_portfolio(KernelKind::Msa, false);
+    verify_portfolio(KernelKind::Msa, false, 108, 8192);
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn portfolio_dense_path_forced() {
-    verify_portfolio(KernelKind::Msa, true);
+    verify_portfolio(KernelKind::Msa, true, 108, 8192);
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn sa_reaches_portfolio_ground_states() {
-    verify_portfolio(KernelKind::Sa, false);
+    verify_portfolio(KernelKind::Sa, false, 108, 8192);
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn gibbs_reaches_portfolio_ground_states() {
-    verify_portfolio(KernelKind::Gibbs, false);
+    verify_portfolio(KernelKind::Gibbs, false, 108, 8192);
+}
+
+#[cfg(feature = "long-tests")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_dense_path_forced_reaches_portfolio_ground_states() {
+    verify_portfolio(KernelKind::Gibbs, true, 108, 8192);
 }
 
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn gibbs_dense_path_forced_reaches_portfolio_ground_states() {
-    verify_portfolio(KernelKind::Gibbs, true);
+fn portfolio_dense_reaches_qubo_ground_state_ci() {
+    verify_portfolio(KernelKind::Msa, false, 3, 128);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn portfolio_dense_path_forced_ci() {
+    verify_portfolio(KernelKind::Msa, true, 3, 128);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_reaches_portfolio_ground_states_ci() {
+    verify_portfolio(KernelKind::Sa, false, 3, 128);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_reaches_portfolio_ground_states_ci() {
+    verify_portfolio(KernelKind::Gibbs, false, 3, 128);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_dense_path_forced_reaches_portfolio_ground_states_ci() {
+    verify_portfolio(KernelKind::Gibbs, true, 3, 128);
 }

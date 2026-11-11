@@ -1,5 +1,7 @@
 //! Fixed-wall-time measurements through the production MSA binary and session.
 
+#![cfg(feature = "long-tests")]
+
 use super::{ensure_built, lease, permissive_target, profile_bin, target, Session};
 use quip_solver_core::quip_proto::v1::{coord_msg, Cancel, EdgeList, Topology};
 use quip_solver_core::quip_protocol::lease::{verify_lease_result, TopologyView};

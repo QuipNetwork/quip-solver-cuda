@@ -60,9 +60,24 @@ fn gibbs_bench_model_serves_real_coefficients() {
     assert!((best - ground).abs() < 1e-10, "{best} != {ground}");
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn gibbs_real_route_reaches_planted_ground_state() {
+    gibbs_real_route_reaches_planted_ground_state_case(&params());
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_real_route_reaches_planted_ground_state_ci() {
+    gibbs_real_route_reaches_planted_ground_state_case(&SampleParams {
+        num_sweeps: 64,
+        num_reads: 32,
+        ..params()
+    });
+}
+
+fn gibbs_real_route_reaches_planted_ground_state_case(params: &SampleParams) {
     let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 4800).unwrap();
     let edges: Vec<_> = (0..64)
         .flat_map(|u| (1..=10).map(move |d| (u, (u + d) % 64)))
@@ -77,14 +92,14 @@ fn gibbs_real_route_reaches_planted_ground_state() {
     let fractional = IsingGraph::new(vec![0.100_000_01, -0.200_000_01], vec![-0.5], vec![(0, 1)]);
     for (graph, planted) in [(graph, vec![-1; 64]), (fractional, vec![1; 2])] {
         let ground = energy(&planted, &graph);
-        assert!(sample_one(&device, &graph, &params(), KernelKind::Gibbs).is_err());
+        assert!(sample_one(&device, &graph, params, KernelKind::Gibbs).is_err());
         for metropolis in [false, true] {
             device.gibbs_metropolis = metropolis;
             let mut baseline = None;
             for cap in [None, Some(0), Some(1), Some(64)] {
                 device.gibbs_shared_spins_cap = cap;
-                let reads = sample_one_real(&device, &graph, &params()).unwrap();
-                assert_eq!(reads.len(), params().num_reads);
+                let reads = sample_one_real(&device, &graph, params).unwrap();
+                assert_eq!(reads.len(), params.num_reads);
                 assert!(reads.iter().any(|read| read.spins == planted));
                 assert!(reads
                     .iter()
@@ -100,7 +115,7 @@ fn gibbs_real_route_reaches_planted_ground_state() {
                 }
             }
         }
-        bench_many_real(&device, &graph, &params(), 1).unwrap();
+        bench_many_real(&device, &graph, params, 1).unwrap();
     }
 }
 
@@ -245,9 +260,23 @@ fn real_bench_refuses_f32_beta_overflow() {
     assert!(message.contains("f32"), "{message}");
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn weighted_int8_matches_int32() {
+    weighted_int8_matches_int32_case(&params());
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn weighted_int8_matches_int32_ci() {
+    weighted_int8_matches_int32_case(&SampleParams {
+        num_sweeps: 16,
+        ..params()
+    });
+}
+
+fn weighted_int8_matches_int32_case(params: &SampleParams) {
     let mut device = device();
     device.msa_shared_spins_cap = Some(4);
     // Cover both the single-pass and chunked weighted hot loops, with spill.
@@ -265,15 +294,9 @@ fn weighted_int8_matches_int32() {
             plan(KernelKind::Msa, &graph).unwrap().path,
             CoefficientPath::WeightedInt8
         );
-        let (narrow, _) = bench_one(&device, &graph, &params(), KernelKind::Msa, None).unwrap();
-        let (wide, _) = bench_one(
-            &device,
-            &graph,
-            &params(),
-            KernelKind::Msa,
-            Some(MsaLane::I32),
-        )
-        .unwrap();
+        let (narrow, _) = bench_one(&device, &graph, params, KernelKind::Msa, None).unwrap();
+        let (wide, _) =
+            bench_one(&device, &graph, params, KernelKind::Msa, Some(MsaLane::I32)).unwrap();
         assert_eq!(
             narrow.iter().map(|r| &r.spins).collect::<Vec<_>>(),
             wide.iter().map(|r| &r.spins).collect::<Vec<_>>(),

@@ -6,6 +6,7 @@
 //! Run them on a GPU host: `cargo test -p quip-solver-cuda -- --ignored`.
 
 use quip_solver_conformance::driver::{drive_miner, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER};
+#[cfg(feature = "long-tests")]
 use quip_solver_conformance::solve::{drive_solve, CaseOutcome};
 use quip_solver_core::quip_protocol::session::PROTOCOL_VERSION;
 use serial_test::serial;
@@ -17,6 +18,7 @@ use common::{ensure_built, profile_bin};
 /// Run the `--solve` gate on `bin` and require, beyond overall conformance,
 /// that the linear-schedule case and each named limit case passed rather than
 /// being skipped: the gate skips a case the binary does not advertise.
+#[cfg(feature = "long-tests")]
 async fn assert_passes_solve_gate(bin: &str, limit_cases: &[&str]) {
     ensure_built(&[bin]);
     let report = drive_solve(&profile_bin(bin)).await;
@@ -49,6 +51,7 @@ async fn quip_cuda_sa_passes_conformance() {
     assert!(report.is_conformant(), "{}", report.summary());
 }
 
+#[cfg(feature = "long-tests")]
 #[tokio::test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
@@ -85,6 +88,7 @@ async fn quip_cuda_msa_passes_conformance() {
     assert!(lease.credit_refunded);
 }
 
+#[cfg(feature = "long-tests")]
 #[tokio::test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
@@ -123,6 +127,7 @@ async fn quip_cuda_gibbs_passes_conformance() {
     assert!(report.is_conformant(), "{}", report.summary());
 }
 
+#[cfg(feature = "long-tests")]
 #[tokio::test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]

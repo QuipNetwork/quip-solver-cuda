@@ -56,31 +56,50 @@ fn sa_global_matches_local_samples() {
     }
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn sa_threshold_selects_instantiation_and_runs() {
+    sa_threshold_selects_instantiation_and_runs_case(
+        &SampleParams {
+            num_sweeps: 8192,
+            sweeps_per_beta: 128,
+            ..params()
+        },
+        0,
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_threshold_runs_in_ci() {
+    sa_threshold_selects_instantiation_and_runs_case(
+        &SampleParams {
+            num_reads: 4,
+            num_sweeps: 128,
+            sweeps_per_beta: 2,
+            ..params()
+        },
+        -1,
+    );
+}
+
+fn sa_threshold_selects_instantiation_and_runs_case(params: &SampleParams, field: i32) {
     let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 5001).unwrap();
-    let params = SampleParams {
-        num_sweeps: 8192,
-        sweeps_per_beta: 128,
-        ..params()
-    };
     for n in [5000, 5001] {
         let mut graph = circulant(n, false);
         graph.j.fill(-1.0);
-        let reads = sample_one(&device, &graph, &params, KernelKind::Sa).unwrap();
-        assert_eq!(reads.len(), 256);
-        // Each of the N * 10 edges contributes at least -1. Aligned spins attain it.
-        let ground_milli = -i64::try_from(n).unwrap() * 10 * 1000;
+        graph.h.fill(f64::from(field));
+        let reads = sample_one(&device, &graph, params, KernelKind::Sa).unwrap();
+        assert_eq!(reads.len(), params.num_reads);
+        // Aligned spins attain the lower bound of every bond and field.
+        let ground_milli = -i64::try_from(n).unwrap() * (10 + i64::from(field).abs()) * 1000;
         let mut reached_ground = false;
         for r in reads {
             assert_eq!(r.spins.len(), n);
             assert!(r.spins.iter().all(|&spin| spin == -1 || spin == 1));
-            let host_energy: i64 = graph
-                .edges
-                .iter()
-                .map(|&(u, v)| -i64::from(r.spins[u]) * i64::from(r.spins[v]) * 1000)
-                .sum();
+            let host_energy =
+                quip_protocol::scoring::energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges);
             assert_eq!(r.energy_milli, host_energy);
             if host_energy == ground_milli {
                 assert!(r.spins.iter().all(|&spin| spin == r.spins[0]));

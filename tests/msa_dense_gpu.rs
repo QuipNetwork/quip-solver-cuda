@@ -103,13 +103,25 @@ fn ground_energy(graph: &IsingGraph) -> i64 {
     best
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
 fn dense_unit_finds_brute_force_ground_state() {
+    unit_ground_states(20, 10);
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_unit_finds_brute_force_ground_state_ci() {
+    unit_ground_states(16, 2);
+}
+
+fn unit_ground_states(nodes: usize, seeds: u64) {
     let device = open();
-    for seed in 1..=10 {
-        let graph = sk(20, seed);
+    for seed in 1..=seeds {
+        let graph = sk(nodes, seed);
         let ground = ground_energy(&graph);
         let reads = sample_one(&device, &graph, &params(&device, 4_096), KernelKind::Msa).unwrap();
         assert_eq!(reads.len(), msa_device_reads(&device.limits));
@@ -403,10 +415,10 @@ fn ground_real_energy(graph: &IsingGraph) -> f64 {
     scored
 }
 
-fn weighted_ground_states(path: CoefficientPath) {
+fn weighted_ground_states(path: CoefficientPath, nodes: usize, seeds: u64) {
     let device = open();
-    for seed in 1..=10 {
-        let graph = weighted_graph(20, seed, path);
+    for seed in 1..=seeds {
+        let graph = weighted_graph(nodes, seed, path);
         if path == CoefficientPath::Float32 {
             let ground = ground_real_energy(&graph);
             let reads = sample_one_real(&device, &graph, &params(&device, 4_096)).unwrap();
@@ -430,25 +442,27 @@ fn weighted_ground_states(path: CoefficientPath) {
     }
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
 fn dense_int8_finds_brute_force_ground_state() {
-    weighted_ground_states(CoefficientPath::WeightedInt8);
+    weighted_ground_states(CoefficientPath::WeightedInt8, 20, 10);
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
 fn dense_i32_finds_brute_force_ground_state() {
-    weighted_ground_states(CoefficientPath::Wide);
+    weighted_ground_states(CoefficientPath::Wide, 20, 10);
 }
 
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
 fn dense_f32_real_finds_brute_force_ground_state() {
-    weighted_ground_states(CoefficientPath::Float32);
+    weighted_ground_states(CoefficientPath::Float32, 20, 10);
 }
 
 fn check_weighted_energies(device: &CudaDevice, graph: &IsingGraph, storage: Storage) {
@@ -555,4 +569,18 @@ fn dense_weighted_planted_mattis_multi_tile() {
             );
         }
     }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_int8_finds_brute_force_ground_state_ci() {
+    weighted_ground_states(CoefficientPath::WeightedInt8, 16, 2);
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_i32_finds_brute_force_ground_state_ci() {
+    weighted_ground_states(CoefficientPath::Wide, 16, 2);
 }

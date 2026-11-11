@@ -274,39 +274,59 @@ fn assert_all_ground(reads: &[quip_solver_cuda::SamplerResult], ground: i64, wha
 /// Degree 21 is the first two-pass spin and degree 62 the sparse ceiling. Every
 /// lane must reach the ground state, which a wrong carry in the chunked
 /// counter or the chunked weighted field would miss.
+#[cfg(feature = "long-tests")]
 #[test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
 fn msa_reaches_ground_states_at_degree_21_and_62_on_every_lane() {
-    let p = SampleParams {
+    for nodes in [22, 63] {
+        for lane in [None, Some(MsaLane::I32), Some(MsaLane::F32)] {
+            assert_chunked_ground(nodes, lane);
+        }
+    }
+}
+
+fn assert_chunked_ground(nodes: usize, lane: Option<MsaLane>) {
+    let params = SampleParams {
         num_reads: 64,
         num_sweeps: 4096,
         seed: 3,
         ..SampleParams::default()
     };
-    for n in [22, 63] {
-        let unit = ferro_complete(n, 1.0, 1.0);
-        let (reads, _) =
-            bench_one(device(KernelKind::Msa), &unit, &p, KernelKind::Msa, None).unwrap();
-        assert_all_ground(&reads, ferro_ground_milli(n, 1, 1), &format!("unit K_{n}"));
+    let (coupling, field) = if lane.is_some() { (2, 3) } else { (1, 1) };
+    let graph = ferro_complete(nodes, f64::from(coupling), f64::from(field));
+    let (reads, _) = bench_one(
+        device(KernelKind::Msa),
+        &graph,
+        &params,
+        KernelKind::Msa,
+        lane,
+    )
+    .unwrap();
+    assert_eq!(reads.len(), params.num_reads);
+    assert_all_ground(
+        &reads,
+        ferro_ground_milli(nodes, i64::from(coupling), i64::from(field)),
+        &format!("{lane:?} K_{nodes}"),
+    );
+}
 
-        let weighted = ferro_complete(n, 2.0, 3.0);
-        for lane in [MsaLane::I32, MsaLane::F32] {
-            let (reads, _) = bench_one(
-                device(KernelKind::Msa),
-                &weighted,
-                &p,
-                KernelKind::Msa,
-                Some(lane),
-            )
-            .unwrap();
-            assert_all_ground(
-                &reads,
-                ferro_ground_milli(n, 2, 3),
-                &format!("{lane:?} K_{n}"),
-            );
-        }
-    }
+macro_rules! chunked_ground_tests {
+    ($($name:ident => ($nodes:literal, $lane:expr)),+ $(,)?) => {
+        $(#[test]
+        #[serial]
+        #[ignore = "requires CUDA GPU; run with make test-gpu"]
+        fn $name() { assert_chunked_ground($nodes, $lane); })+
+    };
+}
+
+chunked_ground_tests! {
+    msa_degree_21_unit_ci => (22, None),
+    msa_degree_21_i32_ci => (22, Some(MsaLane::I32)),
+    msa_degree_21_f32_ci => (22, Some(MsaLane::F32)),
+    msa_degree_62_unit_ci => (63, None),
+    msa_degree_62_i32_ci => (63, Some(MsaLane::I32)),
+    msa_degree_62_f32_ci => (63, Some(MsaLane::F32)),
 }
 
 #[test]

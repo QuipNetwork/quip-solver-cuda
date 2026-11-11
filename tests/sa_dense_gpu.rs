@@ -183,22 +183,43 @@ fn sa_dense_matches_sparse_integer_samples() {
     }
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn sa_dense_planted_ground_state_every_precision() {
-    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, 600).unwrap();
-    let params = SampleParams {
-        num_sweeps: 1024,
-        sweeps_per_beta: 16,
-        ..params()
-    };
+    sa_dense_planted_ground_state_every_precision_case(
+        600,
+        &SampleParams {
+            num_sweeps: 1024,
+            sweeps_per_beta: 16,
+            ..params()
+        },
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_dense_planted_ground_state_ci() {
+    sa_dense_planted_ground_state_every_precision_case(
+        96,
+        &SampleParams {
+            num_reads: 32,
+            num_sweeps: 64,
+            sweeps_per_beta: 1,
+            ..params()
+        },
+    );
+}
+
+fn sa_dense_planted_ground_state_every_precision_case(nodes: usize, params: &SampleParams) {
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Sa, nodes).unwrap();
     for precision in [
         Precision::Binary,
         Precision::Int8,
         Precision::Int32,
         Precision::Float32,
     ] {
-        let graph = complete(600, precision, true);
+        let graph = complete(nodes, precision, true);
         if precision != Precision::Float32 {
             let plan = coefficients::plan(KernelKind::Sa, &graph).unwrap();
             assert_eq!(
@@ -210,9 +231,9 @@ fn sa_dense_planted_ground_state_every_precision() {
                 }
             );
         }
-        let reads = sample_one_real_forced(&device, &graph, &params, Storage::Dense).unwrap();
+        let reads = sample_one_real_forced(&device, &graph, params, Storage::Dense).unwrap();
         assert_eq!(last_storage(&device), Some(Storage::Dense));
-        assert_eq!(reads.len(), 256);
+        assert_eq!(reads.len(), params.num_reads);
         if precision == Precision::Float32 {
             let ground = -graph.j.iter().map(|j| j.abs()).sum::<f64>();
             assert!(

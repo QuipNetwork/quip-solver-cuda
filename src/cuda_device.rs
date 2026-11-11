@@ -1003,6 +1003,7 @@ mod msa_weighted_gpu_tests {
     use super::CudaDevice;
     use crate::{capacity, KernelKind};
 
+    #[cfg(feature = "long-tests")]
     #[test]
     #[serial_test::serial]
     #[ignore = "requires a CUDA GPU"]
@@ -1039,14 +1040,7 @@ mod msa_weighted_gpu_tests {
                 .iter()
                 .any(|entry| entry.file_name().to_string_lossy().starts_with(name)));
         }
-        let weighted = device.msa_weighted.as_ref().expect("weighted MSA kernels");
-        for lane in [&weighted.i32, &weighted.f32, &weighted.int8, &weighted.real] {
-            assert!(
-                usize::try_from(lane.shared_size_bytes().expect("loaded weighted function"))
-                    .expect("nonnegative static shared memory")
-                    <= capacity::MSA_STATIC_SHARED_BYTES
-            );
-        }
+        assert_weighted_functions(&device);
 
         for kind in [KernelKind::Sa, KernelKind::Gibbs] {
             let device = CudaDevice::open_with_nodes(0, kind, 0).expect("non-MSA open");
@@ -1057,6 +1051,31 @@ mod msa_weighted_gpu_tests {
         }
         drop(std::fs::remove_dir_all(&dir));
         std::env::remove_var("QUIP_CUDA_CACHE");
+    }
+
+    fn assert_weighted_functions(device: &CudaDevice) {
+        let weighted = device.msa_weighted.as_ref().expect("weighted MSA kernels");
+        for lane in [&weighted.i32, &weighted.f32, &weighted.int8, &weighted.real] {
+            assert!(
+                usize::try_from(lane.shared_size_bytes().expect("loaded weighted function"))
+                    .expect("nonnegative static shared memory")
+                    <= capacity::MSA_STATIC_SHARED_BYTES
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "requires a CUDA GPU"]
+    fn msa_open_loads_weighted_lane_modules_ci() {
+        let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, capacity::MSA_DEFAULT_NODES)
+            .expect("default MSA device");
+        assert_eq!(device.max_nodes, capacity::MSA_DEFAULT_NODES);
+        assert_weighted_functions(&device);
+        for kind in [KernelKind::Sa, KernelKind::Gibbs] {
+            let device = CudaDevice::open_with_nodes(0, kind, 0).expect("non-MSA open");
+            assert!(device.msa_weighted.is_none());
+        }
     }
 }
 

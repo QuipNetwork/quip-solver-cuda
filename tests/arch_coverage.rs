@@ -10,7 +10,7 @@
 //!
 //! Needs the CUDA 12.9 toolkit (libnvrtc + ptxas) but no device — hence the
 //! ignore; CI and `make test-archs` run it inside the CI image with
-//! `--include-ignored`. Off that toolkit both tests skip, for the reasons on
+//! `--include-ignored`. Off that toolkit the compilation tests skip, for the reasons on
 //! [`skip_outside_ci`].
 
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
@@ -154,10 +154,10 @@ const KERNEL_VARIANTS: &[(&str, &str, usize, &[&str])] = &[
 /// Reports whether the caller must return without testing anything, and says
 /// so on stderr when it does.
 ///
-/// Both tests here measure what the *toolkit* accepts, so they only carry
+/// The compilation tests here measure what the *toolkit* accepts, so they only carry
 /// meaning on the pinned CUDA 12.9 one. A newer toolkit does not merely fail
 /// them, it misreports them. CUDA 13 dropped `sm_70` and `sm_72` and renamed
-/// `compute_101`, so [`every_supported_arch_compiles_and_assembles_every_kernel`]
+/// `compute_101`, so the supported-architecture matrix
 /// fails on three architectures while the kernels are fine, and
 /// [`floor_is_real_one_arch_below_fails`] passes for the wrong reason — NVRTC
 /// rejects `compute_62` as an unknown `-arch` value long before it can reject
@@ -230,27 +230,59 @@ fn compile_and_assemble(
     }
 }
 
-#[test]
-#[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
-fn every_supported_arch_compiles_and_assembles_every_kernel() {
-    if skip_outside_ci("every_supported_arch_compiles_and_assembles_every_kernel") {
+fn assert_kernel_variants(arch: i32, kernel: &str) {
+    if skip_outside_ci(&format!("{kernel} @ compute_{arch}")) {
         return;
     }
+    let mut checked = 0;
     let mut failures = Vec::new();
-    for &arch in SUPPORTED_ARCHS {
-        // Smallest realistic capacity for SA, the compiled-in default for
-        // Gibbs — the same shapes `CudaDevice::open_with_nodes` produces.
-        for &(name, src, nodes, defines) in KERNEL_VARIANTS {
-            if let Err(e) = compile_and_assemble(name, src, nodes, arch, defines) {
-                failures.push(e);
+    for &(name, src, nodes, defines) in KERNEL_VARIANTS {
+        if name.split('-').next() == Some(kernel) {
+            checked += 1;
+            if let Err(error) = compile_and_assemble(name, src, nodes, arch, defines) {
+                failures.push(error);
             }
         }
     }
-    assert!(
-        failures.is_empty(),
-        "supported-arch validation failed:\n{}",
-        failures.join("\n")
-    );
+    assert!(checked > 0, "no variants for {kernel}");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+macro_rules! architecture_tests {
+    ($($module:ident => $arch:literal),+ $(,)?) => {
+        #[test]
+        fn architecture_matrix_matches_support_contract() {
+            assert_eq!(&[$($arch),+], SUPPORTED_ARCHS);
+            for &(name, ..) in KERNEL_VARIANTS {
+                assert!(matches!(name.split('-').next(), Some("sa" | "gibbs" | "msa" | "screen")));
+            }
+        }
+
+        $(mod $module {
+            #[test]
+            #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
+            fn sa() { super::assert_kernel_variants($arch, "sa"); }
+
+            #[test]
+            #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
+            fn gibbs() { super::assert_kernel_variants($arch, "gibbs"); }
+
+            #[test]
+            #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
+            fn msa() { super::assert_kernel_variants($arch, "msa"); }
+
+            #[test]
+            #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
+            fn screen() { super::assert_kernel_variants($arch, "screen"); }
+        })+
+    };
+}
+
+architecture_tests! {
+    sm_70 => 70, sm_72 => 72, sm_75 => 75,
+    sm_80 => 80, sm_86 => 86, sm_87 => 87, sm_89 => 89,
+    sm_90 => 90, sm_100 => 100, sm_101 => 101, sm_103 => 103,
+    sm_120 => 120, sm_121 => 121,
 }
 
 #[test]

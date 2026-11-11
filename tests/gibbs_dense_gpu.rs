@@ -65,15 +65,29 @@ fn params() -> SampleParams {
     }
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn gibbs_dense_planted_ground_state_every_precision() {
-    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 600).unwrap();
-    let params = SampleParams {
-        num_sweeps: 64,
-        sweeps_per_beta: 1,
-        ..params()
-    };
+    gibbs_dense_planted_ground_state_every_precision_case(600, &params());
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_dense_planted_ground_state_ci() {
+    gibbs_dense_planted_ground_state_every_precision_case(
+        96,
+        &SampleParams {
+            num_reads: 32,
+            num_sweeps: 64,
+            sweeps_per_beta: 1,
+            ..params()
+        },
+    );
+}
+
+fn gibbs_dense_planted_ground_state_every_precision_case(nodes: usize, params: &SampleParams) {
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, nodes).unwrap();
     for metropolis in [false, true] {
         device.gibbs_metropolis = metropolis;
         for precision in [
@@ -82,7 +96,7 @@ fn gibbs_dense_planted_ground_state_every_precision() {
             Precision::Int32,
             Precision::Float32,
         ] {
-            let graph = complete(600, precision, true);
+            let graph = complete(nodes, precision, true);
             if precision != Precision::Float32 {
                 let plan = coefficients::plan(KernelKind::Gibbs, &graph).unwrap();
                 assert_eq!(
@@ -94,7 +108,7 @@ fn gibbs_dense_planted_ground_state_every_precision() {
                     }
                 );
             }
-            let reads = sample_one_real_forced(&device, &graph, &params, Storage::Dense).unwrap();
+            let reads = sample_one_real_forced(&device, &graph, params, Storage::Dense).unwrap();
             assert_eq!(last_storage(&device), Some(Storage::Dense));
             assert_eq!(
                 last_gibbs_variant(&device),
@@ -104,7 +118,7 @@ fn gibbs_dense_planted_ground_state_every_precision() {
                     Precision::Float32 => "gibbs-f32-dense",
                 })
             );
-            assert_eq!(reads.len(), 256);
+            assert_eq!(reads.len(), params.num_reads);
             if precision == Precision::Float32 {
                 let ground = -graph.j.iter().map(|j| j.abs()).sum::<f64>();
                 assert!(
@@ -185,10 +199,28 @@ fn gibbs_dense_model_past_limit_refused() {
     );
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn gibbs_dense_spill_matches_shared_every_precision() {
-    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 600).unwrap();
+    gibbs_dense_spill_matches_shared_every_precision_case(600, &params());
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gibbs_dense_spill_matches_shared_ci() {
+    gibbs_dense_spill_matches_shared_every_precision_case(
+        48,
+        &SampleParams {
+            num_reads: 8,
+            num_sweeps: 4,
+            ..params()
+        },
+    );
+}
+
+fn gibbs_dense_spill_matches_shared_every_precision_case(nodes: usize, params: &SampleParams) {
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, nodes).unwrap();
     for metropolis in [false, true] {
         device.gibbs_metropolis = metropolis;
         for precision in [
@@ -197,15 +229,14 @@ fn gibbs_dense_spill_matches_shared_every_precision() {
             Precision::Int32,
             Precision::Float32,
         ] {
-            let graph = complete(600, precision, false);
+            let graph = complete(nodes, precision, false);
             device.gibbs_shared_spins_cap = None;
-            let baseline =
-                sample_one_real_forced(&device, &graph, &params(), Storage::Dense).unwrap();
-            assert_eq!(baseline.len(), 256);
-            for cap in [0, 300, 599] {
+            let baseline = sample_one_real_forced(&device, &graph, params, Storage::Dense).unwrap();
+            assert_eq!(baseline.len(), params.num_reads);
+            for cap in [0, nodes / 2, nodes - 1] {
                 device.gibbs_shared_spins_cap = Some(cap);
                 let reads =
-                    sample_one_real_forced(&device, &graph, &params(), Storage::Dense).unwrap();
+                    sample_one_real_forced(&device, &graph, params, Storage::Dense).unwrap();
                 assert_eq!(reads.len(), baseline.len());
                 for (expected, actual) in baseline.iter().zip(&reads) {
                     assert_eq!(
