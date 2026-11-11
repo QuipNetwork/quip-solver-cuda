@@ -118,7 +118,7 @@ impl Session {
         backend_toml: &str,
         command: impl FnOnce(&str) -> Command,
     ) -> Self {
-        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("socket directory");
+        let directory = tempfile::tempdir().expect("socket directory");
         let path = directory.path().join("coord.sock");
         let listener = UnixListener::bind(&path).expect("bind test coordinator");
         let (send, receive) = oneshot::channel();

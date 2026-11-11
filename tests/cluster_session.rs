@@ -1044,7 +1044,7 @@ mod gpu {
     #[serial]
     async fn sc7_family_conformance_records_hardware() {
         hardware();
-        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let socket = format!("unix://{}", directory.path().join("sc7.sock").display());
         let report = drive_miner_family(BIN, &[], &socket).await;
         eprintln!("{}", report.summary());
