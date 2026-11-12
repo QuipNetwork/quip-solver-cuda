@@ -446,7 +446,7 @@ pub struct FlowRun {
 }
 
 // CPU-12 otsuka_sampler.rs:68-85: counted little-endian TLV sections.
-fn section(metadata: &[u8], kind: u16) -> Option<&[u8]> {
+pub(crate) fn section(metadata: &[u8], kind: u16) -> Option<&[u8]> {
     let (count, mut rest) = metadata.split_first_chunk::<2>()?;
     for _ in 0..u16::from_le_bytes(*count) {
         let (head, tail) = rest.split_first_chunk::<6>()?;

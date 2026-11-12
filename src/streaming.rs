@@ -333,7 +333,7 @@ fn score_threads_from(value: Option<&str>) -> usize {
 }
 
 /// [`score_threads_from`] over the real environment, read once.
-fn score_threads() -> usize {
+pub(crate) fn score_threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| score_threads_from(std::env::var("QUIP_SCORE_THREADS").ok().as_deref()))
 }

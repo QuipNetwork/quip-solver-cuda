@@ -1012,6 +1012,7 @@ dependencies = [
 name = "quip-solver-cuda"
 version = "0.3.6-rc2"
 dependencies = [
+ "blake3",
  "clap",
  "cudarc",
  "nvml-wrapper",
