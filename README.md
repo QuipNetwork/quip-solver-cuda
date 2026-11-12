@@ -225,6 +225,18 @@ the job seed. The archived research run used another tile order and a seed
 from the nonce, and a comparison with the archived results is statistical,
 not read by read.
 
+Every sweep but the last of an anneal leaves one node out, chosen afresh each
+sweep. The kernels accept a flat move (`ΔE = 0`) without a draw, so on a model
+with no linear field a sweep that visited every node the same way each time
+moved the domain walls of a chain in step, and a read kept the energy of its
+random start (QUI-1980). `quip-cuda-sa` draws the node from the thread's
+stream. The sparse `quip-cuda-msa` kernel takes it per replica word from the
+high half of the hash that already gives the sweep's row offset. The dense
+kernel and the lease screen take one node for all replicas from the same kind
+of hash. A model of one node leaves none out. `tests/zero_field_gpu.rs` runs a
+zero-field ring and a zero-field Max-Cut lattice through `--solve` on both
+binaries.
+
 ## Lease screening (`quip-cuda-msa`)
 
 MSA accepts coordinator salt leases and screens each salt before a full solve.

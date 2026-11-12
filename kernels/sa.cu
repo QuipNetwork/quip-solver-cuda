@@ -100,6 +100,21 @@ static_assert(sizeof(coef_t) == 4, "wide build uses i32 coefficients");
 
 extern "C" {
 
+// "No node": the value that makes a sweep leave no node out.
+#define SA_NO_SIT_OUT 0xFFFFFFFFu
+
+// The node in [0, n) that one sweep leaves out, from one uniform draw.
+//
+// Flat moves are always accepted and a sweep visits the nodes in index order.
+// If every sweep visited every node, each sweep would shift every domain wall
+// of a zero-field chain one site the same way and no two walls would ever
+// meet. A wall that reaches the node left out stays where it is for that
+// sweep, and the wall behind it catches up. Same rule as quip-solver-cpu's
+// sampler_core.rs (QUI-1980). A model of fewer than two nodes leaves none out.
+__device__ __forceinline__ unsigned int sit_out_node(unsigned int draw, int n) {
+    return n < 2 ? SA_NO_SIT_OUT : __umulhi(draw, (unsigned int)n);
+}
+
 // Simple xorshift32 RNG
 __device__ unsigned int xorshift32(unsigned int &state) {
     unsigned int x = state;
@@ -434,7 +449,19 @@ __global__ void cuda_sa_self_feeding(
                 for (int sweep = 0;
                      sweep < sweeps_per_beta;
                      sweep++) {
+                    // One draw per sweep picks the node that sits it out.
+                    // The last sweep of the anneal leaves none out, so every
+                    // node is settled at the coldest rung; the draw is made
+                    // either way.
+                    const unsigned int sit_out_draw = xorshift32(rng_state);
+                    const bool last_sweep =
+                        beta_idx == num_betas - 1 && sweep == sweeps_per_beta - 1;
+                    const unsigned int skip =
+                        last_sweep ? SA_NO_SIT_OUT : sit_out_node(sit_out_draw, N);
                     for (int var = 0; var < N; var++) {
+                        if ((unsigned int)var == skip) {
+                            continue;
+                        }
                         delta_t de =
 #ifdef QUIP_SA_GLOBAL_STATE
                             delta_energy[(long long)var * total_threads + global_tid];
