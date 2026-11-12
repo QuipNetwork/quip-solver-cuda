@@ -7,6 +7,10 @@
 //! its reads, rescores them exactly, and forwards the result. The GPU keeps
 //! running the next jobs while the host descends. Lease salts go to the
 //! inner sampler without descent.
+//!
+//! The descent never fails a job. When it cannot run, or its result fails a
+//! check, the job logs a warning and returns the raw kernel reads. Only a
+//! cancelled watermark changes the outcome.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
@@ -14,7 +18,7 @@ use std::time::Instant;
 
 use quip_protocol::scoring::energy_milli;
 use quip_solver_core::families::{Declaration, FamilyClaim, FamilyContext};
-use quip_solver_core::ising_generators::ice::{CHARGED_ICE_V1, ICE_CHARGE_RECIPE};
+use quip_solver_core::ising_generators::ice::CHARGED_ICE_V1;
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleError, SampleParams, Sampler, SamplerResult, StreamJob,
     StreamOutcome, StreamResult, WarmStreamJob,
@@ -23,16 +27,16 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use super::greedy::DescentError;
 use super::tiles::instance_tiles;
-use super::{descend, Plan, POLICY_ID};
+use super::{descend, Plan, PlanError, POLICY_ID};
 
 /// The stable id of this binary (FAM-60).
 pub const MSA_DESCENT_SOLVER_ID: &str = "quip-cuda-msa-descent/1";
 
-/// The binary accepts explicit `quip/charged-ice@1` jobs of the `ice-charge`
-/// recipe. It generates no family work.
+/// The binary accepts explicit `quip/charged-ice@1` jobs with every valid
+/// parameter set. It generates no family work.
 const ACCEPTED: &[FamilyClaim] = &[FamilyClaim {
     revisions: &[CHARGED_ICE_V1],
-    only_params: &[ICE_CHARGE_RECIPE.params],
+    only_params: &[],
 }];
 
 /// The inner MSA sampler with the `msa-nat-loop/1` descent after each job.
@@ -49,14 +53,14 @@ impl<S> MsaDescentSampler<S> {
     }
 }
 
-/// The metadata tiles of a selected family job: a `quip/charged-ice@1` job
-/// with the `ice-charge` recipe parameters. `None` for every other job,
-/// whose tiles are then recovered from the couplings.
+/// The metadata tiles of a `quip/charged-ice@1` job, with any parameters,
+/// checked against the job graph. `None` for every other job, whose tiles
+/// are then recovered from the couplings.
 ///
 /// # Errors
 ///
-/// [`SampleError::Declined`] when a selected instance does not match the job
-/// graph or its tile section is malformed.
+/// [`SampleError::Declined`] when a charged-ice instance does not match the
+/// job graph or its tile section is malformed.
 pub fn family_tiles(
     graph: &IsingGraph,
     family: Option<&FamilyContext>,
@@ -64,10 +68,9 @@ pub fn family_tiles(
     let Some(family) = family else {
         return Ok(None);
     };
-    let selected = family.family_id() == CHARGED_ICE_V1.family_id
-        && family.revision() == CHARGED_ICE_V1.revision
-        && family.params() == ICE_CHARGE_RECIPE.params;
-    if !selected {
+    let charged_ice = family.family_id() == CHARGED_ICE_V1.family_id
+        && family.revision() == CHARGED_ICE_V1.revision;
+    if !charged_ice {
         return Ok(None);
     }
     instance_tiles(graph, family.instance())
@@ -83,45 +86,65 @@ struct Pending {
     watermark: Option<u64>,
 }
 
-/// Why a descent did not return states.
-enum Failure {
-    Cancelled,
-    Sample(SampleError),
+/// The cancel token abandoned the job's watermark during the descent.
+struct Cancelled;
+
+/// A job id for the log: lowercase hex.
+fn job_label(job_id: &[u8]) -> String {
+    use std::fmt::Write;
+    job_id.iter().fold(String::new(), |mut out, b| {
+        write!(out, "{b:02x}").expect("a String accepts writes");
+        out
+    })
 }
 
-/// Descend the raw kernel reads of one job and rescore every state.
+/// Descend the raw kernel reads of one job and rescore every state. Any
+/// failure other than a cancel logs a warning and returns `raw` unchanged.
 fn finish(
+    job_id: &[u8],
     pending: &Pending,
     raw: Vec<SamplerResult>,
     kernel_s: f64,
     cancel: Option<(&CancelToken, Option<u64>)>,
-) -> Result<Vec<SamplerResult>, Failure> {
+) -> Result<Vec<SamplerResult>, Cancelled> {
     let started = Instant::now();
+    let job = job_label(job_id);
+    let skip = |why: &str| {
+        tracing::warn!(
+            policy = POLICY_ID,
+            job,
+            why,
+            "descent skipped; raw kernel reads returned"
+        );
+    };
     let graph = &pending.graph;
-    let plan = match Plan::new(graph, pending.tiles.clone()) {
+    let plan = match Plan::new(graph, pending.tiles.clone(), cancel) {
         Ok(plan) => plan,
-        Err(why) => {
-            tracing::warn!(
-                policy = POLICY_ID,
-                why,
-                "descent skipped; raw reads returned"
-            );
+        Err(PlanError::Cancelled) => return Err(Cancelled),
+        Err(e) => {
+            skip(&e.to_string());
             return Ok(raw);
         }
     };
-    let spins: Vec<Vec<i8>> = raw.into_iter().map(|r| r.spins).collect();
+    if let Some(stop) = plan.recovery() {
+        tracing::info!(policy = POLICY_ID, job, why = %stop, "no tile recovery; greedy only");
+    }
+    let spins: Vec<Vec<i8>> = raw.iter().map(|r| r.spins.clone()).collect();
     let threads = crate::streaming::score_threads();
-    let out = descend(&plan, &spins, pending.seed, threads, cancel).map_err(|e| match e {
-        DescentError::Cancelled => Failure::Cancelled,
-        e => Failure::Sample(SampleError::DeviceFault(format!("descent: {e}"))),
-    })?;
+    let out = match descend(&plan, &spins, pending.seed, threads, cancel) {
+        Ok(out) => out,
+        Err(DescentError::Cancelled) => return Err(Cancelled),
+        Err(e) => {
+            skip(&e.to_string());
+            return Ok(raw);
+        }
+    };
     let mut reads = Vec::with_capacity(out.reads.len());
     for spins in out.reads {
         let energy = energy_milli(&spins, &graph.h, &graph.j, &graph.edges);
         if energy != plan.ising().energy(&spins) {
-            return Err(Failure::Sample(SampleError::DeviceFault(
-                "descent rescore differs from the exact energy".into(),
-            )));
+            skip("the descent rescore differs from the exact energy");
+            return Ok(raw);
         }
         reads.push(SamplerResult {
             spins,
@@ -131,13 +154,13 @@ fn finish(
     let report = out.report;
     let best = reads.iter().map(|r| r.energy_milli).min();
     if best != Some(report.final_best) || report.final_best > report.raw_best {
-        return Err(Failure::Sample(SampleError::DeviceFault(
-            "descended best is above the raw best or differs from the report".into(),
-        )));
+        skip("the descended best is above the raw best or differs from the report");
+        return Ok(raw);
     }
     let counts = plan.tile_counts();
     tracing::info!(
         policy = POLICY_ID,
+        job,
         tiles_from = plan.source().name(),
         tiles = counts.tiles,
         tiled_spins = plan.tiles().tiled().len(),
@@ -173,20 +196,30 @@ impl<S: Sampler> MsaDescentSampler<S> {
             tiles,
             watermark: None,
         };
-        finish(&pending, raw, started.elapsed().as_secs_f64(), None).map_err(|f| match f {
-            Failure::Sample(e) => e,
-            Failure::Cancelled => SampleError::DeviceBusy,
-        })
+        // Without a watermark the descent cannot be cancelled.
+        finish(
+            b"solve",
+            &pending,
+            raw,
+            started.elapsed().as_secs_f64(),
+            None,
+        )
+        .map_err(|Cancelled| SampleError::DeviceBusy)
     }
 
-    /// The streaming pipeline behind both stream entry points.
-    fn pipeline(
+    /// The streaming pipeline behind both stream entry points. `next`
+    /// yields each job with its validated family context, when it has one,
+    /// and `None` when the jobs end. A charged-ice job whose instance does
+    /// not match its graph is declined at intake.
+    pub fn sample_stream_family(
         &self,
         mut next: impl FnMut() -> Option<(StreamJob, Option<FamilyContext>)>,
         out: &Sender<StreamResult>,
         cancel: &CancelToken,
     ) {
-        let depth = self.inner.stream_width().saturating_mul(2).max(1);
+        // Each queued job holds a second copy of its graph here, so the
+        // queues stay at one stream width.
+        let depth = self.inner.stream_width().max(1);
         let (inner_tx, inner_rx) = channel::<StreamJob>(depth);
         let (done_tx, done_rx) = channel::<StreamResult>(depth);
         let pending: Mutex<HashMap<Vec<u8>, VecDeque<Pending>>> = Mutex::default();
@@ -213,18 +246,21 @@ impl<S: Sampler> MsaDescentSampler<S> {
                         continue;
                     }
                 };
-                // Record the job before the kernel can finish it.
-                waiting
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .entry(job.job_id.clone())
-                    .or_default()
-                    .push_back(Pending {
-                        graph: job.graph.clone(),
-                        seed: job.params.seed,
-                        tiles,
-                        watermark: job.watermark,
-                    });
+                // Record the job before the kernel can finish it. The session
+                // keeps job ids unique among in-flight jobs. The queue per id
+                // only keeps a repeat from losing a result: the inner stream
+                // completes out of order, so a repeated id would pair results
+                // with graphs in FIFO order.
+                let mut map = waiting.lock().unwrap_or_else(PoisonError::into_inner);
+                let queue = map.entry(job.job_id.clone()).or_default();
+                debug_assert!(queue.is_empty(), "a job id is already in flight");
+                queue.push_back(Pending {
+                    graph: job.graph.clone(),
+                    seed: job.params.seed,
+                    tiles,
+                    watermark: job.watermark,
+                });
+                drop(map);
                 if inner_tx.blocking_send(job).is_err() {
                     break;
                 }
@@ -252,21 +288,27 @@ fn post_process(
         };
         let outcome = match (result.outcome, job) {
             (StreamOutcome::Completed(Ok(raw)), Some(job)) => {
-                // Microseconds to seconds; a job runs far below 2^52 us.
                 #[expect(
                     clippy::cast_precision_loss,
                     reason = "kernel times are far below 2^52 microseconds"
                 )]
                 let kernel_s = result.device_access_time_us as f64 / 1e6;
-                match finish(&job, raw, kernel_s, Some((cancel, job.watermark))) {
+                let guard = Some((cancel, job.watermark));
+                match finish(&result.job_id, &job, raw, kernel_s, guard) {
+                    // A cancel that lands during the descent abandons the job.
+                    Ok(_) if cancel.is_cancelled(job.watermark) => StreamOutcome::Cancelled,
                     Ok(reads) => StreamOutcome::Completed(Ok(reads)),
-                    Err(Failure::Cancelled) => StreamOutcome::Cancelled,
-                    Err(Failure::Sample(e)) => StreamOutcome::Completed(Err(e)),
+                    Err(Cancelled) => StreamOutcome::Cancelled,
                 }
             }
-            (StreamOutcome::Completed(Ok(_)), None) => StreamOutcome::Completed(Err(
-                SampleError::DeviceFault("a kernel result has no pending job".into()),
-            )),
+            (StreamOutcome::Completed(Ok(raw)), None) => {
+                tracing::warn!(
+                    policy = POLICY_ID,
+                    job = job_label(&result.job_id),
+                    "a kernel result has no pending job; raw kernel reads returned"
+                );
+                StreamOutcome::Completed(Ok(raw))
+            }
             (other, _) => other,
         };
         let forwarded = StreamResult {
@@ -333,7 +375,7 @@ impl<S: Sampler> Sampler for MsaDescentSampler<S> {
         out: Sender<StreamResult>,
         cancel: CancelToken,
     ) {
-        self.pipeline(
+        self.sample_stream_family(
             || jobs.blocking_recv().map(|job| (job, None)),
             &out,
             &cancel,
@@ -346,7 +388,7 @@ impl<S: Sampler> Sampler for MsaDescentSampler<S> {
         out: Sender<StreamResult>,
         cancel: CancelToken,
     ) {
-        self.pipeline(
+        self.sample_stream_family(
             || jobs.blocking_recv().map(|item| (item.job, item.family)),
             &out,
             &cancel,

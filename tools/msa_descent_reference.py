@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import shutil
 import subprocess
@@ -52,7 +53,7 @@ class CsrMatrix:
     then column, duplicates summed, explicit zeros kept, as scipy does.
     """
 
-    def __init__(self, arg, shape=None, dtype=None):
+    def __init__(self, arg, shape: tuple[int, int], dtype=None):
         data, (rows, cols) = arg
         data = np.asarray(data, dtype=dtype or np.asarray(data).dtype)
         rows = np.asarray(rows, dtype=np.int64)
@@ -86,16 +87,14 @@ class CsrMatrix:
 def install_stand_ins() -> None:
     scipy = types.ModuleType("scipy")
     sparse = types.ModuleType("scipy.sparse")
-    sparse.csr_matrix = CsrMatrix
-    scipy.sparse = sparse
+    vars(sparse).update(csr_matrix=CsrMatrix)
+    vars(scipy).update(sparse=sparse)
     dimod = types.ModuleType("dimod")
-    dimod.BinaryQuadraticModel = object
-    dimod.SPIN = "SPIN"
+    vars(dimod).update(BinaryQuadraticModel=object, SPIN="SPIN")
     dwave = types.ModuleType("dwave")
     samplers = types.ModuleType("dwave.samplers")
-    samplers.SimulatedAnnealingSampler = object
-    samplers.SteepestDescentSolver = object
-    dwave.samplers = samplers
+    vars(samplers).update(SimulatedAnnealingSampler=object, SteepestDescentSolver=object)
+    vars(dwave).update(samplers=samplers)
     sys.modules.update({"scipy": scipy, "scipy.sparse": sparse, "dimod": dimod, "dwave": dwave,
                         "dwave.samplers": samplers})
 
@@ -114,17 +113,15 @@ def import_research(dest: Path):
     research sys.path edits in descent.py find them in sys.modules."""
     install_stand_ins()
     sys.path.insert(0, str(dest))
-    import prep  # noqa: F401, PLC0415
-    import prep_groups  # noqa: F401, PLC0415
-    import rescore  # noqa: F401, PLC0415
-
-    import descent  # noqa: PLC0415
-
-    for name in ("prep", "prep_groups", "rescore", "descent"):
-        origin = Path(sys.modules[name].__file__).resolve()
+    modules = {name: importlib.import_module(name) for name in ("prep", "prep_groups", "rescore", "descent")}
+    for name, module in modules.items():
+        file = module.__file__
+        if file is None:
+            raise RuntimeError(f"{name} has no source file")
+        origin = Path(file).resolve()
         if origin.parent != dest.resolve():
             raise RuntimeError(f"{name} imported from {origin}, not the copy")
-    return descent
+    return modules["descent"]
 
 
 def run_one(D, at: Path) -> dict:

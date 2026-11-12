@@ -195,22 +195,35 @@ Two host-side changes came with it and apply to `quip-cuda-sa` too:
 `msa-nat-loop/1` descent on the host for each job:
 
 1. Natural-move greedy descent on every read. The moves are single flips,
-   coupled pairs, and the 3-spin and 4-spin subsets of each tile.
+   coupled pairs, the 3-spin and 4-spin subsets of each tile, and the rigid
+   groups of strong bonds.
 2. Loop descent on the read with the lowest raw energy: up to 10 rounds of
    a worm descent on the gauged K4 tiles, then greedy descent. The worm seed
    comes from the job seed.
 3. The loop state replaces the greedy state of that read only when its
    energy is lower.
 
-The binary rescores every returned state exactly on the job graph. An
-accepted `quip/charged-ice@1` job with the `ice-charge` recipe parameters
-takes its tiles from the instance metadata. The session refuses other
-charged-ice parameters. A plain job recovers its tiles from the couplings.
-Each tile is a K4 clique whose six couplings have the same size and the
-gauged antiferromagnetic sign pattern, with at most two tiles per spin. Lease salts run without descent. The binary logs
-`kernel_s`, `descent_s`, and the raw, greedy, loop, and final best energies
-of each job. `tests/msa_descent.rs` checks the descent against the research
-code on regenerated charged-ice instances.
+The binary rescores every returned state exactly on the job graph. When the
+descent cannot run or a check fails, the job logs a warning and returns the
+raw kernel reads. A `quip/charged-ice@1` job, with any valid parameters,
+takes its tiles from the instance metadata, checked against the job graph.
+A plain job recovers its tiles from the couplings. Each tile is a K4 clique
+whose six couplings have the same size and the gauged antiferromagnetic sign
+pattern, with at most two tiles per spin. Recovery skips a model with a
+degree over 32, or one that needs more than 64 coupling lookups per edge.
+Such a model gets greedy descent without tiles.
+
+The descent runs on jobs with at most 262,144 nodes and 4,194,304 edges. A
+job of 200,000 nodes at degree 20 fits. A larger job logs the skip and returns
+its raw reads. Lease salts run without descent. The binary logs `kernel_s`,
+`descent_s`, and the raw, greedy, loop, and final best energies of each job.
+
+`tests/msa_descent.rs` checks the descent against the research code on
+regenerated charged-ice instances, with the tiles in the same order. A plain
+job lists its recovered tiles in ascending node order and seeds the worm from
+the job seed. The archived research run used another tile order and a seed
+from the nonce, and a comparison with the archived results is statistical,
+not read by read.
 
 ## Lease screening (`quip-cuda-msa`)
 

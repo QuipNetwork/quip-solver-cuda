@@ -1,11 +1,20 @@
 """Manual acceptance campaign of quip-cuda-msa-descent on the 100 archived ice-charge models.
 
-Each model runs as one `--solve` job, one at a time, on physical GPU 1
-(CUDA_VISIBLE_DEVICES=1, so the process sees it as device 0). Each job is
-wrapped in the bench-evidence telemetry script, because GPU 1 throttles about
-45 s into load. The job matches the archived research job: 64 reads, 65,536
+Each model runs as one `--solve` job, one at a time, on the physical GPU that
+`--gpu N` names (default 0), in nvidia-smi order. The tool sets
+CUDA_DEVICE_ORDER=PCI_BUS_ID, CUDA_VISIBLE_DEVICES=N and TELEMETRY_GPU=N, so
+the process sees that GPU as device 0 and the telemetry samples the same card. Each job is wrapped in the bench-evidence telemetry
+script, because the A4000 on GPU 1 throttles about 45 s into load. The job
+uses the kernel parameters of the archived research job: 64 reads, 65,536
 sweeps, one sweep per beta, the production default beta range, and the
-research seed protocol_seed(nonce) (qpu-f17/generate.py:42-44).
+research kernel seed protocol_seed(nonce) (qpu-f17/generate.py:42-44).
+
+The comparison with the archive is statistical, not per read. The production
+kernel differs from the archived build. The plain job recovers its tiles in
+ascending node order, while the archived `tetrahedra` rows are in another
+order, so spins with two tiles fill their worm slots differently. The loop
+seed is the job seed, not the first 12 hex digits of the nonce. The energies
+of a run are therefore not expected to equal the archived ones.
 
 The script appends one JSON line per model to OUT. A rerun skips the nonces
 that OUT already holds. Fields: nonce, kernel_s and descent_s (from the
@@ -18,7 +27,7 @@ The model files and the targets file are only read. This is a manual run of
 two to three hours, never part of CI. Run from the repository root:
 
     cargo build --release --bin quip-cuda-msa-descent
-    /usr/bin/python3 -I -B tools/msa_descent_campaign.py --out .tmp/cu7/campaign/ice-charge.jsonl
+    /usr/bin/python3 -I -B tools/msa_descent_campaign.py --gpu 0 --out .tmp/cu7/campaign/ice-charge.jsonl
 """
 
 from __future__ import annotations
@@ -80,12 +89,13 @@ def descent_fields(log: str) -> dict[str, str]:
     raise RuntimeError("the binary wrote no msa descent log line")
 
 
-def run_one(row: dict, binary: Path, scratch: Path) -> dict:
+def run_one(row: dict, binary: Path, scratch: Path, gpu: int) -> dict:
     nonce = row["nonce"]
     model = load_model(row["model"])
     job = scratch / f"{nonce}.json"
     job.write_text(json.dumps(problem(nonce, model)))
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="1", TELEMETRY_GPU="1", NO_COLOR="1")
+    env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID",
+               CUDA_VISIBLE_DEVICES=str(gpu), TELEMETRY_GPU=str(gpu), NO_COLOR="1")
     command = [str(TELEMETRY), f"cu7-{nonce[:12]}", "sh", "-c",
                f'exec "{binary}" --device 0 --solve --log-level info < "{job}"']
     started = time.perf_counter()
@@ -120,6 +130,7 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True, help="JSONL output, appended")
     parser.add_argument("--binary", type=Path, default=BINARY)
     parser.add_argument("--limit", type=int, default=None, help="run at most this many models")
+    parser.add_argument("--gpu", type=int, default=0, help="physical GPU index (default 0)")
     args = parser.parse_args()
     rows = json.loads(TARGETS.read_text())["ice-charge"]["rows"]
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -130,7 +141,7 @@ def main() -> None:
     binary = args.binary.resolve()
     with tempfile.TemporaryDirectory(dir=args.out.parent) as scratch:
         for k, row in enumerate(todo, 1):
-            record = run_one(row, binary, Path(scratch))
+            record = run_one(row, binary, Path(scratch), args.gpu)
             with args.out.open("a") as out:
                 out.write(json.dumps(record) + "\n")
             print(f"{k}/{len(todo)} {record['nonce'][:12]} final {record['final_best']} "

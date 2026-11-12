@@ -1,0 +1,5 @@
+{
+  "include": ["tools"],
+  "pythonVersion": "3.11",
+  "extraPaths": ["/usr/lib/python3/dist-packages"]
+}

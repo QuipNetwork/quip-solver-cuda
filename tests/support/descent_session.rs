@@ -112,6 +112,11 @@ impl MinerService for Coordinator {
 /// session, and return the contexts that reached `sample_family`. A binding
 /// the session refuses never reaches the sampler.
 pub(super) fn contexts(bindings: &[(Vec<u8>, Instance)]) -> Contexts {
+    // Each session sets and clears the process-wide session token.
+    static SESSIONS: Mutex<()> = Mutex::new(());
+    let _one = SESSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     {
         let jobs: Vec<Job> = bindings
             .iter()

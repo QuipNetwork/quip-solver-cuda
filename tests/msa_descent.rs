@@ -21,18 +21,19 @@ use std::sync::Mutex;
 use charged_ice::{Fixture, Record};
 use quip_protocol::scoring::energy_milli;
 use quip_solver_core::beta::default_ising_beta_range;
-use quip_solver_core::families::Declaration;
+use quip_solver_core::families::{Declaration, FamilyContext};
 use quip_solver_core::ising_generators::descriptor::params_digest;
 use quip_solver_core::ising_generators::ice::{CHARGED_ICE_V1, ICE_CHARGE_RECIPE};
 use quip_solver_core::ising_generators::instance::Instance;
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleError, SampleParams, Sampler, SamplerResult, StreamJob,
-    StreamOutcome,
+    StreamOutcome, StreamResult,
 };
 use quip_solver_cuda::descent::loop_descent::TileCounts;
-use quip_solver_cuda::descent::tiles::recover_tiles;
+use quip_solver_cuda::descent::tiles::{recover_tiles, RecoverStop};
 use quip_solver_cuda::descent::{
-    descend, family_tiles, job_ising, MsaDescentSampler, Plan, TileSource, MSA_DESCENT_SOLVER_ID,
+    descend, family_tiles, job_ising, MsaDescentSampler, Plan, PlanError, TileSource,
+    MAX_DESCENT_NODES, MSA_DESCENT_SOLVER_ID,
 };
 
 fn fixture() -> Fixture {
@@ -78,7 +79,7 @@ fn greedy_matches_the_research_descent_on_every_read() {
     for record in fixture().records {
         let instance = regenerate(&record);
         let graph = charged_ice::graph(&instance);
-        let plan = Plan::new(&graph, Some(charged_ice::metadata_tiles(&instance))).unwrap();
+        let plan = Plan::new(&graph, Some(charged_ice::metadata_tiles(&instance)), None).unwrap();
         let reads = start_reads(&record, &instance);
         let raw_best = reads.iter().map(|s| plan.ising().energy(s)).min();
         assert_eq!(raw_best, Some(record.raw_best), "{}", record.nonce);
@@ -111,7 +112,7 @@ fn the_policy_matches_the_research_greedy_and_loop() {
     for record in fixture().records {
         let instance = regenerate(&record);
         let graph = charged_ice::graph(&instance);
-        let plan = Plan::new(&graph, Some(charged_ice::metadata_tiles(&instance))).unwrap();
+        let plan = Plan::new(&graph, Some(charged_ice::metadata_tiles(&instance)), None).unwrap();
         assert_eq!(plan.source(), TileSource::Metadata);
         let reads = start_reads(&record, &instance);
         // Two threads: the result must not depend on the split.
@@ -147,9 +148,9 @@ fn tiles_recovered_from_the_couplings_equal_the_generator_tiles() {
         let graph = charged_ice::graph(&instance);
         let metadata = charged_ice::metadata_tiles(&instance);
         assert_eq!(metadata.len(), record.tiles);
-        let recovered = recover_tiles(&job_ising(&graph).unwrap());
+        let recovered = recover_tiles(&job_ising(&graph).unwrap(), None).unwrap();
         assert_eq!(recovered, metadata, "{}", record.nonce);
-        let plan = Plan::new(&graph, None).unwrap();
+        let plan = Plan::new(&graph, None, None).unwrap();
         assert_eq!(plan.source(), TileSource::Recovered);
         assert_eq!(plan.tiles().tiles(), metadata.as_slice());
         assert_eq!(
@@ -166,7 +167,7 @@ fn tiles_recovered_from_the_couplings_equal_the_generator_tiles() {
 }
 
 #[test]
-fn the_declaration_accepts_only_the_ice_charge_recipe() {
+fn the_declaration_accepts_every_charged_ice_parameter_set() {
     let table = MsaDescentSampler::<FixedReads>::declaration()
         .validate()
         .expect("a valid declaration");
@@ -175,44 +176,175 @@ fn the_declaration_accepts_only_the_ice_charge_recipe() {
     assert_eq!(accepted.len(), 1);
     assert_eq!(accepted[0].family_id, CHARGED_ICE_V1.family_id);
     assert_eq!(accepted[0].revisions, vec![CHARGED_ICE_V1.revision]);
-    assert_eq!(
-        accepted[0].params_digests,
-        vec![params_digest(ICE_CHARGE_RECIPE.params).to_vec()]
+    assert!(
+        accepted[0].params_digests.is_empty(),
+        "every valid parameter set"
     );
     let declaration: Declaration = MsaDescentSampler::<FixedReads>::declaration();
     assert_eq!(declaration.solver_id, MSA_DESCENT_SOLVER_ID);
 }
 
 #[test]
-fn a_recipe_job_is_admitted_with_its_tiles_and_other_params_never_reach_the_sampler() {
+fn charged_ice_jobs_with_any_params_reach_the_sampler_with_their_metadata_tiles() {
     let record = &fixture().records[0];
-    let instance = regenerate(record);
-    // The same instance under other valid parameters: 64 charged tiles per
-    // 256 instead of 128.
+    let recipe = regenerate(record);
+    let other = other_instance(record);
+    let contexts = descent_session::contexts(&[
+        (ICE_CHARGE_RECIPE.params.to_vec(), recipe.clone()),
+        (other_params(), other.clone()),
+    ]);
+    assert_eq!(contexts.len(), 2, "both jobs reach the sampler");
+    let cases = [
+        (ICE_CHARGE_RECIPE.params.to_vec(), recipe),
+        (other_params(), other),
+    ];
+    for (context, (params, instance)) in contexts.iter().zip(cases) {
+        assert_eq!(context.params(), params.as_slice());
+        let graph = charged_ice::graph(&instance);
+        let tiles = family_tiles(&graph, Some(context))
+            .unwrap()
+            .expect("a charged-ice job uses its metadata tiles");
+        assert_eq!(tiles, charged_ice::metadata_tiles(&instance));
+        // A job graph that differs from the instance is declined.
+        let mut changed = graph.clone();
+        changed.h[0] += 0.001;
+        assert!(matches!(
+            family_tiles(&changed, Some(context)),
+            Err(SampleError::Declined(_))
+        ));
+        assert_eq!(family_tiles(&graph, None).unwrap(), None);
+    }
+}
+
+/// The instance of a record's nonce under [`other_params`].
+fn other_instance(record: &Record) -> Instance {
+    charged_ice::instance_with(&other_params(), charged_ice::nonce(&record.nonce))
+}
+
+/// The recipe parameters with 64 charged tiles per 256 instead of 128.
+fn other_params() -> Vec<u8> {
     let mut other = ICE_CHARGE_RECIPE.params.to_vec();
     let last = other.len() - 2;
     assert_eq!(other[last], 0x80);
     other[last] = 0x40;
-    let contexts = descent_session::contexts(&[
-        (ICE_CHARGE_RECIPE.params.to_vec(), instance.clone()),
-        (other, instance.clone()),
-    ]);
-    assert_eq!(contexts.len(), 1, "only the recipe job reaches the sampler");
-    let context = &contexts[0];
-    assert_eq!(context.params(), ICE_CHARGE_RECIPE.params);
+    assert_ne!(
+        params_digest(&other),
+        params_digest(ICE_CHARGE_RECIPE.params)
+    );
+    other
+}
+
+/// Run jobs through the wrapper pipeline and collect the results in order.
+fn run_pipeline<S: Sampler>(
+    sampler: &MsaDescentSampler<S>,
+    jobs: Vec<(StreamJob, Option<FamilyContext>)>,
+    cancel: &CancelToken,
+) -> Vec<StreamResult> {
+    let count = jobs.len();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(count.max(1));
+    let mut jobs = jobs.into_iter();
+    sampler.sample_stream_family(|| jobs.next(), &out_tx, cancel);
+    drop(out_tx);
+    let mut results = Vec::new();
+    while let Some(result) = out_rx.blocking_recv() {
+        results.push(result);
+    }
+    results
+}
+
+fn stream_job(id: u8, graph: &IsingGraph, seed: u64, watermark: Option<u64>) -> StreamJob {
+    StreamJob {
+        job_id: vec![id],
+        graph: graph.clone(),
+        params: SampleParams {
+            num_reads: 4,
+            seed,
+            ..SampleParams::default()
+        },
+        watermark,
+    }
+}
+
+#[test]
+fn the_pipeline_descends_family_jobs_with_metadata_tiles_and_declines_a_mismatch() {
+    let record = &fixture().records[0];
+    let instance = other_instance(record);
+    let contexts = descent_session::contexts(&[(other_params(), instance.clone())]);
+    let context = contexts[0].clone();
     let graph = charged_ice::graph(&instance);
-    let tiles = family_tiles(&graph, Some(context))
-        .unwrap()
-        .expect("the recipe job uses its metadata tiles");
-    assert_eq!(tiles, recover_tiles(&job_ising(&graph).unwrap()));
-    // A job graph that differs from the instance is declined.
+    let raw = start_reads(record, &instance)[..4].to_vec();
+    let sampler = MsaDescentSampler::new(FixedReads(Mutex::new(raw.clone())));
     let mut changed = graph.clone();
-    changed.h[0] += 0.001;
+    changed.j[0] = -changed.j[0];
+    let jobs = vec![
+        (stream_job(1, &graph, 11, None), Some(context.clone())),
+        (stream_job(2, &changed, 11, None), Some(context)),
+        (stream_job(3, &graph, 12, None), None),
+    ];
+    let results = run_pipeline(&sampler, jobs, &CancelToken::default());
+    assert_eq!(results.len(), 3);
+    let by_id = |id: u8| {
+        results
+            .iter()
+            .find(|r| r.job_id == vec![id])
+            .expect("a result")
+    };
     assert!(matches!(
-        family_tiles(&changed, Some(context)),
-        Err(SampleError::Declined(_))
+        &by_id(2).outcome,
+        StreamOutcome::Completed(Err(SampleError::Declined(_)))
     ));
-    assert_eq!(family_tiles(&graph, None).unwrap(), None);
+    let metadata = charged_ice::metadata_tiles(&instance);
+    for (id, seed, plan) in [
+        (1, 11, Plan::new(&graph, Some(metadata), None).unwrap()),
+        (3, 12, Plan::new(&graph, None, None).unwrap()),
+    ] {
+        let StreamOutcome::Completed(Ok(reads)) = &by_id(id).outcome else {
+            panic!("job {id} completes");
+        };
+        let expected = descend(&plan, &raw, seed, 1, None).unwrap();
+        let spins: Vec<Vec<i8>> = reads.iter().map(|r| r.spins.clone()).collect();
+        assert_eq!(spins, expected.reads, "job {id}");
+        check_rescored(&graph, reads, &raw);
+    }
+}
+
+/// A kernel stand-in whose stream completes every job, cancelled or not, so
+/// that the cancel reaches the descent.
+struct IgnoresCancel(Vec<Vec<i8>>);
+
+impl Sampler for IgnoresCancel {
+    fn sample(
+        &self,
+        graph: &IsingGraph,
+        _: &SampleParams,
+    ) -> Result<Vec<SamplerResult>, SampleError> {
+        Ok(self
+            .0
+            .iter()
+            .map(|s| SamplerResult {
+                spins: s.clone(),
+                energy_milli: energy_milli(s, &graph.h, &graph.j, &graph.edges),
+            })
+            .collect())
+    }
+
+    fn sample_stream(
+        &self,
+        mut jobs: tokio::sync::mpsc::Receiver<StreamJob>,
+        out: tokio::sync::mpsc::Sender<StreamResult>,
+        _cancel: CancelToken,
+    ) {
+        while let Some(job) = jobs.blocking_recv() {
+            let result = StreamResult {
+                job_id: job.job_id,
+                outcome: StreamOutcome::Completed(self.sample(&job.graph, &job.params)),
+                device_access_time_us: 1,
+            };
+            if out.blocking_send(result).is_err() {
+                break;
+            }
+        }
+    }
 }
 
 #[test]
@@ -304,7 +436,7 @@ fn the_wrapper_returns_exact_energies_never_above_the_raw_best() {
     };
     let direct = sampler.sample(&graph, &params).unwrap();
     check_rescored(&graph, &direct, &raw);
-    let plan = Plan::new(&graph, None).unwrap();
+    let plan = Plan::new(&graph, None, None).unwrap();
     let expected = descend(&plan, &raw, record.loop_seed, 1, None).unwrap();
     let spins: Vec<Vec<i8>> = direct.iter().map(|r| r.spins.clone()).collect();
     assert_eq!(spins, expected.reads);
@@ -332,28 +464,119 @@ fn the_wrapper_returns_exact_energies_never_above_the_raw_best() {
 }
 
 #[test]
-fn a_cancelled_stream_job_is_reported_cancelled() {
+fn a_cancel_during_the_descent_reports_the_job_cancelled() {
     let record = &fixture().records[0];
     let instance = regenerate(record);
     let graph = charged_ice::graph(&instance);
     let raw = start_reads(record, &instance)[..2].to_vec();
-    let sampler = MsaDescentSampler::new(FixedReads(Mutex::new(raw)));
+    let sampler = MsaDescentSampler::new(IgnoresCancel(raw));
     let cancel = CancelToken::default();
     cancel.cancel_through(5);
-    let (job_tx, job_rx) = tokio::sync::mpsc::channel(1);
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1);
-    job_tx
-        .blocking_send(StreamJob {
-            job_id: vec![1],
-            graph,
-            params: SampleParams::default(),
-            watermark: Some(3),
-        })
-        .unwrap();
-    drop(job_tx);
-    sampler.sample_stream(job_rx, out_tx, cancel);
-    let result = out_rx.blocking_recv().expect("one result");
-    assert!(matches!(result.outcome, StreamOutcome::Cancelled));
+    let results = run_pipeline(
+        &sampler,
+        vec![
+            (stream_job(1, &graph, 1, Some(3)), None),
+            (stream_job(2, &graph, 1, Some(9)), None),
+        ],
+        &cancel,
+    );
+    assert_eq!(results.len(), 2);
+    assert!(matches!(results[0].outcome, StreamOutcome::Cancelled));
+    assert!(matches!(
+        results[1].outcome,
+        StreamOutcome::Completed(Ok(_))
+    ));
+}
+
+#[test]
+fn a_descent_failure_returns_the_raw_kernel_reads() {
+    let record = &fixture().records[0];
+    let instance = regenerate(record);
+    let graph = charged_ice::graph(&instance);
+    // A read with a zero spin fails the descent check, not the session.
+    let mut raw = start_reads(record, &instance)[..2].to_vec();
+    raw[1][0] = 0;
+    let sampler = MsaDescentSampler::new(IgnoresCancel(raw.clone()));
+    let reads = sampler
+        .sample(&graph, &SampleParams::default())
+        .expect("the raw reads, not a fault");
+    let spins: Vec<Vec<i8>> = reads.iter().map(|r| r.spins.clone()).collect();
+    assert_eq!(spins, raw);
+    // A job above the size gate also returns its raw reads.
+    let big = IsingGraph::new(vec![0.0; MAX_DESCENT_NODES + 1], Vec::new(), Vec::new());
+    assert!(matches!(
+        Plan::new(&big, None, None),
+        Err(PlanError::TooLarge { .. })
+    ));
+    let one = vec![vec![1_i8; MAX_DESCENT_NODES + 1]];
+    let sampler = MsaDescentSampler::new(IgnoresCancel(one.clone()));
+    let reads = sampler.sample(&big, &SampleParams::default()).unwrap();
+    assert_eq!(reads[0].spins, one[0]);
+}
+
+/// A complete graph with every coupling `sign`, in milli units of 1.
+fn complete(n: usize, sign: f64) -> IsingGraph {
+    let edges: Vec<(usize, usize)> = (0..n)
+        .flat_map(|u| (u + 1..n).map(move |v| (u, v)))
+        .collect();
+    IsingGraph::new(vec![0.0; n], vec![sign; edges.len()], edges)
+}
+
+#[test]
+fn tile_recovery_on_complete_graphs_is_bounded() {
+    let started = std::time::Instant::now();
+    for sign in [1.0, -1.0] {
+        // Degree 63 is above the cap: no enumeration, and greedy still runs.
+        let dense = complete(64, sign);
+        let ising = job_ising(&dense).unwrap();
+        assert_eq!(
+            recover_tiles(&ising, None),
+            Err(RecoverStop::Degree { max: 63 })
+        );
+        let plan = Plan::new(&dense, None, None).unwrap();
+        assert_eq!(plan.recovery(), Some(RecoverStop::Degree { max: 63 }));
+        assert!(plan.tiles().tiles().is_empty());
+        let reads = charged_ice::reads(64, 5, 2);
+        descend(&plan, &reads, 1, 1, None).unwrap();
+        // Degree 31 is at the cap and enumerates.
+        let edge = complete(32, sign);
+        let tiles = recover_tiles(&job_ising(&edge).unwrap(), None).unwrap();
+        let mut slots = [0_u8; 32];
+        for &u in tiles.iter().flatten() {
+            slots[u as usize] += 1;
+        }
+        assert!(slots.iter().all(|&k| k <= 2));
+        if sign > 0.0 {
+            // Every K4 is antiferromagnetic. The two-slot rule in
+            // lexicographic order keeps 15.
+            assert_eq!(tiles.len(), 15);
+        } else {
+            // No ferromagnetic K4 is gauge-equivalent to an antiferromagnet.
+            assert!(tiles.is_empty());
+        }
+    }
+    assert!(
+        started.elapsed().as_secs_f64() < 5.0,
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn tile_recovery_observes_the_cancel_token() {
+    let record = &fixture().records[0];
+    let graph = charged_ice::graph(&regenerate(record));
+    let cancel = CancelToken::default();
+    cancel.cancel_through(2);
+    let guard = Some((&cancel, Some(1)));
+    assert_eq!(
+        recover_tiles(&job_ising(&graph).unwrap(), guard),
+        Err(RecoverStop::Cancelled)
+    );
+    assert_eq!(
+        Plan::new(&graph, None, guard).unwrap_err(),
+        PlanError::Cancelled
+    );
 }
 
 /// One regenerated instance, 64 reads, 2,048 sweeps through the wrapper
@@ -406,7 +629,7 @@ fn the_msa_stream_descends_a_regenerated_instance() {
         );
     }
     // Every returned state is a greedy local minimum.
-    let plan = Plan::new(&graph, None).unwrap();
+    let plan = Plan::new(&graph, None, None).unwrap();
     for read in &reads {
         let mut s = read.spins.clone();
         assert_eq!(plan.greedy().descend(&mut s, None).unwrap(), 0);

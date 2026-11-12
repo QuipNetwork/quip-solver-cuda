@@ -1,10 +1,13 @@
 //! CUDA Ising samplers.
 //!
-//! Three binaries share this library:
+//! These binaries share this library:
 //! - `quip-cuda-sa` — Metropolis simulated annealing on one GPU
 //! - `quip-cuda-msa` — multi-spin coded simulated annealing, 64 reads per word
 //! - `quip-cuda-msa-descent` — the MSA kernel, then host greedy and loop descent
 //! - `quip-cuda-gibbs` — single-site heat-bath Gibbs on one GPU
+//! - `quip-cuda-otsuka` — Otsuka cluster moves for validated families, with SA fallback
+//! - `quip-cuda-flow-loops` — constrained loop search for flow and polariton families
+//! - `quip-cuda-dipolar` — D-static string and loop search for explicit family instances
 //!
 //! Kernels are the v0.2 self-feeding persistent kernels (`GPU/cuda_sa.cu` /
 //! `GPU/cuda_gibbs.cu`, copied verbatim into `kernels/`): a kernel-side

@@ -2,7 +2,7 @@
 //! from the coupling graph of a plain job.
 
 use quip_solver_core::ising_generators::instance::Instance;
-use quip_solver_core::IsingGraph;
+use quip_solver_core::{CancelToken, IsingGraph};
 
 use super::greedy::Ising;
 use super::milli;
@@ -68,6 +68,45 @@ pub fn instance_tiles(graph: &IsingGraph, instance: &Instance) -> Result<Vec<[u3
     parse_tiles(payload, n).ok_or_else(|| "the tile section is malformed".to_owned())
 }
 
+/// The largest degree at which [`recover_tiles`] runs. Charged ice has
+/// degree at most 20. A denser model has no ice tiles to recover, and its K4
+/// enumeration grows with the cube of the degree.
+pub const RECOVER_MAX_DEGREE: usize = 32;
+
+/// The coupling lookups [`recover_tiles`] may spend per edge.
+pub const RECOVER_LOOKUPS_PER_EDGE: usize = 64;
+
+/// Why [`recover_tiles`] returned no tiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoverStop {
+    /// A node has more than [`RECOVER_MAX_DEGREE`] neighbours.
+    Degree {
+        /// The largest degree.
+        max: usize,
+    },
+    /// The enumeration used more than [`RECOVER_LOOKUPS_PER_EDGE`] lookups
+    /// per edge.
+    Budget,
+    /// The cancel token abandoned the watermark.
+    Cancelled,
+}
+
+impl std::fmt::Display for RecoverStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Degree { max } => write!(
+                f,
+                "degree {max} is above the tile recovery limit of {RECOVER_MAX_DEGREE}"
+            ),
+            Self::Budget => write!(
+                f,
+                "tile recovery passed its budget of {RECOVER_LOOKUPS_PER_EDGE} lookups per edge"
+            ),
+            Self::Cancelled => write!(f, "tile recovery was cancelled"),
+        }
+    }
+}
+
 /// Recover the tiles of a plain job from its couplings.
 ///
 /// A tile is a K4 clique whose six couplings share one nonzero magnitude and
@@ -75,66 +114,81 @@ pub fn instance_tiles(graph: &IsingGraph, instance: &Instance) -> Result<Vec<[u3
 /// [`IceTiles::new`](super::loop_descent::IceTiles::new). The cliques are
 /// visited in ascending order of their sorted node tuples, the order of a
 /// kind 1 section. A clique is kept when none of its nodes already has two
-/// tiles.
-#[must_use]
-pub fn recover_tiles(ising: &Ising) -> Vec<[u32; 4]> {
+/// tiles. The visit order is lexicographic, so the filter runs as the
+/// cliques are found, and a node with two tiles is not expanded further.
+///
+/// # Errors
+///
+/// [`RecoverStop`] when the model is too dense, the lookup budget runs out,
+/// or the token abandons the watermark. The token is checked once per node.
+pub fn recover_tiles(
+    ising: &Ising,
+    cancel: Option<(&CancelToken, Option<u64>)>,
+) -> Result<Vec<[u32; 4]>, RecoverStop> {
     let n = ising.num_nodes();
-    let mut found: Vec<[u32; 4]> = Vec::new();
+    let max = (0..n).map(|u| ising.row(u).len()).max().unwrap_or(0);
+    if max > RECOVER_MAX_DEGREE {
+        return Err(RecoverStop::Degree { max });
+    }
+    let edges: usize = (0..n).map(|u| ising.row(u).len()).sum::<usize>() / 2;
+    let mut budget = edges.saturating_mul(RECOVER_LOOKUPS_PER_EDGE).max(1);
+    let mut lookup = |u: u32, v: u32| {
+        budget = budget.checked_sub(1).ok_or(RecoverStop::Budget)?;
+        Ok(ising.coupling(u, v))
+    };
+    let mut slots = vec![0_u8; n];
+    let mut tiles = Vec::new();
     for a in 0..n {
-        let up = |u: usize| {
-            let row = ising.row(u);
-            let at = row.partition_point(|&(v, _)| (v as usize) <= u);
-            &row[at..]
-        };
-        let ra = up(a);
+        if cancel.is_some_and(|(token, watermark)| token.is_cancelled(watermark)) {
+            return Err(RecoverStop::Cancelled);
+        }
+        let row = ising.row(a);
+        let ra = &row[row.partition_point(|&(v, _)| (v as usize) <= a)..];
+        let a32 = u32::try_from(a).map_err(|_| RecoverStop::Budget)?;
         for (ib, &(b, jab)) in ra.iter().enumerate() {
-            if jab == 0 {
+            if slots[a] >= 2 {
+                break;
+            }
+            if jab == 0 || slots[b as usize] >= 2 {
                 continue;
             }
             let mag = jab.abs();
+            let gb = jab.signum();
             for (ic, &(c, jac)) in ra.iter().enumerate().skip(ib + 1) {
-                if jac.abs() != mag {
+                if slots[a] >= 2 || slots[b as usize] >= 2 {
+                    break;
+                }
+                if jac.abs() != mag || slots[c as usize] >= 2 {
                     continue;
                 }
-                let Some(jbc) = ising.coupling(b, c) else {
-                    continue;
-                };
-                if jbc.abs() != mag {
-                    continue;
+                // Gauge with g_a = +1: g_b and g_c follow from the a-row.
+                let gc = jac.signum();
+                match lookup(b, c)? {
+                    Some(jbc) if jbc.abs() == mag && jbc.signum() == gb * gc => {}
+                    _ => continue,
                 }
                 for &(d, jad) in &ra[ic + 1..] {
-                    if jad.abs() != mag {
+                    if jad.abs() != mag || slots[d as usize] >= 2 {
                         continue;
                     }
-                    let (Some(jbd), Some(jcd)) = (ising.coupling(b, d), ising.coupling(c, d))
-                    else {
-                        continue;
+                    let gd = jad.signum();
+                    let fits = |j: Option<i64>, g: i64| {
+                        j.is_some_and(|j| j.abs() == mag && j.signum() == g)
                     };
-                    if jbd.abs() != mag || jcd.abs() != mag {
+                    if !fits(lookup(b, d)?, gb * gd) || !fits(lookup(c, d)?, gc * gd) {
                         continue;
                     }
-                    // Gauge with g_a = +1: g_b, g_c, g_d follow from the a-row.
-                    let (gb, gc, gd) = (jab.signum(), jac.signum(), jad.signum());
-                    if jbc.signum() == gb * gc && jbd.signum() == gb * gd && jcd.signum() == gc * gd
-                    {
-                        let a = u32::try_from(a).unwrap_or(u32::MAX);
-                        found.push([a, b, c, d]);
+                    let tile = [a32, b, c, d];
+                    for &u in &tile {
+                        slots[u as usize] += 1;
+                    }
+                    tiles.push(tile);
+                    if slots[a] >= 2 || slots[b as usize] >= 2 || slots[c as usize] >= 2 {
+                        break;
                     }
                 }
             }
         }
     }
-    found.sort_unstable();
-    let mut slots = vec![0_u8; n];
-    let mut tiles = Vec::new();
-    for tile in found {
-        if tile.iter().any(|&u| slots[u as usize] >= 2) {
-            continue;
-        }
-        for &u in &tile {
-            slots[u as usize] += 1;
-        }
-        tiles.push(tile);
-    }
-    tiles
+    Ok(tiles)
 }

@@ -26,19 +26,21 @@ pub fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// The canonical instance of `nonce` on the full Zephyr z(12, 4) lattice.
+/// The canonical `ice-charge` instance of `nonce` on the full Zephyr
+/// z(12, 4) lattice.
 pub fn instance(nonce: [u8; 32]) -> Instance {
+    instance_with(ICE_CHARGE_RECIPE.params, nonce)
+}
+
+/// The canonical charged-ice instance of `nonce` with parameters `params`
+/// on the full Zephyr z(12, 4) lattice.
+pub fn instance_with(params: &[u8], nonce: [u8; 32]) -> Instance {
     let (nodes, edges) = zephyr_lattice(12, 4).expect("the z(12, 4) lattice");
     let topology = BaseTopology::new(nodes, &edges).expect("a topology");
-    export_instances(
-        &CHARGED_ICE_V1,
-        ICE_CHARGE_RECIPE.params,
-        &topology,
-        &[nonce],
-    )
-    .expect("the recipe admits z(12, 4)")
-    .remove(0)
-    .expect("the nonce gives an instance")
+    export_instances(&CHARGED_ICE_V1, params, &topology, &[nonce])
+        .expect("the parameters admit z(12, 4)")
+        .remove(0)
+        .expect("the nonce gives an instance")
 }
 
 /// The job graph of an instance, as the session decodes an i32 milli job.

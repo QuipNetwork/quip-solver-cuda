@@ -305,13 +305,15 @@ impl Walk<'_> {
 /// # Errors
 ///
 /// [`DescentError::Length`] or [`DescentError::Value`] when a read does not
-/// fit the model.
+/// fit the model, and [`DescentError::Cancelled`] when the token abandons
+/// the watermark. The token is checked before each sweep.
 pub fn loop_descent(
     ising: &Ising,
     tiles: &IceTiles,
     reads: &mut [Vec<i8>],
     limits: LoopLimits,
     seed: u64,
+    cancel: Option<(&CancelToken, Option<u64>)>,
 ) -> Result<u64, DescentError> {
     let nodes = ising.num_nodes();
     let mut rng = if seed == 0 { ZERO_SEED } else { seed };
@@ -338,6 +340,9 @@ pub fn loop_descent(
         order.clear();
         order.extend_from_slice(&tiles.tiled);
         for _ in 0..limits.max_sweeps {
+            if cancel.is_some_and(|(token, watermark)| token.is_cancelled(watermark)) {
+                return Err(DescentError::Cancelled);
+            }
             let mut improved = false;
             for i in (1..order.len()).rev() {
                 #[expect(
@@ -400,6 +405,7 @@ pub fn nat_loop(
             reads,
             limits,
             seed.wrapping_add(u64::from(round)),
+            cancel,
         )?;
         for s in reads.iter_mut() {
             greedy.descend(s, cancel)?;
