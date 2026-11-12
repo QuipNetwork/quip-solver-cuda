@@ -69,6 +69,7 @@ The precision options are `binary`, `int8`, `int32`, and `float`.
 |--------|-----------|
 | `quip-cuda-sa` | simulated annealing (Metropolis) |
 | `quip-cuda-msa` | multi-spin coded simulated annealing, 64 reads per word |
+| `quip-cuda-msa-descent` | the `quip-cuda-msa` kernel, then host greedy and loop descent |
 | `quip-cuda-gibbs` | heat-bath Gibbs |
 
 Each [release](https://gitlab.com/quip.network/quip-solver-cuda/-/releases)
@@ -187,6 +188,29 @@ Two host-side changes came with it and apply to `quip-cuda-sa` too:
 * **Parallel scoring.** The host rescores downloaded samples on `QUIP_SCORE_THREADS`
   threads (default 4). With one thread the sampler capped a fast kernel at
   about 20 jobs per second and left the GPU idle between batches.
+
+## Host descent (`quip-cuda-msa-descent`)
+
+`quip-cuda-msa-descent` runs the `quip-cuda-msa` kernel and then the
+`msa-nat-loop/1` descent on the host for each job:
+
+1. Natural-move greedy descent on every read. The moves are single flips,
+   coupled pairs, and the 3-spin and 4-spin subsets of each tile.
+2. Loop descent on the read with the lowest raw energy: up to 10 rounds of
+   a worm descent on the gauged K4 tiles, then greedy descent. The worm seed
+   comes from the job seed.
+3. The loop state replaces the greedy state of that read only when its
+   energy is lower.
+
+The binary rescores every returned state exactly on the job graph. An
+accepted `quip/charged-ice@1` job with the `ice-charge` recipe parameters
+takes its tiles from the instance metadata. The session refuses other
+charged-ice parameters. A plain job recovers its tiles from the couplings.
+Each tile is a K4 clique whose six couplings have the same size and the
+gauged antiferromagnetic sign pattern, with at most two tiles per spin. Lease salts run without descent. The binary logs
+`kernel_s`, `descent_s`, and the raw, greedy, loop, and final best energies
+of each job. `tests/msa_descent.rs` checks the descent against the research
+code on regenerated charged-ice instances.
 
 ## Lease screening (`quip-cuda-msa`)
 

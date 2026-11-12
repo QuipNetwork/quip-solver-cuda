@@ -1,0 +1,43 @@
+{
+  "description": [
+    "Research descent results on regenerated quip/charged-ice@1 ice-charge instances on z(12, 4).",
+    "Made by tools/msa_descent_reference.py, which runs new-pow/gpu/scripts/descent.py and libgreedy.so.",
+    "Start reads: SplitMix64 from read_seed, low bit 0 is +1, reads in order.",
+    "Greedy: natural moves on every read. Loop: nat_loop on the lowest raw read, zero budget 0, seed loop_seed.",
+    "Hashes: BLAKE3, energies as little-endian i64, spins as one byte each."
+  ],
+  "records": [
+    {
+      "nonce": "06fef0b7a59d82ae777cf83a30d9e9d834bca1be8a3e71c58dbee636ca0cc2d0",
+      "topology_hash": "6c739cc6c9fe0f3fe10810e41899892c7a1a5dcad7c24557a0f5c67034481ba1",
+      "integrity_hash": "54e973ac1961fcb72860d61b785a4286f0b3034df184748480de2cb79cd50975",
+      "read_seed": 12611584,
+      "reads": 64,
+      "loop_seed": 7692030027165,
+      "tiles": 2116,
+      "raw_best": -78120,
+      "greedy_energies_blake3": "1418545eb60605519e25feffed5ceb19c720ae854340f4e7d0691e67a9ecd808",
+      "greedy_spins_blake3": "78a9966dafd0a00849e62fcf365447749cf3c21f365c7559b140e26b428b0dcd",
+      "greedy_best": -1660098,
+      "loop_from": 12,
+      "loop_spins_blake3": "663bcdb80a7f2d9cf954c65632f1a4bda26d810ed4c25ab41992a1bd7f31f6d3",
+      "loop_energy": -1676808
+    },
+    {
+      "nonce": "3693ad03d06a4f1b9d2755fa1c011deafd8364b03b7cc5b6ee94613f161021df",
+      "topology_hash": "6c739cc6c9fe0f3fe10810e41899892c7a1a5dcad7c24557a0f5c67034481ba1",
+      "integrity_hash": "6d00ed856924e41f0e837ce9ccfd07f00871314a10804372533f875d53ea2a3a",
+      "read_seed": 12611585,
+      "reads": 64,
+      "loop_seed": 60007890800746,
+      "tiles": 2116,
+      "raw_best": -91726,
+      "greedy_energies_blake3": "39a221db558dbb807af27378b5529fc648d53194f2d27c60d5c96a096ada1690",
+      "greedy_spins_blake3": "49f660c9aaa9f49c13f772234808bb8cc0d3cfc3bb9127aa5cc90a6ed727b77a",
+      "greedy_best": -1666758,
+      "loop_from": 50,
+      "loop_spins_blake3": "1db8fa5eb81e291e6489635f86caaef2cd48dc738288eddd6e93f2e975deb689",
+      "loop_energy": -1679350
+    }
+  ]
+}

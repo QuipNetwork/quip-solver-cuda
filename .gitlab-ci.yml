@@ -11,7 +11,7 @@ variables:
   PKG: quip-solver-cuda
   # The binaries that a tag publishes. build-amd64 fails when this list and the
   # manifest's binary targets differ, so a new binary is a deliberate edit here.
-  BINS: quip-cuda-dipolar quip-cuda-flow-loops quip-cuda-gibbs quip-cuda-msa quip-cuda-otsuka quip-cuda-sa
+  BINS: quip-cuda-dipolar quip-cuda-flow-loops quip-cuda-gibbs quip-cuda-msa quip-cuda-msa-descent quip-cuda-otsuka quip-cuda-sa
   # The toolchain image the jobs run on, by digest. The
   # build-toolchain-image job prints this line after a rebuild.
   TOOLCHAIN_IMAGE: registry.gitlab.com/quip.network/quip-solver-cuda/ci-toolchain@sha256:5ebdbbd387d4a04a24a439f0ea2f43e41ba04e6ed161360807b8714758e7d885

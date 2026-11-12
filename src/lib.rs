@@ -3,6 +3,7 @@
 //! Three binaries share this library:
 //! - `quip-cuda-sa` — Metropolis simulated annealing on one GPU
 //! - `quip-cuda-msa` — multi-spin coded simulated annealing, 64 reads per word
+//! - `quip-cuda-msa-descent` — the MSA kernel, then host greedy and loop descent
 //! - `quip-cuda-gibbs` — single-site heat-bath Gibbs on one GPU
 //!
 //! Kernels are the v0.2 self-feeding persistent kernels (`GPU/cuda_sa.cu` /
@@ -21,6 +22,7 @@ pub mod cluster;
 pub mod coefficients;
 pub mod corpus;
 pub mod cuda_device;
+pub mod descent;
 // Preserve Metal's estimator arithmetic: counts intentionally become floats,
 // and its probability midpoint stays in [0, 1]. Keep its exact-value tests.
 #[allow(clippy::cast_precision_loss, clippy::manual_midpoint)]

@@ -27,6 +27,10 @@ name = "quip-cuda-msa"
 path = "src/bin/quip_cuda_msa.rs"
 
 [[bin]]
+name = "quip-cuda-msa-descent"
+path = "src/bin/quip_cuda_msa_descent.rs"
+
+[[bin]]
 name = "quip-cuda-otsuka"
 path = "src/bin/quip_cuda_otsuka.rs"
 
@@ -76,6 +80,8 @@ tonic = "=0.12.3"
 tokio-stream = { version = "=0.1.19", features = ["net"] }
 tempfile = "=3.27.0"
 quip-solver-conformance = "0.0.11"
+# Fixture hashes of the descent parity records; already in the build graph.
+blake3 = "=1.8.5"
 proptest = "1"
 serial_test = "3.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync", "process"] }

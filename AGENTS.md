@@ -74,6 +74,15 @@ The miner refuses a session whose buffers exceed device memory. At
 for unit models and 5.2 GiB for weighted i32 models (see the
 [A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)).
 
+`quip-cuda-msa-descent` runs the MSA kernel, then the `msa-nat-loop/1` host
+descent on each job (`src/descent/`): natural-move greedy on every read, and
+loop descent on the lowest raw read. Plain `quip-cuda-msa` does not descend.
+The descent is a port of the research `greedy.c` and `descent.py`. The parity
+fixture `tests/fixtures/msa_descent_parity.json` holds only nonces and hashes.
+`tools/msa_descent_reference.py` regenerates it from the research code.
+`tools/msa_descent_campaign.py` is the manual campaign on the 100 archived
+ice-charge models. It runs on GPU 1 for two to three hours and is never part of CI.
+
 SA and Gibbs derive their limits from device memory split among instances.
 SA uses one SM per instance. Gibbs uses four SMs per instance.
 A device with 48 SMs runs 48 SA instances or 12 Gibbs instances.
