@@ -218,12 +218,24 @@ __global__ void __launch_bounds__(SCR_THREADS) quip_screen_probe(
         }
         __syncthreads();
         for (int sweep = 0; sweep < sweeps_per_beta; ++sweep) {
-            const int off = (int)(scr_splitmix64(slot_seed ^ ((u64)beta_idx << 20) ^ (u64)sweep) & SCR_ROW_MASK);
+            const u64 sweep_hash = scr_splitmix64(slot_seed ^ ((u64)beta_idx << 20) ^ (u64)sweep);
+            const int off = (int)(sweep_hash & SCR_ROW_MASK);
+            // One node sits each sweep but the last out, as in the MSA kernel
+            // this probe predicts (msa.cu, sit_out_node): the node comes from
+            // the high half of the hash that gives the row offset. -1 matches
+            // no node.
+            const bool last_sweep = beta_idx == num_betas - 1 && sweep == sweeps_per_beta - 1;
+            const int skip = (last_sweep || n_nodes < 2)
+                ? -1
+                : (int)__umulhi((unsigned int)(sweep_hash >> 32), (unsigned int)n_nodes);
             for (int c = 0; c < num_colors; ++c) {
                 const int start = __ldg(&color_starts[c]);
                 const int cnt = __ldg(&color_counts[c]);
                 for (int k = tid; k < cnt; k += blockDim.x) {
                     const int var = __ldg(&color_nodes[start + k]);
+                    if (var == skip) {
+                        continue;
+                    }
                     // The node's padded neighbour row: 20 entries in five
                     // 16-byte loads.
                     const uint4* row4 = (const uint4*)(adj + (size_t)var * SCR_MAX_DEG);

@@ -151,6 +151,30 @@ __device__ __forceinline__ u64 splitmix64(u64 x) {
     return x ^ (x >> 31);
 }
 
+// "No node": the value that makes a sweep leave no node out.
+#define MSA_NO_SIT_OUT (-1)
+
+// The node in [0, n) that replica word `w` leaves out of one sweep.
+//
+// Flat moves are always accepted and the colour order is fixed, so with every
+// node updated the domain walls of a zero-field chain all advance two sites
+// per sweep and walls on the same sublattice never meet. A wall that reaches
+// the node left out waits one step, changes sublattice and meets the rest.
+// Same rule as quip-solver-cpu's sa_msc.rs (QUI-1980).
+//
+// `sweep_hash` is the per-sweep hash of the slot seed and the sweep position
+// whose low bits already give the row offset; the node comes from its high
+// half. Every thread of the block computes the same node and no RNG stream
+// moves. A second hash here measured 15% slower on an RTX 4090. A model of
+// fewer than two nodes leaves none out.
+__device__ __forceinline__ int sit_out_node(u64 sweep_hash, int w, int n) {
+    if (n < 2) {
+        return MSA_NO_SIT_OUT;
+    }
+    const unsigned int hi = (unsigned int)(sweep_hash >> 32) ^ ((unsigned int)w * 0x9E3779B9u);
+    return (int)__umulhi(hi, (unsigned int)n);
+}
+
 // Carry-save adder: (h, l) = a + b + c per lane.
 __device__ __forceinline__ void csa(u64 &h, u64 &l, u64 a, u64 b, u64 c) {
     u64 u = a ^ b;
@@ -490,14 +514,25 @@ __device__ __forceinline__ bool anneal_model(
 
         for (int sweep = 0; sweep < mdl.sweeps_per_beta; ++sweep) {
             // Random cyclic shift of the row per sweep, uniform across the block.
-            int off = (int)(splitmix64(
-                mdl.slot_seed ^ ((u64)beta_idx << 20) ^ (u64)sweep) & MSA_ROW_MASK);
+            const u64 sweep_hash = splitmix64(
+                mdl.slot_seed ^ ((u64)beta_idx << 20) ^ (u64)sweep);
+            int off = (int)(sweep_hash & MSA_ROW_MASK);
+            // The last sweep of the anneal leaves no node out, so every node
+            // is settled at the coldest rung.
+            const bool last_sweep =
+                beta_idx == mdl.num_betas - 1 && sweep == mdl.sweeps_per_beta - 1;
+            const int skip = last_sweep
+                ? MSA_NO_SIT_OUT
+                : sit_out_node(sweep_hash, w, mdl.N);
 
             for (int c = 0; c < mdl.num_colors; ++c) {
                 int start = __ldg(&mdl.color_starts[c]);
                 int cnt = __ldg(&mdl.color_counts[c]);
                 for (int k = g; k < cnt; k += gstride) {
                     int var = __ldg(&mdl.color_nodes[start + k]);
+                    if (var == skip) {
+                        continue;
+                    }
                     int pstart = __ldg(&mdl.csr_row_ptr[var]);
                     int pend = __ldg(&mdl.csr_row_ptr[var + 1]);
                     msa_field_t h = __ldg(&mdl.h[var]);
@@ -931,7 +966,18 @@ extern "C" __global__ void cuda_msa_dense_self_feeding(
             const float beta = beta_schedule[beta_idx];
 #endif
             for (int sweep = 0; sweep < sweeps_per_beta && !s_abort; ++sweep) {
+                // One node sits each sweep out for every replica; the last
+                // sweep leaves none out. The dense kernel visits the nodes in
+                // index order, like SA.
+                const bool last_sweep = beta_idx == num_betas - 1 && sweep == sweeps_per_beta - 1;
+                const int skip = last_sweep
+                    ? MSA_NO_SIT_OUT
+                    : sit_out_node(
+                          splitmix64(seed ^ ((u64)beta_idx << 20) ^ (u64)sweep), 0, N);
                 for (int node = 0; node < N; ++node) {
+                    if (node == skip) {
+                        continue;
+                    }
                     if (tid == 0) s_abort = nonce_ctrl[ctrl_base + CTRL_EXIT_NOW] == EXIT_ABORT;
                     __syncthreads();
                     if (s_abort) break;

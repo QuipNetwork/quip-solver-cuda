@@ -401,7 +401,8 @@ fn acceptance_oracle() -> Vec<Vec<i8>> {
         .map(|r| {
             (0..64_u64)
                 .map(|node| {
-                    let event = mix(slot_seed ^ (1 << 40) ^ node);
+                    // The acceptance draw of the last of three rungs.
+                    let event = mix(slot_seed ^ (2 << 40) ^ node);
                     let uniform = (f64::from(u32::try_from(mix(event ^ r) >> 41).unwrap()) + 0.5)
                         / 8_388_608.0;
                     if uniform < p {
@@ -438,14 +439,15 @@ fn real_sparse_acceptance_matches_replica_oracle() {
     }
     let oracle = acceptance_oracle();
     let expected_masks = [
-        [0xf993_8ace_786f_bd13, 0xad3e_4a59_54b9_5e76],
-        [0xf5ac_4257_3db9_7b93, 0x97dd_dffb_57db_ed9c],
+        [0xb72b_4e0a_ffde_e4ae, 0xd78b_8df5_2c8f_14c1],
+        [0xbd14_18f5_beea_a68a, 0x1fad_55f8_1378_77d8],
     ];
     for (node, expected) in expected_masks.iter().enumerate() {
         assert_eq!(mask(&oracle[..64], node), expected[0]);
         assert_eq!(mask(&oracle[64..], node), expected[1]);
     }
-    assert_ne!(oracle[63][0], oracle[64][0]);
+    // The reads on either side of the replica word boundary differ at node 1.
+    assert_ne!(oracle[63][1], oracle[64][1]);
     let mut prefix: Option<Vec<Vec<i8>>> = None;
     for degree in [20, 22] {
         let edges: Vec<_> = (0..64)
@@ -456,9 +458,15 @@ fn real_sparse_acceptance_matches_replica_oracle() {
         for cap in [None, Some(0)] {
             device.msa_shared_spins_cap = cap;
             for num_reads in [63, 64, 65, 128].into_iter().filter(|&r| r <= max_reads) {
+                // Two frozen sweeps, then the sweep under test at beta 2. A
+                // frozen sweep sets every node it visits against its field,
+                // which erases the random start. Each of the first two sweeps
+                // leaves one node per word out, a different one each time for
+                // this seed, so two of them erase every node. The last sweep
+                // visits every node.
                 let params = SampleParams {
                     num_reads,
-                    num_sweeps: 2,
+                    num_sweeps: 3,
                     sweeps_per_beta: 1,
                     seed: 42,
                     schedule: BetaSchedule::Linear,
