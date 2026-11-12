@@ -3,8 +3,9 @@
 Each model runs as one `--solve` job, one at a time, on the physical GPU that
 `--gpu N` names (default 0), in nvidia-smi order. The tool sets
 CUDA_DEVICE_ORDER=PCI_BUS_ID, CUDA_VISIBLE_DEVICES=N and TELEMETRY_GPU=N, so
-the process sees that GPU as device 0 and the telemetry samples the same card. Each job is wrapped in the bench-evidence telemetry
-script, because the A4000 on GPU 1 throttles about 45 s into load. The job
+the process sees that GPU as device 0 and the telemetry samples the same
+card. Each job is wrapped in the bench-evidence telemetry script, because
+the A4000 on GPU 1 throttles about 45 s into load. The job
 uses the kernel parameters of the archived research job: 64 reads, 65,536
 sweeps, one sweep per beta, the production default beta range, and the
 research kernel seed protocol_seed(nonce) (qpu-f17/generate.py:42-44).
