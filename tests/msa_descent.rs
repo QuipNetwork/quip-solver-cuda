@@ -171,7 +171,12 @@ fn the_declaration_accepts_every_charged_ice_parameter_set() {
     let table = MsaDescentSampler::<FixedReads>::declaration()
         .validate()
         .expect("a valid declaration");
-    assert!(table.generated().is_empty());
+    // Declared generation is empty; the solver-core default session path
+    // generates every registered family for this binary.
+    assert_eq!(
+        table.generated().len(),
+        quip_solver_core::ising_generators::registry::CONTRACTS.len()
+    );
     let accepted = table.accepted();
     assert_eq!(accepted.len(), 1);
     assert_eq!(accepted[0].family_id, CHARGED_ICE_V1.family_id);

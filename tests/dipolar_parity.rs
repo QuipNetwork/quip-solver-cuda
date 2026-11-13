@@ -625,8 +625,11 @@ fn capabilities_and_plain_decline_need_no_cuda() {
     assert_eq!(caps["backend"], "cuda");
     assert_eq!(caps["algorithm"], "dipolar");
     assert_eq!(caps["solverId"], "quip-cuda-dipolar/1");
-    for list in ["generatedFamilies", "acceptedFamilies"] {
-        assert_eq!(caps[list].as_array().unwrap().len(), 1);
+    // The declared family comes first in each list. The solver-core default
+    // session path adds every other registered family to `generatedFamilies`.
+    let registered = quip_solver_core::ising_generators::registry::CONTRACTS.len();
+    for (list, len) in [("generatedFamilies", registered), ("acceptedFamilies", 1)] {
+        assert_eq!(caps[list].as_array().unwrap().len(), len, "{list}");
         assert_eq!(caps[list][0]["familyId"], "quip/defects-static");
         assert_eq!(caps[list][0]["revisions"], serde_json::json!([1]));
     }

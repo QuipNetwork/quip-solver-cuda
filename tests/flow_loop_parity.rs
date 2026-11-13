@@ -271,7 +271,7 @@ fn footprints_saturate_instead_of_wrapping() {
 }
 
 #[test]
-fn capabilities_declare_only_the_two_revisions_without_a_device() {
+fn capabilities_declare_the_two_revisions_first_without_a_device() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_quip-cuda-flow-loops"))
         .arg("--capabilities")
         .env("CUDA_VISIBLE_DEVICES", "")
@@ -286,9 +286,13 @@ fn capabilities_declare_only_the_two_revisions_without_a_device() {
     assert_eq!(caps["backend"], "cuda");
     assert_eq!(caps["algorithm"], "flow-loops");
     assert_eq!(caps["solverId"], "quip-cuda-flow-loops/1");
-    for key in ["generatedFamilies", "acceptedFamilies"] {
+    // The two declared families come first in each list. The solver-core
+    // default session path adds every other registered family to
+    // `generatedFamilies`.
+    let registered = quip_solver_core::ising_generators::registry::CONTRACTS.len();
+    for (key, len) in [("generatedFamilies", registered), ("acceptedFamilies", 2)] {
         let entries = caps[key].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), len, "{key}");
         for (entry, id) in entries
             .iter()
             .zip([FLOW_V1.family_id, POLARITON_V1.family_id])
