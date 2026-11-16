@@ -71,6 +71,7 @@ The precision options are `binary`, `int8`, `int32`, and `float`.
 | `quip-cuda-msa` | multi-spin coded simulated annealing, 64 reads per word |
 | `quip-cuda-msa-descent` | the `quip-cuda-msa` kernel, then host greedy and loop descent |
 | `quip-cuda-gibbs` | heat-bath Gibbs |
+| `quip-cuda-otsuka` | Otsuka cluster annealing for `quip/twisted-ice-dimer` jobs, CUDA SA otherwise |
 
 Each [release](https://gitlab.com/quip.network/quip-solver-cuda/-/releases)
 provides prebuilt `amd64` binaries.
@@ -275,6 +276,28 @@ See the [calibration and session results](docs/perf/2026-10-cuda-lease-screen.md
 
 The probe kernel comes from rdyplayerB's
 [QuipNetwork/quip-solver-cuda#1](https://github.com/QuipNetwork/quip-solver-cuda/pull/1).
+
+## Otsuka cluster miner (`quip-cuda-otsuka`)
+
+`quip-cuda-otsuka` anneals `quip/twisted-ice-dimer` jobs with tile and pair
+cluster moves and sends every other job to CUDA SA. Between kernel launches the
+host runs a population step, as the CPU Otsuka sampler does: it resamples the
+reads by their true energies and swaps Houdayer clusters between pairs of reads
+from beta 3.
+
+| Setting (`[cuda.N]` key, or environment) | Default | Meaning |
+| --- | --- | --- |
+| `otsuka_beta` / `QUIP_OTSUKA_BETA` | `1,8` | Beta range for jobs that carry none. `stock` keeps the job's own range. |
+| `otsuka_resamples` / `QUIP_OTSUKA_RESAMPLES` | `256` | Population steps per anneal. `0` turns them off. |
+| `otsuka_houdayer` / `QUIP_OTSUKA_HOUDAYER` | `1` | Houdayer rounds per population step. |
+| `otsuka_chunk` / `QUIP_OTSUKA_CHUNK` | `16` | Sweeps per kernel launch. |
+| `otsuka_reads`, `otsuka_sweeps` / `QUIP_OTSUKA_READS`, `QUIP_OTSUKA_SWEEPS` | job budget | Pin the replicas and sweeps of every job. |
+| `QUIP_OTSUKA_TILE_MILLI`, `QUIP_OTSUKA_PAIR_MILLI` | `250` | Cluster-draw weights (the research default; `1000` is full weight). |
+| `QUIP_OTSUKA_WEAK_SCALE` | `1.5` | Scale on the weak couplings in the anneal model. Reported energies stay exact. |
+
+On the first Aglais twisted-ice graph (4,575 nodes, recipe w62-p1200) with an
+RTX 5090 Laptop GPU, the previous settings reached about −5,030 in 33 s per salt;
+the defaults above reach about −5,054 in 2.4 s at 160 reads by 8,192 sweeps.
 
 ## Sharing the graphics processor
 

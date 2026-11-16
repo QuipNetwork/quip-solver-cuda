@@ -114,7 +114,7 @@ impl ClusterWork {
             graph,
             params.num_sweeps,
             per_beta,
-            params.beta_range,
+            params.beta_range.or(super::device::knobs().beta),
             params.schedule,
             1.0,
         );
@@ -219,7 +219,8 @@ impl ClusterBackend for GpuCluster {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ClusterRun, ClusterDeviceError> {
         checkpoint(stopped)?;
-        ClusterDevice::open_with_kernel(graph, &self.kernel)?.run_work(work, stopped, cancelled)
+        ClusterDevice::open_with_kernel(graph, &self.kernel)?
+            .run_work_population(work, stopped, cancelled)
     }
 }
 
@@ -271,6 +272,7 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
         prepared: PreparedGraph,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<SamplerResult>, ClusterDeviceError> {
+        let params = &budget(params);
         // A governor yield refuses this job as busy. Only the session token
         // makes finish() report Cancelled and suppress the upstream result.
         let stopped = || cancelled() || self.sa.should_throttle();
@@ -296,6 +298,16 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
                 spins,
             });
         }
+        let n = graph.h.len();
+        let bad: Vec<usize> = reads
+            .iter()
+            .map(|r| r.spins.len())
+            .filter(|&l| l != n)
+            .collect();
+        if !bad.is_empty() {
+            tracing::warn!(nodes = n, dropped = bad.len(), lengths = ?bad, "dropped cluster reads of the wrong length");
+            reads.retain(|r| r.spins.len() == n);
+        }
         Ok(reads)
     }
 
@@ -305,12 +317,13 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
         params: &SampleParams,
         family: &FamilyContext,
     ) -> Result<PreparedGraph, SampleError> {
+        let params = &budget(params);
         if family.instance().h().len() != graph.h.len()
             || family.instance().edges().len() != graph.edges.len()
         {
             return Err(SampleError::Capacity);
         }
-        PreparedGraph::from_family(family, Weights::FULL, &self.limits, params.num_reads).map_err(
+        PreparedGraph::from_family(family, weights_knob(), &self.limits, params.num_reads).map_err(
             |e| {
                 tracing::warn!(error = %e, "cluster admission refused");
                 SampleError::Capacity
@@ -480,6 +493,53 @@ impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
         self.sa.should_throttle()
     }
     fn apply_config(&self, backend_toml: &str) {
+        super::device::knobs_from_toml(backend_toml);
         self.sa.apply_config(backend_toml);
     }
 }
+
+/// The job's budget, with the replicas and sweeps pinned by `otsuka_reads` / `otsuka_sweeps`
+/// (`QUIP_OTSUKA_READS` / `QUIP_OTSUKA_SWEEPS`) when they are set.
+fn budget(params: &SampleParams) -> SampleParams {
+    let k = super::device::knobs();
+    let mut p = params.clone();
+    if k.reads > 0 {
+        p.num_reads = k.reads.min(MAX_READS);
+    }
+    if k.sweeps > 0 {
+        p.num_sweeps = k.sweeps;
+    }
+    p
+}
+
+/// Cluster-draw weights for family jobs, in milli.
+///
+/// The default is the research value, 250 for tiles and pairs (`run_cluster.py`); the full weights
+/// (1000) freeze the clusters early on twisted-ice instances. `QUIP_OTSUKA_TILE_MILLI` and
+/// `QUIP_OTSUKA_PAIR_MILLI` override it.
+fn weights_knob() -> Weights {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let get = |key: &str, lo: i32| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .filter(|x| (lo..=1000).contains(x))
+            .unwrap_or(DEFAULT_CLUSTER_MILLI)
+    };
+    let w = Weights {
+        pair_milli: get("QUIP_OTSUKA_PAIR_MILLI", 0),
+        tile_milli: get("QUIP_OTSUKA_TILE_MILLI", 1),
+    };
+    ONCE.call_once(|| {
+        tracing::info!(
+            tile_milli = w.tile_milli,
+            pair_milli = w.pair_milli,
+            weak_scale = super::prepare::weak_scale(),
+            "otsuka cluster settings"
+        );
+    });
+    w
+}
+
+/// The research cluster weight, in milli.
+const DEFAULT_CLUSTER_MILLI: i32 = 250;

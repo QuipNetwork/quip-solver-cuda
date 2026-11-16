@@ -212,11 +212,154 @@ impl ClusterKernel {
     }
 }
 
+fn envn(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+/// Otsuka population-anneal settings. Each comes from the `otsuka_*` key of the miner's config
+/// section, else the `QUIP_OTSUKA_*` environment variable, else the default:
+///
+/// - `beta`: the family beta range `(hot, cold)` for jobs that carry none. Default `(1, 8)`, near the
+///   CPU sampler's `FAMILY_BETA_RANGE`; the generic SA range (about 0.04 to 105) wastes most of the
+///   ladder on twisted-ice instances. `"stock"` restores the job's own range.
+/// - `chunk`: sweeps per kernel launch. Default 16.
+/// - `resamples`: population steps per anneal. Default 256; 0 turns the population step off.
+/// - `houdayer`: Houdayer swap rounds per population step from beta 3. Default 1.
+/// - `reads`, `sweeps`: pin the job budget. Default 0 (the job's own budget).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Knobs {
+    pub beta: Option<(f64, f64)>,
+    pub chunk: usize,
+    pub resamples: usize,
+    pub houdayer: usize,
+    pub reads: usize,
+    pub sweeps: usize,
+}
+
+static KNOBS: std::sync::RwLock<Option<Knobs>> = std::sync::RwLock::new(None);
+
+fn parse_beta(v: &str) -> Option<(f64, f64)> {
+    if v.trim() == "stock" {
+        return None;
+    }
+    let mut it = v.split(',').filter_map(|x| x.trim().parse::<f64>().ok());
+    match (it.next(), it.next()) {
+        (Some(hot), Some(cold)) if hot > 0.0 && cold > 0.0 => Some((hot, cold)),
+        _ => Some((1.0, 8.0)),
+    }
+}
+
+pub(crate) fn knobs() -> Knobs {
+    if let Some(k) = *KNOBS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return k;
+    }
+    let k = Knobs {
+        beta: match std::env::var("QUIP_OTSUKA_BETA") {
+            Ok(v) => parse_beta(&v),
+            Err(_) => Some((1.0, 8.0)),
+        },
+        chunk: envn("QUIP_OTSUKA_CHUNK", 16).max(1),
+        resamples: envn("QUIP_OTSUKA_RESAMPLES", 256),
+        houdayer: envn("QUIP_OTSUKA_HOUDAYER", 1),
+        reads: envn("QUIP_OTSUKA_READS", 0),
+        sweeps: envn("QUIP_OTSUKA_SWEEPS", 0),
+    };
+    *KNOBS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(k);
+    k
+}
+
+/// The `otsuka_*` keys of the miner's config section override env and defaults.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "an integer beta bound in the config is a small number"
+)]
+pub(crate) fn knobs_from_toml(backend_toml: &str) {
+    let Ok(t) = backend_toml.parse::<toml::Table>() else {
+        return;
+    };
+    let mut k = knobs();
+    let int = |key: &str| {
+        t.get(key)
+            .and_then(toml::Value::as_integer)
+            .and_then(|v| usize::try_from(v).ok())
+    };
+    if let Some(v) = int("otsuka_chunk") {
+        k.chunk = v.max(1);
+    }
+    if let Some(v) = int("otsuka_resamples") {
+        k.resamples = v;
+    }
+    if let Some(v) = int("otsuka_houdayer") {
+        k.houdayer = v;
+    }
+    if let Some(v) = int("otsuka_reads") {
+        k.reads = v;
+    }
+    if let Some(v) = int("otsuka_sweeps") {
+        k.sweeps = v;
+    }
+    match t.get("otsuka_beta") {
+        Some(toml::Value::String(v)) => k.beta = parse_beta(v),
+        Some(toml::Value::Array(a)) if a.len() == 2 => {
+            let f = |x: &toml::Value| x.as_float().or_else(|| x.as_integer().map(|i| i as f64));
+            if let (Some(hot), Some(cold)) = (f(&a[0]), f(&a[1])) {
+                if hot > 0.0 && cold > 0.0 {
+                    k.beta = Some((hot, cold));
+                }
+            }
+        }
+        _ => {}
+    }
+    *KNOBS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(k);
+    tracing::info!(?k, "otsuka settings");
+}
+
+/// Host state of the population anneal (resampling and Houdayer moves between launches).
+struct Pop {
+    every: usize,
+    since: usize,
+    last_beta: f32,
+    houdayer: usize,
+    rng: u64,
+    best: Option<(Vec<i8>, i64)>,
+    adj: Vec<Vec<u32>>,
+    steps: usize,
+    host: std::time::Duration,
+}
+
+impl Pop {
+    fn next(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "53 random bits scaled to [0, 1) are exact in f64"
+    )]
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
 struct WorkControl<'a> {
     work: &'a super::sampler::ClusterWork,
     stopped: &'a dyn Fn() -> bool,
     cancelled: &'a dyn Fn() -> bool,
     chunk: usize,
+    /// Run the host population step between launches (the miner's job path).
+    population: bool,
 }
 
 impl ClusterDevice {
@@ -313,7 +456,25 @@ impl ClusterDevice {
         stopped: &dyn Fn() -> bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ClusterRun, ClusterDeviceError> {
-        self.run_work_chunked(work, stopped, cancelled, 1)
+        self.run_work_chunked(work, stopped, cancelled, 1, false)
+    }
+
+    /// Run a host-built ladder as the miner does: `otsuka_chunk` sweeps per launch and the host
+    /// population step between launches (see [`Knobs`]).
+    ///
+    /// Unlike [`Self::run_work`], the result depends on the launch chunk, because the population
+    /// step runs at launch boundaries.
+    ///
+    /// # Errors
+    /// Returns the same validation and device errors as `run_work`.
+    #[doc(hidden)]
+    pub fn run_work_population(
+        &mut self,
+        work: &super::sampler::ClusterWork,
+        stopped: &dyn Fn() -> bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ClusterRun, ClusterDeviceError> {
+        self.run_work_chunked(work, stopped, cancelled, knobs().chunk, true)
     }
 
     /// Run the identical host ladder with larger launch chunks as a GPU oracle.
@@ -327,7 +488,7 @@ impl ClusterDevice {
         work: &super::sampler::ClusterWork,
         chunk: usize,
     ) -> Result<ClusterRun, ClusterDeviceError> {
-        self.run_work_chunked(work, &|| false, &|| false, chunk)
+        self.run_work_chunked(work, &|| false, &|| false, chunk, false)
     }
 
     fn run_work_chunked(
@@ -336,6 +497,7 @@ impl ClusterDevice {
         stopped: &dyn Fn() -> bool,
         cancelled: &dyn Fn() -> bool,
         chunk: usize,
+        population: bool,
     ) -> Result<ClusterRun, ClusterDeviceError> {
         let schedule = ClusterSchedule {
             sweeps: work.betas.len() * work.sweeps_per_beta,
@@ -352,11 +514,20 @@ impl ClusterDevice {
                 stopped,
                 cancelled,
                 chunk,
+                population,
             }),
         )
         .map(|(run, _)| run)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the population step hooks into the launch loop it shares with stock runs"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "node indices stay below MAX_PACKED_NODES, far below u32::MAX"
+    )]
     fn run_inner(
         &mut self,
         schedule: &ClusterSchedule,
@@ -398,6 +569,28 @@ impl ClusterDevice {
             shared_mem_bytes: u32::try_from(self.graph.dynamic_shared_bytes())
                 .map_err(|_| ClusterDeviceError::Parameter("shared memory exceeds u32"))?,
         };
+        let total_sweeps = usize::try_from(params.sweeps).unwrap_or(0);
+        let resamples = knobs().resamples;
+        let population = control.is_some_and(|c| c.population);
+        let mut pop = (population && resamples > 0 && anneals > 1).then(|| Pop {
+            every: (total_sweeps / resamples).max(1),
+            since: 0,
+            last_beta: 0.0,
+            houdayer: knobs().houdayer,
+            rng: seed ^ 0x9e37_79b9_7f4a_7c15 | 1,
+            best: None,
+            adj: {
+                let g = self.graph.original_graph();
+                let mut adj = vec![Vec::new(); g.num_nodes()];
+                for &(u, v, _) in &g.edges {
+                    adj[u].push(v as u32);
+                    adj[v].push(u as u32);
+                }
+                adj
+            },
+            steps: 0,
+            host: std::time::Duration::ZERO,
+        });
         if let Some(control) = control {
             control.work.for_each_chunk(
                 control.stopped,
@@ -430,6 +623,18 @@ impl ClusterDevice {
                         &mut rng,
                     )?;
                     self.stream.synchronize()?;
+                    if let Some(pop) = pop.as_mut() {
+                        if !descent {
+                            if pop.steps == 0 && pop.since == 0 {
+                                pop.last_beta = beta;
+                            }
+                            pop.since += count;
+                            if pop.since >= pop.every {
+                                pop.since = 0;
+                                self.population_step(pop, beta, &mut spins)?;
+                            }
+                        }
+                    }
                     Ok(())
                 },
             )?;
@@ -463,7 +668,163 @@ impl ClusterDevice {
             result.energies.push(self.graph.energy(&original)?);
             result.spins.push(original);
         }
+        if let Some(pop) = pop {
+            tracing::debug!(
+                steps = pop.steps,
+                host_ms = u64::try_from(pop.host.as_millis()).unwrap_or(u64::MAX),
+                "otsuka population steps"
+            );
+            if let Some((state, e)) = pop.best {
+                let low = result.energies.iter().copied().min().unwrap_or(i64::MAX);
+                if e < low {
+                    if let Some(worst) =
+                        (0..result.energies.len()).max_by_key(|&i| result.energies[i])
+                    {
+                        result.energies[worst] = e;
+                        result.spins[worst] = state;
+                    }
+                }
+            }
+        }
         Ok((result, rng_state))
+    }
+
+    /// One population step on the host. Downloads the replicas, resamples them in proportion to
+    /// `exp(-(beta - last_beta) (E - E_min))` with systematic resampling (true model energies), takes
+    /// Houdayer cluster swaps between random pairs from beta 3, and uploads the result. This is the
+    /// GPU counterpart of `anneal_population` in quip-solver-cpu's Otsuka sampler.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "resampling and Houdayer swaps share the downloaded replicas"
+    )]
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "g, n, r, a, b follow the population-annealing notation of the CPU sampler"
+    )]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "milli energies and replica counts are far below 2^52"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "node and replica indices stay below MAX_PACKED_NODES and MAX_READS"
+    )]
+    fn population_step(
+        &self,
+        pop: &mut Pop,
+        beta: f32,
+        spins: &mut CudaSlice<i8>,
+    ) -> Result<(), ClusterDeviceError> {
+        let t0 = std::time::Instant::now();
+        let g = self.graph.original_graph();
+        let n = g.num_nodes();
+        let o2d = self.graph.original_to_device();
+        let d2o = self.graph.device_to_original();
+        let dev = self.stream.clone_dtoh(spins)?;
+        self.stream.synchronize()?;
+        let mut states: Vec<Vec<i8>> = dev
+            .chunks_exact(n)
+            .map(|s| o2d.iter().map(|&d| s[d]).collect())
+            .collect();
+        let r = states.len();
+        let mut energy = vec![0i64; r];
+        let per = r.div_ceil(8).max(1);
+        std::thread::scope(|sc| {
+            for (es, ss) in energy.chunks_mut(per).zip(states.chunks(per)) {
+                sc.spawn(move || {
+                    for (e, s) in es.iter_mut().zip(ss) {
+                        *e = g.energy(s);
+                    }
+                });
+            }
+        });
+        let (low_at, low) = energy
+            .iter()
+            .copied()
+            .enumerate()
+            .min_by_key(|&(_, e)| e)
+            .unwrap_or((0, 0));
+        if pop.best.as_ref().is_none_or(|b| low < b.1) {
+            pop.best = Some((states[low_at].clone(), low));
+        }
+        let step = f64::from(beta - pop.last_beta);
+        if step > 0.0 {
+            let low = low as f64;
+            let weights: Vec<f64> = energy
+                .iter()
+                .map(|&e| (-step * (e as f64 - low) / 1000.0).exp())
+                .collect();
+            let total: f64 = weights.iter().sum();
+            let stride = total / r as f64;
+            let mut mark = pop.unit() * stride;
+            let mut picks = Vec::with_capacity(r);
+            let mut reach = 0.0;
+            for (i, &w) in weights.iter().enumerate() {
+                reach += w;
+                while mark < reach && picks.len() < r {
+                    picks.push(i);
+                    mark += stride;
+                }
+            }
+            picks.resize(r, r - 1);
+            states = picks.iter().map(|&i| states[i].clone()).collect();
+        }
+        if pop.houdayer > 0 && beta >= 3.0 {
+            let mut order: Vec<usize> = (0..r).collect();
+            let mut seen = vec![false; n];
+            let mut differ: Vec<u32> = Vec::new();
+            let mut cluster: Vec<u32> = Vec::new();
+            for _ in 0..pop.houdayer {
+                for i in (1..r).rev() {
+                    let j = (pop.next() % (i as u64 + 1)) as usize;
+                    order.swap(i, j);
+                }
+                for pair in order.chunks_exact(2) {
+                    let (a, b) = (pair[0].min(pair[1]), pair[0].max(pair[1]));
+                    let (left, right) = states.split_at_mut(b);
+                    let (sa, sb) = (&mut left[a], &mut right[0]);
+                    differ.clear();
+                    differ.extend((0..n as u32).filter(|&u| sa[u as usize] != sb[u as usize]));
+                    if differ.is_empty() {
+                        continue;
+                    }
+                    let root = differ[(pop.next() % differ.len() as u64) as usize];
+                    cluster.clear();
+                    cluster.push(root);
+                    seen[root as usize] = true;
+                    let mut at = 0;
+                    while at < cluster.len() {
+                        let u = cluster[at] as usize;
+                        at += 1;
+                        for &v in &pop.adj[u] {
+                            let v = v as usize;
+                            if !seen[v] && sa[v] != sb[v] {
+                                seen[v] = true;
+                                cluster.push(v as u32);
+                            }
+                        }
+                    }
+                    for &u in &cluster {
+                        let u = u as usize;
+                        seen[u] = false;
+                        sa[u] = -sa[u];
+                        sb[u] = -sb[u];
+                    }
+                }
+            }
+        }
+        let mut up = vec![0i8; r * n];
+        for (block, state) in up.chunks_exact_mut(n).zip(&states) {
+            for (d, slot) in block.iter_mut().enumerate() {
+                *slot = state[d2o[d]];
+            }
+        }
+        self.stream.memcpy_htod(&up, spins)?;
+        self.stream.synchronize()?;
+        pop.last_beta = beta;
+        pop.steps += 1;
+        pop.host += t0.elapsed();
+        Ok(())
     }
 
     // The flat argument order matches quip_cluster_anneal in kernels/cluster.cu.
