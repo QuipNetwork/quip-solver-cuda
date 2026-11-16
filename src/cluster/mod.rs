@@ -9,6 +9,8 @@ pub mod device;
 mod prepare;
 /// Family routing and production streaming for `quip-cuda-otsuka`.
 pub mod sampler;
+/// Lease-local salt screening for `quip-cuda-otsuka` (opt-in).
+pub mod screen_lease;
 
 use std::collections::HashMap;
 use std::fmt;

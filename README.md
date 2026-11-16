@@ -299,6 +299,24 @@ On the first Aglais twisted-ice graph (4,575 nodes, recipe w62-p1200) with an
 RTX 5090 Laptop GPU, the previous settings reached about −5,030 in 33 s per salt;
 the defaults above reach about −5,054 in 2.4 s at 160 reads by 8,192 sweeps.
 
+### Lease screening
+
+With `QUIP_OTSUKA_SCREEN="threads,warm,keep"` set, the miner works family
+leases itself. It generates every salt on `threads` CPU threads, scores each
+instance from four structural counts, keeps the best `keep`, and spends the GPU
+only on those: a short solve for the best few, then one long anneal for the best
+of them. See `src/cluster/screen_lease.rs` for the score and the other settings
+(`QUIP_OTSUKA_SCREEN_RUNGS`, `QUIP_OTSUKA_SCREEN_SCORE`,
+`QUIP_OTSUKA_SCREEN_HOLDERS`). A typical value is `20,10000,48` on a 24-thread
+host. Each miner process owns one GPU and starts its own generator threads, so
+on a host with several GPUs divide `threads` between the processes.
+
+On the current Aglais graph (4,560 nodes, recipe w45-p1350) and the same
+machine, 600 s bench rounds averaged a best energy of −5,074.4 without screening
+(every salt solved at 160 by 8,192, the best re-solved deeper) and −5,082.3 with
+it. Running live, the miner's share of rounds rose from 1 in about 600 to about
+6 %.
+
 ## Sharing the graphics processor
 
 `--yielding` lets the miner share a GPU. The NVML governor measures the load

@@ -646,9 +646,8 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "ising-generators"
-version = "0.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c47d3427ebb21766756b89faf79ed47ce540d946439b161db6dce1e197cc600"
+version = "0.0.16-rc2"
+source = "git+https://github.com/QuipNetwork/quip-solver-core?branch=feat%2Ffamily-lease-context#9c7c53e5c964cee49a3f2c9826676e4f881694e9"
 dependencies = [
  "blake3",
  "miniz_oxide",
@@ -945,9 +944,8 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quip-proto"
-version = "0.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4ea6c7e37c7caa67b13efc691311cda52fc0d8d927776226aa25052fd361b5f"
+version = "0.0.16-rc2"
+source = "git+https://github.com/QuipNetwork/quip-solver-core?branch=feat%2Ffamily-lease-context#9c7c53e5c964cee49a3f2c9826676e4f881694e9"
 dependencies = [
  "prost",
  "tonic",
@@ -955,9 +953,8 @@ dependencies = [
 
 [[package]]
 name = "quip-protocol"
-version = "0.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e61b9571851ee3d89f17dc1d45086e4960d5c957f0460220b9d4e05983c67002"
+version = "0.0.16-rc2"
+source = "git+https://github.com/QuipNetwork/quip-solver-core?branch=feat%2Ffamily-lease-context#9c7c53e5c964cee49a3f2c9826676e4f881694e9"
 dependencies = [
  "ising-generators",
  "quip-proto",
@@ -965,9 +962,8 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-conformance"
-version = "0.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5790141062605840f69d82c7db5bbf32d222327d62d2e3c74f5a979904c1654d"
+version = "0.0.16-rc2"
+source = "git+https://github.com/QuipNetwork/quip-solver-core?branch=feat%2Ffamily-lease-context#9c7c53e5c964cee49a3f2c9826676e4f881694e9"
 dependencies = [
  "hyper-util",
  "ising-generators",
@@ -984,9 +980,8 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-core"
-version = "0.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea6cab7d24f7cd8704f76f9f4c6565d10a8b16970abd9df1bac2a831f30172db"
+version = "0.0.16-rc2"
+source = "git+https://github.com/QuipNetwork/quip-solver-core?branch=feat%2Ffamily-lease-context#9c7c53e5c964cee49a3f2c9826676e4f881694e9"
 dependencies = [
  "base64",
  "clap",
