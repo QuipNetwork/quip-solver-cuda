@@ -311,6 +311,22 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
         Ok(reads)
     }
 
+    /// A family job with a cancel check, for the lease-local screen (`screen_lease`).
+    fn solve_cancellable(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+        family: &FamilyContext,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<SamplerResult>, SampleError> {
+        if !supported(family) {
+            return self.sa.sample(graph, params);
+        }
+        let prepared = self.prepared(graph, params, family)?;
+        self.reads(graph, params, prepared, cancelled)
+            .map_err(sample_error)
+    }
+
     fn prepared(
         &self,
         graph: &IsingGraph,
@@ -406,6 +422,25 @@ impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
 
     fn accepts_family_metadata() -> bool {
         true
+    }
+
+    fn generates_locally() -> bool {
+        super::screen_lease::screen_cfg().is_some()
+    }
+
+    fn sample_lease(
+        &self,
+        lease: &quip_solver_core::Lease,
+        _topology: &quip_solver_core::TopologyView,
+        params: &SampleParams,
+        sink: &quip_solver_core::LeaseSink,
+    ) -> Result<(), SampleError> {
+        let Some(cfg) = super::screen_lease::screen_cfg() else {
+            return Err(SampleError::DeviceFault("lease screening is off".into()));
+        };
+        super::screen_lease::run_lease(lease, params, sink, &cfg, |g, p, ctx, c| {
+            self.solve_cancellable(g, p, ctx, c)
+        })
     }
 
     fn declaration() -> Declaration {
