@@ -292,30 +292,36 @@ from beta 3.
 | `otsuka_houdayer` / `QUIP_OTSUKA_HOUDAYER` | `1` | Houdayer rounds per population step. |
 | `otsuka_chunk` / `QUIP_OTSUKA_CHUNK` | `16` | Sweeps per kernel launch. |
 | `otsuka_reads`, `otsuka_sweeps` / `QUIP_OTSUKA_READS`, `QUIP_OTSUKA_SWEEPS` | job budget | Pin the replicas and sweeps of every job. |
-| `QUIP_OTSUKA_TILE_MILLI`, `QUIP_OTSUKA_PAIR_MILLI` | `250` | Cluster-draw weights (the research default; `1000` is full weight). |
+| `QUIP_OTSUKA_TILE_MILLI`, `QUIP_OTSUKA_PAIR_MILLI` | `250` | Cluster-draw weights, the research default. `1000` is full weight. |
 | `QUIP_OTSUKA_WEAK_SCALE` | `1.5` | Scale on the weak couplings in the anneal model. Reported energies stay exact. |
 
 On the first Aglais twisted-ice graph (4,575 nodes, recipe w62-p1200) with an
-RTX 5090 Laptop GPU, the previous settings reached about −5,030 in 33 s per salt;
-the defaults above reach about −5,054 in 2.4 s at 160 reads by 8,192 sweeps.
+RTX 5090 Laptop GPU, the previous settings reached about −5,030 in 33 s per salt.
+The defaults in the table reach about −5,054 in 2.4 s at 160 reads by 8,192 sweeps.
 
 ### Lease screening
 
 With `QUIP_OTSUKA_SCREEN="threads,warm,keep"` set, the miner works family
 leases itself. It generates every salt on `threads` CPU threads, scores each
-instance from four structural counts, keeps the best `keep`, and spends the GPU
-only on those: a short solve for the best few, then one long anneal for the best
-of them. See `src/cluster/screen_lease.rs` for the score and the other settings
+instance from four structural counts, and keeps the best `keep`. The GPU solves
+only the kept salts. The best few get a short solve, and the best of those gets
+one long anneal. See `src/cluster/screen_lease.rs` for the score and the other settings
 (`QUIP_OTSUKA_SCREEN_RUNGS`, `QUIP_OTSUKA_SCREEN_SCORE`,
 `QUIP_OTSUKA_SCREEN_HOLDERS`). A typical value is `20,10000,48` on a 24-thread
 host. Each miner process owns one GPU and starts its own generator threads, so
-on a host with several GPUs divide `threads` between the processes.
+on a host with more than one GPU, divide `threads` between the processes.
+Leave cores for the host population step. On a 32-thread host with two A4000
+cards, a probe took 6.5 s with 10 threads per process and 13.5 s with 14.
 
 On the current Aglais graph (4,560 nodes, recipe w45-p1350) and the same
 machine, 600 s bench rounds averaged a best energy of −5,074.4 without screening
 (every salt solved at 160 by 8,192, the best re-solved deeper) and −5,082.3 with
 it. Running live, the miner's share of rounds rose from 1 in about 600 to about
 6 %.
+
+On two RTX A4000 cards, screening reached a round best 12.5 units lower than
+solving every salt, and an estimated 8 to 11 % of rounds. See the
+[A4000 round measurements](docs/perf/2026-11-16-otsuka-rounds-a4000.md).
 
 ## Sharing the graphics processor
 

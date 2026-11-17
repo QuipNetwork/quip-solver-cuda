@@ -1,0 +1,14 @@
+{"best":-5120.21,"device":"0","long_anneals":2,"mode":"screen","recipe":"w45-p1350","round":0,"screened":658149,"seconds":600,"solved":26}
+{"best":-5118.91,"device":"0","long_anneals":2,"mode":"screen","recipe":"w45-p1350","round":1,"screened":688759,"seconds":600,"solved":26}
+{"best":-5117.13,"device":"0","long_anneals":2,"mode":"screen","recipe":"w45-p1350","round":2,"screened":704648,"seconds":600,"solved":26}
+{"best":-5123.4,"device":"1","long_anneals":2,"mode":"screen","recipe":"w45-p1350","round":3,"screened":667091,"seconds":600,"solved":26}
+{"best":-5121.46,"device":"1","long_anneals":2,"mode":"screen","recipe":"w45-p1350","round":4,"screened":691244,"seconds":600,"solved":26}
+{"best":-5118.93,"device":"1","long_anneals":2,"mode":"screen","recipe":"w45-p1350","round":5,"screened":698669,"seconds":600,"solved":26}
+{"best":-5107.12,"device":"0","long_anneals":0,"mode":"plain","recipe":"w45-p1350","round":0,"screened":0,"seconds":600,"solved":123}
+{"best":-5108.47,"device":"0","long_anneals":0,"mode":"plain","recipe":"w45-p1350","round":1,"screened":0,"seconds":600,"solved":127}
+{"best":-5112.57,"device":"0","long_anneals":0,"mode":"plain","recipe":"w45-p1350","round":2,"screened":0,"seconds":600,"solved":126}
+{"best":-5105.55,"device":"1","long_anneals":0,"mode":"plain","recipe":"w45-p1350","round":3,"screened":0,"seconds":600,"solved":119}
+{"best":-5106.81,"device":"1","long_anneals":0,"mode":"plain","recipe":"w45-p1350","round":4,"screened":0,"seconds":600,"solved":124}
+{"best":-5104.36,"device":"1","long_anneals":0,"mode":"plain","recipe":"w45-p1350","round":5,"screened":0,"seconds":600,"solved":124}
+{"best":-5052.59,"device":"0","long_anneals":0,"mode":"stock","recipe":"w45-p1350","round":0,"screened":0,"seconds":600,"solved":158}
+{"best":-5055.93,"device":"1","long_anneals":0,"mode":"stock","recipe":"w45-p1350","round":3,"screened":0,"seconds":600,"solved":148}
