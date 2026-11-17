@@ -2,6 +2,7 @@
 use clap::Parser;
 use quip_solver_core::{run, CommonArgs};
 use quip_solver_cuda::families::dipolar::{DipolarSampler, CUDA_DIPOLAR_IDENTITY};
+use quip_solver_cuda::headless::require_visible;
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -17,6 +18,7 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     run(CUDA_DIPOLAR_IDENTITY, &cli.common, || {
+        require_visible(cli.device)?;
         Ok(DipolarSampler::new(cli.device))
     })
 }

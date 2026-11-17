@@ -4,11 +4,13 @@
 //! `--miner-id` to `cuda-N` (matching `[cuda.N]` config sections).
 
 use clap::{Parser, Subcommand};
-use quip_solver_core::{run, CommonArgs};
+use quip_solver_core::{run, BackendIdentity, CommonArgs};
 use quip_solver_cuda::bench::{run_bench, BenchAction};
-use quip_solver_cuda::capacity::{advertised_couplers, advertised_nodes};
-use quip_solver_cuda::cuda_device::{device_label_mismatch, CudaDevice};
+use quip_solver_cuda::capacity::{advertised_couplers, advertised_nodes, DeviceLimits};
+use quip_solver_cuda::cuda_device::device_label_mismatch;
+use quip_solver_cuda::headless::{open_unless_capabilities, run_unopened, HEADLESS_LIMITS};
 use quip_solver_cuda::nvml_gov::UtilGovernor;
+use quip_solver_cuda::probe::open_and_print;
 use quip_solver_cuda::{cuda_gibbs_identity, CudaSampler, KernelKind};
 use std::process::ExitCode;
 
@@ -101,29 +103,24 @@ fn main() -> ExitCode {
             cli.device
         );
     }
-    let mut device = match CudaDevice::open_with_nodes(
-        cli.device,
-        KernelKind::Gibbs,
-        cli.max_nodes.unwrap_or(usize::MAX),
-    ) {
+    let cap = cli.max_nodes.unwrap_or(usize::MAX);
+    if cli.probe_capacity {
+        return open_and_print(cli.device, KernelKind::Gibbs, cap, cli.json);
+    }
+    let mut device = match open_unless_capabilities(&cli.common, cli.device, KernelKind::Gibbs, cap)
+    {
         Ok(device) => device,
-        Err(e) => {
-            tracing::error!("device {}: {e}", cli.device);
-            return ExitCode::FAILURE;
+        Err(reason) => {
+            return run_unopened::<CudaSampler>(
+                identity_at(&HEADLESS_LIMITS, cap),
+                &cli.common,
+                reason,
+            )
         }
     };
-    if cli.probe_capacity {
-        quip_solver_cuda::probe::print_probe(&device, cli.json);
-        return ExitCode::SUCCESS;
-    }
-    let nodes = advertised_nodes(
-        KernelKind::Gibbs,
-        cli.max_nodes.unwrap_or(usize::MAX),
-        Some(&device.limits),
-    );
-    device.max_nodes = nodes;
-    let edges = advertised_couplers(KernelKind::Gibbs, &device.limits);
-    run(cuda_gibbs_identity(nodes, edges), &cli.common, || {
+    let identity = identity_at(&device.limits, cap);
+    device.max_nodes = identity.max_nodes as usize;
+    run(identity, &cli.common, || {
         // The governor binds by PCI bus id, not by ordinal: NVML's index
         // space is PCI-ordered and does not track the CUDA ordinal this
         // process opened. Taking it from the opened device means both
@@ -131,6 +128,15 @@ fn main() -> ExitCode {
         let gov = UtilGovernor::start(&device.pci_bus_id, cli.utilization, cli.yielding);
         Ok(CudaSampler::new(device, gov, KernelKind::Gibbs, cli.stall))
     })
+}
+
+/// Identity at `limits`: the memory-derived node limit, reduced by
+/// `--max-nodes`, and the memory-derived coupler limit.
+fn identity_at(limits: &DeviceLimits, cap: usize) -> BackendIdentity {
+    cuda_gibbs_identity(
+        advertised_nodes(KernelKind::Gibbs, cap, Some(limits)),
+        advertised_couplers(KernelKind::Gibbs, limits),
+    )
 }
 
 #[cfg(test)]

@@ -149,6 +149,12 @@ quip-cuda-sa --capabilities   # capabilities JSON
 quip-cuda-sa --check          # probe the backend is runnable
 ```
 
+`--capabilities` does not open the device. It reports limits for a small
+reference device (64 MiB free, one SM). A session reports the limits of the
+device it opens. If the device does not open, `--check`, `--solve`, and a
+session exit 69. This includes a host with no visible GPU, and a host with the
+driver but no NVRTC.
+
 ## Multi-spin kernel (`quip-cuda-msa`)
 
 `kernels/msa.cu` is a CUDA port of the multi-spin coded simulated annealing
@@ -176,8 +182,7 @@ which reaches L2 and then DRAM as the graph grows. Placement does not change
 the samples: a spilled run returns the same reads as an all-shared run of the
 same seed. Without `--max-nodes`, the miner uses its device-derived node limit.
 The flag sets a lower cap. A value that exceeds the device limit fails at open.
-The error names the largest capacity that fits. MSA `--capabilities`
-opens the selected device to read its memory limits.
+The error names the largest capacity that fits.
 See the [A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)
 for the throughput at each size.
 

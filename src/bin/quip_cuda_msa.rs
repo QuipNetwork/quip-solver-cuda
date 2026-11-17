@@ -8,12 +8,14 @@
 use clap::{Parser, Subcommand};
 use quip_solver_core::{run, CommonArgs};
 use quip_solver_cuda::bench::{run_bench, BenchAction};
-use quip_solver_cuda::capacity::{
-    max_reads, msa_max_couplers, msa_max_nodes, resolve, MSA_DEFAULT_NODES,
+use quip_solver_cuda::capacity::{resolve, MSA_DEFAULT_NODES};
+use quip_solver_cuda::cuda_device::device_label_mismatch;
+use quip_solver_cuda::headless::{
+    config_invalid, open_unless_capabilities, run_unopened, HEADLESS_LIMITS,
 };
-use quip_solver_cuda::cuda_device::{device_label_mismatch, CudaDevice};
 use quip_solver_cuda::nvml_gov::UtilGovernor;
-use quip_solver_cuda::{cuda_msa_identity, KernelKind, MsaSampler};
+use quip_solver_cuda::probe::open_and_print;
+use quip_solver_cuda::{cuda_msa_identity_at, KernelKind, MsaSampler};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -109,31 +111,29 @@ fn main() -> ExitCode {
     }
     // MSA has no compiled node array. Open at the floor to read device
     // limits, then apply the optional cap to the same memory snapshot.
+    if cli.probe_capacity {
+        return open_and_print(cli.device, KernelKind::Msa, MSA_DEFAULT_NODES, cli.json);
+    }
     let mut device =
-        match CudaDevice::open_with_nodes(cli.device, KernelKind::Msa, MSA_DEFAULT_NODES) {
+        match open_unless_capabilities(&cli.common, cli.device, KernelKind::Msa, MSA_DEFAULT_NODES)
+        {
             Ok(device) => device,
-            Err(e) => {
-                tracing::error!("device {}: {e}", cli.device);
-                return ExitCode::FAILURE;
+            Err(reason) => {
+                return run_unopened::<MsaSampler>(
+                    cuda_msa_identity_at(&HEADLESS_LIMITS, cli.max_nodes),
+                    &cli.common,
+                    reason,
+                )
             }
         };
-    let reads = max_reads(KernelKind::Msa, &device.limits);
-    if cli.probe_capacity {
-        quip_solver_cuda::probe::print_probe(&device, cli.json);
-        return ExitCode::SUCCESS;
-    }
     if let Some(cap) = cli.max_nodes {
         if let Err(e) = resolve(KernelKind::Msa, cap, &device.limits) {
             tracing::error!("device {}: {e}", cli.device);
-            return ExitCode::FAILURE;
+            return config_invalid();
         }
     }
-    let nodes = msa_max_nodes(&device.limits, reads)
-        .min(cli.max_nodes.unwrap_or(usize::MAX).max(MSA_DEFAULT_NODES));
-    let edges = msa_max_couplers(&device.limits, reads);
-    device.max_nodes = nodes;
-    let mut identity = cuda_msa_identity(nodes, edges);
-    identity.adapt = quip_solver_cuda::cuda_msa_adapt(u32::try_from(reads).unwrap_or(128));
+    let identity = cuda_msa_identity_at(&device.limits, cli.max_nodes);
+    device.max_nodes = identity.max_nodes as usize;
     run(identity, &cli.common, || {
         // The governor binds by PCI bus id, not by ordinal: NVML's index
         // space is PCI-ordered and does not track the CUDA ordinal this
