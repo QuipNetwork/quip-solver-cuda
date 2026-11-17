@@ -2,8 +2,8 @@
 
 use clap::Parser;
 use quip_solver_core::{run, CommonArgs, OpenError};
-use quip_solver_cuda::cluster::sampler::{cuda_otsuka_identity, OtsukaSampler, HEADLESS_LIMITS};
-use quip_solver_cuda::cuda_device::CudaDevice;
+use quip_solver_cuda::cluster::sampler::{cuda_otsuka_identity, OtsukaSampler};
+use quip_solver_cuda::headless::{open_unless_capabilities, run_unopened, HEADLESS_LIMITS};
 use quip_solver_cuda::nvml_gov::UtilGovernor;
 use quip_solver_cuda::streaming::StallConfig;
 use quip_solver_cuda::KernelKind;
@@ -36,24 +36,21 @@ fn main() -> ExitCode {
         cli.common.miner_id = Some(format!("cuda-{}", cli.device));
     }
     let cap = cli.max_nodes.unwrap_or(usize::MAX);
-    if cli.common.capabilities {
-        return run(
-            cuda_otsuka_identity(&HEADLESS_LIMITS, cap),
-            &cli.common,
-            || Err::<OtsukaSampler, _>(OpenError("capabilities must remain headless".into())),
-        );
-    }
-    let mut device = match CudaDevice::open_with_nodes(cli.device, KernelKind::Sa, cap) {
+    let headless = || cuda_otsuka_identity(&HEADLESS_LIMITS, cap);
+    let mut device = match open_unless_capabilities(&cli.common, cli.device, KernelKind::Sa, cap) {
         Ok(device) => device,
-        Err(error) => {
-            eprintln!("device {}: {error}", cli.device);
-            return ExitCode::FAILURE;
-        }
+        Err(reason) => return run_unopened::<OtsukaSampler>(headless(), &cli.common, reason),
     };
     let identity = cuda_otsuka_identity(&device.limits, cap.min(device.max_nodes));
     if identity.max_nodes == 0 {
-        eprintln!("device has no capacity for an Otsuka session");
-        return ExitCode::FAILURE;
+        return run_unopened::<OtsukaSampler>(
+            headless(),
+            &cli.common,
+            format!(
+                "device {} has no capacity for an Otsuka session",
+                cli.device
+            ),
+        );
     }
     device.max_nodes = identity.max_nodes as usize;
     run(identity, &cli.common, || {

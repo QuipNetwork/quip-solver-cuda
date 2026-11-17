@@ -26,15 +26,6 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 /// Stable binary identity.
 pub const OTSUKA_SOLVER_ID: &str = "quip-cuda-otsuka/1";
 
-/// Conservative headless budgets. Live sessions use the selected device facts.
-pub const HEADLESS_LIMITS: DeviceLimits = DeviceLimits {
-    shared_bytes_per_block: 48 << 10,
-    shared_bytes_per_block_optin: 48 << 10,
-    free_bytes: 64 << 20,
-    sm_count: 1,
-    threads_per_sm: 2048,
-};
-
 // A topology bound, enforced by the session for both family and plain jobs.
 const MAX_DEGREE: usize = 128;
 const MAX_READS: usize = 256;

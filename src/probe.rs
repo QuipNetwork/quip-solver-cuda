@@ -152,6 +152,28 @@ pub fn print_probe(device: &CudaDevice, json: bool) {
     );
 }
 
+/// Open `device` and print its capacity grid (`--probe-capacity`).
+///
+/// A device that does not open exits 69, as in every session mode.
+#[must_use]
+pub fn open_and_print(
+    device: usize,
+    kernel: KernelKind,
+    max_nodes: usize,
+    json: bool,
+) -> std::process::ExitCode {
+    match CudaDevice::open_with_nodes(device, kernel, max_nodes) {
+        Ok(opened) => {
+            print_probe(&opened, json);
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!("device {device}: {e}");
+            crate::headless::env_incompatible()
+        }
+    }
+}
+
 /// The capacity grid of `kernel` on a device with `limits`, as text or JSON.
 fn render_probe(name: &str, kernel: KernelKind, limits: &DeviceLimits, json: bool) -> String {
     use std::fmt::Write as _;

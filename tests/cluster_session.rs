@@ -7,9 +7,10 @@ use quip_solver_core::{
 use quip_solver_cuda::capacity::DeviceLimits;
 use quip_solver_cuda::cluster::device::{ClusterDeviceError, ClusterRun};
 use quip_solver_cuda::cluster::sampler::{
-    cuda_otsuka_identity, ClusterBackend, ClusterWork, OtsukaSampler, HEADLESS_LIMITS,
+    cuda_otsuka_identity, ClusterBackend, ClusterWork, OtsukaSampler,
 };
 use quip_solver_cuda::cluster::{Model, Motifs, PreparedGraph, Weights};
+use quip_solver_cuda::headless::HEADLESS_LIMITS;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 

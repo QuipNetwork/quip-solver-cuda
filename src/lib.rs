@@ -33,6 +33,7 @@ pub mod descent;
 mod cutoff;
 pub mod driver_budget;
 pub mod families;
+pub mod headless;
 mod jit_cache;
 pub mod kernel;
 mod lease;
@@ -290,6 +291,26 @@ pub fn cuda_msa_identity(max_nodes: usize, max_edges: usize) -> BackendIdentity 
             exact_resolution_milli: Some(1),
         },
     }
+}
+
+/// Backend identity for `quip-cuda-msa` and `quip-cuda-msa-descent` on a
+/// device with `limits`, the node limit optionally reduced by `--max-nodes`
+/// but never below [`capacity::MSA_DEFAULT_NODES`]. Reads per nonce follow
+/// the device's opt-in shared memory ([`cuda_msa_adapt`]).
+#[must_use]
+pub fn cuda_msa_identity_at(
+    limits: &capacity::DeviceLimits,
+    max_nodes: Option<usize>,
+) -> BackendIdentity {
+    let reads = capacity::max_reads(KernelKind::Msa, limits);
+    let nodes = capacity::msa_max_nodes(limits, reads).min(
+        max_nodes
+            .unwrap_or(usize::MAX)
+            .max(capacity::MSA_DEFAULT_NODES),
+    );
+    let mut identity = cuda_msa_identity(nodes, capacity::msa_max_couplers(limits, reads));
+    identity.adapt = cuda_msa_adapt(u32::try_from(reads).unwrap_or(128));
+    identity
 }
 
 /// Backend identity for `quip-cuda-gibbs` at its device-memory node and
