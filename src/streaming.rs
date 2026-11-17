@@ -29,8 +29,8 @@ use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg};
 use quip_protocol::scoring::energy_milli;
 use quip_solver_core::beta::default_ising_beta_range;
-use quip_solver_core::BetaSchedule;
 use quip_solver_core::SampleError as WireSampleError;
+use quip_solver_core::{BetaLadder, BetaSchedule};
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome, StreamResult,
 };
@@ -274,17 +274,45 @@ pub(crate) fn build_beta_schedule(
 ) -> (Vec<f32>, usize) {
     let _span = trace_span!("beta_build", num_sweeps).entered();
     let sweeps_per = sweeps_per_beta.max(1);
-    let num_betas = (num_sweeps / sweeps_per).max(1);
-    let (hot, cold) = beta_range.unwrap_or_else(|| default_ising_beta_range(graph));
     // `beta_factor` turns a beta for the model in units into one for the
     // kernel's integer delta (see `coefficients::CoefficientPlan`). It is
     // exactly 1.0 for a mining job, so the uploaded schedule is unchanged.
-    let sched: Vec<f32> = schedule
-        .build(hot, cold, num_betas)
+    let sched: Vec<f32> = model_betas(graph, num_sweeps, sweeps_per, beta_range, schedule)
         .iter()
         .map(|&b| (b * beta_factor) as f32)
         .collect();
     (sched, sweeps_per)
+}
+
+/// The ladder in model units, hot to cold, before the kernel's unit factor.
+fn model_betas(
+    graph: &IsingGraph,
+    num_sweeps: usize,
+    sweeps_per_beta: usize,
+    beta_range: Option<(f64, f64)>,
+    schedule: BetaSchedule,
+) -> Vec<f64> {
+    let num_betas = (num_sweeps / sweeps_per_beta.max(1)).max(1);
+    let (hot, cold) = beta_range.unwrap_or_else(|| default_ising_beta_range(graph));
+    schedule.build(hot, cold, num_betas)
+}
+
+/// The ladder the SA, Gibbs and MSA kernels run for `params`, in model units.
+///
+/// [`build_beta_schedule`] uploads these rungs, each times the coefficient
+/// plan's unit factor, so `--solve` reports the ladder that ran.
+#[must_use]
+pub fn beta_ladder(graph: &IsingGraph, params: &SampleParams) -> BetaLadder {
+    BetaLadder {
+        kind: params.schedule,
+        betas: model_betas(
+            graph,
+            params.num_sweeps,
+            params.sweeps_per_beta,
+            params.beta_range,
+            params.schedule,
+        ),
+    }
 }
 
 fn build_planned_beta_schedule(
@@ -4498,6 +4526,27 @@ mod tests {
         let (sched, _) =
             build_beta_schedule(&graph(), 5, 1, Some((1.0, 5.0)), BetaSchedule::Linear, 1.0);
         assert_eq!(sched, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// `--solve` reports this ladder, so it must be the uploaded one.
+    #[test]
+    fn the_reported_ladder_is_the_uploaded_ladder() {
+        for schedule in [BetaSchedule::Linear, BetaSchedule::Geometric] {
+            let params = SampleParams {
+                num_sweeps: 24,
+                sweeps_per_beta: 4,
+                beta_range: Some((0.25, 3.0)),
+                schedule,
+                ..SampleParams::default()
+            };
+            let ladder = beta_ladder(&graph(), &params);
+            let (uploaded, _) =
+                build_beta_schedule(&graph(), 24, 4, Some((0.25, 3.0)), schedule, 1.0);
+            assert_eq!(ladder.kind, schedule);
+            let reported: Vec<f32> = ladder.betas.iter().map(|&b| b as f32).collect();
+            assert_eq!(reported, uploaded);
+            assert_eq!(ladder.betas.len(), 6);
+        }
     }
 
     /// `--solve` seeds that differ only in their high 32 bits used to give the

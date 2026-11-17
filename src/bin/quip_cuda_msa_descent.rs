@@ -4,7 +4,7 @@
 //! The same device, kernel, and CLI as `quip-cuda-msa`. After each job the
 //! host runs the `msa-nat-loop/1` descent: natural-move greedy on every read,
 //! then the alternating greedy and worm schedule on the lowest raw read
-//! ([`quip_solver_cuda::descent`]). Lease salts run without descent. Select
+//! ([`quip_solver_cuda::descent`]). It rejects coordinator leases. Select
 //! it in the coordinator's `config.toml` with
 //! `[cuda.N] binary = "<path>/quip-cuda-msa-descent"`.
 

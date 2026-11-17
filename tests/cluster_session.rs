@@ -847,6 +847,7 @@ mod gpu {
             beta_range: Some((0.1, 1.7)),
             schedule: quip_solver_core::BetaSchedule::Geometric,
             seed: 73,
+            ..quip_solver_core::SampleParams::default()
         };
         let prepared = PreparedGraph::from_instance(
             &instance,
