@@ -11,7 +11,9 @@ use crate::nvml_gov::UtilGovernor;
 use crate::streaming::{build_beta_schedule, StallConfig};
 use crate::{cuda_sa_identity, CudaSampler, KernelKind};
 use quip_solver_core::families::{Declaration, FamilyClaim, FamilyContext};
+use quip_solver_core::ising_generators::descriptor::Contract;
 use quip_solver_core::ising_generators::ice::TWISTED_DIMER_V1;
+use quip_solver_core::ising_generators::instance::Instance;
 use quip_solver_core::quip_proto::v1::Algorithm;
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::{
@@ -114,7 +116,7 @@ impl ClusterWork {
             graph,
             params.num_sweeps,
             per_beta,
-            params.beta_range,
+            params.beta_range.or(super::device::knobs().beta),
             params.schedule,
             1.0,
         );
@@ -219,7 +221,8 @@ impl ClusterBackend for GpuCluster {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ClusterRun, ClusterDeviceError> {
         checkpoint(stopped)?;
-        ClusterDevice::open_with_kernel(graph, &self.kernel)?.run_work(work, stopped, cancelled)
+        ClusterDevice::open_with_kernel(graph, &self.kernel)?
+            .run_work_population(work, stopped, cancelled)
     }
 }
 
@@ -271,6 +274,7 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
         prepared: PreparedGraph,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<SamplerResult>, ClusterDeviceError> {
+        let params = &budget(params);
         // A governor yield refuses this job as busy. Only the session token
         // makes finish() report Cancelled and suppress the upstream result.
         let stopped = || cancelled() || self.sa.should_throttle();
@@ -299,23 +303,47 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
         Ok(reads)
     }
 
+    /// A salt the lease-local screen (`screen_lease`) generated, solved with a cancel check.
+    fn solve_cancellable(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+        instance: &Instance,
+        contract: &Contract,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<SamplerResult>, SampleError> {
+        if !supported(contract) {
+            return self.sa.sample(graph, params);
+        }
+        let prepared = self.prepared(graph, params, instance, contract)?;
+        self.reads(graph, params, prepared, cancelled)
+            .map_err(sample_error)
+    }
+
+    /// Prepare the bound canonical instance of a family job, with the configured weak scale.
     fn prepared(
         &self,
         graph: &IsingGraph,
         params: &SampleParams,
-        family: &FamilyContext,
+        instance: &Instance,
+        contract: &Contract,
     ) -> Result<PreparedGraph, SampleError> {
-        if family.instance().h().len() != graph.h.len()
-            || family.instance().edges().len() != graph.edges.len()
-        {
+        let params = &budget(params);
+        if instance.h().len() != graph.h.len() || instance.edges().len() != graph.edges.len() {
             return Err(SampleError::Capacity);
         }
-        PreparedGraph::from_family(family, Weights::FULL, &self.limits, params.num_reads).map_err(
-            |e| {
-                tracing::warn!(error = %e, "cluster admission refused");
-                SampleError::Capacity
-            },
+        PreparedGraph::from_instance_scaled(
+            instance,
+            contract,
+            weights_knob(),
+            &self.limits,
+            params.num_reads,
+            super::prepare::weak_scale(),
         )
+        .map_err(|e| {
+            tracing::warn!(error = %e, "cluster admission refused");
+            SampleError::Capacity
+        })
     }
 
     fn finish(
@@ -360,9 +388,9 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
     }
 }
 
-fn supported(family: &FamilyContext) -> bool {
-    family.family_id() == TWISTED_DIMER_V1.family_id
-        && family.revision() == TWISTED_DIMER_V1.revision
+fn supported(contract: &Contract) -> bool {
+    contract.family_id == TWISTED_DIMER_V1.family_id
+        && contract.revision == TWISTED_DIMER_V1.revision
 }
 
 fn sample_error(error: ClusterDeviceError) -> SampleError {
@@ -395,6 +423,25 @@ impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
         true
     }
 
+    fn generates_locally() -> bool {
+        super::screen_lease::screen_cfg().is_some()
+    }
+
+    fn sample_lease(
+        &self,
+        lease: &quip_solver_core::Lease,
+        _topology: &quip_solver_core::TopologyView,
+        params: &SampleParams,
+        sink: &quip_solver_core::LeaseSink,
+    ) -> Result<(), SampleError> {
+        let Some(cfg) = super::screen_lease::screen_cfg() else {
+            return Err(SampleError::DeviceFault("lease screening is off".into()));
+        };
+        super::screen_lease::run_lease(lease, params, sink, &cfg, |g, p, inst, contract, c| {
+            self.solve_cancellable(g, p, inst, contract, c)
+        })
+    }
+
     fn declaration() -> Declaration {
         Declaration {
             solver_id: OTSUKA_SOLVER_ID,
@@ -410,10 +457,10 @@ impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
         _warm: Option<&WarmStart>,
         family: &FamilyContext,
     ) -> Result<Vec<SamplerResult>, SampleError> {
-        if !supported(family) {
+        if !supported(family.contract()) {
             return self.sample(graph, params);
         }
-        let prepared = self.prepared(graph, params, family)?;
+        let prepared = self.prepared(graph, params, family.instance(), family.contract())?;
         self.reads(graph, params, prepared, &|| false)
             .map_err(sample_error)
     }
@@ -444,9 +491,14 @@ impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
                     break;
                 }
                 let job = item.job;
-                if let Some(family) = item.family.as_ref().filter(|f| supported(f)) {
+                if let Some(family) = item.family.as_ref().filter(|f| supported(f.contract())) {
                     let result = Self::finish(&job, &cancel, || {
-                        let prepared = self.prepared(&job.graph, &job.params, family)?;
+                        let prepared = self.prepared(
+                            &job.graph,
+                            &job.params,
+                            family.instance(),
+                            family.contract(),
+                        )?;
                         self.reads(&job.graph, &job.params, prepared, &|| {
                             cancel.is_cancelled(job.watermark)
                         })
@@ -480,6 +532,53 @@ impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
         self.sa.should_throttle()
     }
     fn apply_config(&self, backend_toml: &str) {
+        super::device::knobs_from_toml(backend_toml);
         self.sa.apply_config(backend_toml);
     }
 }
+
+/// The job's budget, with the replicas and sweeps pinned by `otsuka_reads` / `otsuka_sweeps`
+/// (`QUIP_OTSUKA_READS` / `QUIP_OTSUKA_SWEEPS`) when they are set.
+fn budget(params: &SampleParams) -> SampleParams {
+    let k = super::device::knobs();
+    let mut p = params.clone();
+    if k.reads > 0 {
+        p.num_reads = k.reads.min(MAX_READS);
+    }
+    if k.sweeps > 0 {
+        p.num_sweeps = k.sweeps;
+    }
+    p
+}
+
+/// Cluster-draw weights for family jobs, in milli.
+///
+/// The default is the research value, 250 for tiles and pairs (`run_cluster.py`); the full weights
+/// (1000) freeze the clusters early on twisted-ice instances. `QUIP_OTSUKA_TILE_MILLI` and
+/// `QUIP_OTSUKA_PAIR_MILLI` override it.
+fn weights_knob() -> Weights {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let get = |key: &str, lo: i32| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .filter(|x| (lo..=1000).contains(x))
+            .unwrap_or(DEFAULT_CLUSTER_MILLI)
+    };
+    let w = Weights {
+        pair_milli: get("QUIP_OTSUKA_PAIR_MILLI", 0),
+        tile_milli: get("QUIP_OTSUKA_TILE_MILLI", 1),
+    };
+    ONCE.call_once(|| {
+        tracing::info!(
+            tile_milli = w.tile_milli,
+            pair_milli = w.pair_milli,
+            weak_scale = super::prepare::weak_scale(),
+            "otsuka cluster settings"
+        );
+    });
+    w
+}
+
+/// The research cluster weight, in milli.
+const DEFAULT_CLUSTER_MILLI: i32 = 250;
