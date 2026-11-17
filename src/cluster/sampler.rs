@@ -11,7 +11,9 @@ use crate::nvml_gov::UtilGovernor;
 use crate::streaming::{build_beta_schedule, StallConfig};
 use crate::{cuda_sa_identity, CudaSampler, KernelKind};
 use quip_solver_core::families::{Declaration, FamilyClaim, FamilyContext};
+use quip_solver_core::ising_generators::descriptor::Contract;
 use quip_solver_core::ising_generators::ice::TWISTED_DIMER_V1;
+use quip_solver_core::ising_generators::instance::Instance;
 use quip_solver_core::quip_proto::v1::Algorithm;
 use quip_solver_core::quip_protocol::scoring::energy_milli;
 use quip_solver_core::{
@@ -301,40 +303,47 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
         Ok(reads)
     }
 
-    /// A family job with a cancel check, for the lease-local screen (`screen_lease`).
+    /// A salt the lease-local screen (`screen_lease`) generated, solved with a cancel check.
     fn solve_cancellable(
         &self,
         graph: &IsingGraph,
         params: &SampleParams,
-        family: &FamilyContext,
+        instance: &Instance,
+        contract: &Contract,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<SamplerResult>, SampleError> {
-        if !supported(family) {
+        if !supported(contract) {
             return self.sa.sample(graph, params);
         }
-        let prepared = self.prepared(graph, params, family)?;
+        let prepared = self.prepared(graph, params, instance, contract)?;
         self.reads(graph, params, prepared, cancelled)
             .map_err(sample_error)
     }
 
+    /// Prepare the bound canonical instance of a family job, with the configured weak scale.
     fn prepared(
         &self,
         graph: &IsingGraph,
         params: &SampleParams,
-        family: &FamilyContext,
+        instance: &Instance,
+        contract: &Contract,
     ) -> Result<PreparedGraph, SampleError> {
         let params = &budget(params);
-        if family.instance().h().len() != graph.h.len()
-            || family.instance().edges().len() != graph.edges.len()
-        {
+        if instance.h().len() != graph.h.len() || instance.edges().len() != graph.edges.len() {
             return Err(SampleError::Capacity);
         }
-        PreparedGraph::from_family(family, weights_knob(), &self.limits, params.num_reads).map_err(
-            |e| {
-                tracing::warn!(error = %e, "cluster admission refused");
-                SampleError::Capacity
-            },
+        PreparedGraph::from_instance_scaled(
+            instance,
+            contract,
+            weights_knob(),
+            &self.limits,
+            params.num_reads,
+            super::prepare::weak_scale(),
         )
+        .map_err(|e| {
+            tracing::warn!(error = %e, "cluster admission refused");
+            SampleError::Capacity
+        })
     }
 
     fn finish(
@@ -379,9 +388,9 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
     }
 }
 
-fn supported(family: &FamilyContext) -> bool {
-    family.family_id() == TWISTED_DIMER_V1.family_id
-        && family.revision() == TWISTED_DIMER_V1.revision
+fn supported(contract: &Contract) -> bool {
+    contract.family_id == TWISTED_DIMER_V1.family_id
+        && contract.revision == TWISTED_DIMER_V1.revision
 }
 
 fn sample_error(error: ClusterDeviceError) -> SampleError {
@@ -428,8 +437,8 @@ impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
         let Some(cfg) = super::screen_lease::screen_cfg() else {
             return Err(SampleError::DeviceFault("lease screening is off".into()));
         };
-        super::screen_lease::run_lease(lease, params, sink, &cfg, |g, p, ctx, c| {
-            self.solve_cancellable(g, p, ctx, c)
+        super::screen_lease::run_lease(lease, params, sink, &cfg, |g, p, inst, contract, c| {
+            self.solve_cancellable(g, p, inst, contract, c)
         })
     }
 
@@ -448,10 +457,10 @@ impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
         _warm: Option<&WarmStart>,
         family: &FamilyContext,
     ) -> Result<Vec<SamplerResult>, SampleError> {
-        if !supported(family) {
+        if !supported(family.contract()) {
             return self.sample(graph, params);
         }
-        let prepared = self.prepared(graph, params, family)?;
+        let prepared = self.prepared(graph, params, family.instance(), family.contract())?;
         self.reads(graph, params, prepared, &|| false)
             .map_err(sample_error)
     }
@@ -482,9 +491,14 @@ impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
                     break;
                 }
                 let job = item.job;
-                if let Some(family) = item.family.as_ref().filter(|f| supported(f)) {
+                if let Some(family) = item.family.as_ref().filter(|f| supported(f.contract())) {
                     let result = Self::finish(&job, &cancel, || {
-                        let prepared = self.prepared(&job.graph, &job.params, family)?;
+                        let prepared = self.prepared(
+                            &job.graph,
+                            &job.params,
+                            family.instance(),
+                            family.contract(),
+                        )?;
                         self.reads(&job.graph, &job.params, prepared, &|| {
                             cancel.is_cancelled(job.watermark)
                         })

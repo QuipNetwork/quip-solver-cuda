@@ -8,7 +8,6 @@ use crate::capacity::{
     cluster_footprint, ClusterShape, DeviceLimits, Footprint, CLUSTER_DYNAMIC_PADDING,
     CLUSTER_SHARED_BYTES_PER_NODE, CLUSTER_STATIC_SHARED_BYTES,
 };
-use quip_solver_core::families::FamilyContext;
 use quip_solver_core::ising_generators::descriptor::Contract;
 use quip_solver_core::ising_generators::ice::twisted_dimer::local_gauges;
 use quip_solver_core::ising_generators::ice::TWISTED_DIMER_V1;
@@ -289,7 +288,7 @@ impl PreparedGraph {
     /// Prepare a session-validated canonical instance under its family contract.
     ///
     /// The caller must validate the instance against `contract` and its declared
-    /// parameters first. Prefer [`Self::from_family`] for session jobs.
+    /// parameters first. Session jobs use [`Self::from_instance_scaled`] with the configured weak scale.
     ///
     /// # Errors
     /// Returns unsupported family or unreadable metadata, then the same errors
@@ -339,27 +338,6 @@ impl PreparedGraph {
             limits,
             anneals,
             weak_scale,
-        )
-    }
-
-    /// Read the bound canonical instance supplied by a lease or explicit job, with the
-    /// configured weak-coupling scale ([`weak_scale`]) in the anneal model.
-    ///
-    /// # Errors
-    /// Returns the same errors as [`Self::from_instance`].
-    pub fn from_family(
-        family: &FamilyContext,
-        weights: Weights,
-        limits: &DeviceLimits,
-        anneals: usize,
-    ) -> Result<Self, PrepareError> {
-        Self::from_instance_scaled(
-            family.instance(),
-            family.contract(),
-            weights,
-            limits,
-            anneals,
-            weak_scale(),
         )
     }
 

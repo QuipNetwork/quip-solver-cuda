@@ -29,7 +29,7 @@
 //! - `QUIP_OTSUKA_SCREEN_SCORE="w_free,w_tiled_pairs,w_fmean,w_m2"`, default `1,0.773,20.8,22.2`.
 //! - `QUIP_OTSUKA_SCREEN_HOLDERS=<n>`: leases allowed to wait for the GPU, default 1.
 
-use quip_solver_core::families::FamilyContext;
+use quip_solver_core::ising_generators::descriptor::Contract;
 use quip_solver_core::ising_generators::instance::Instance;
 use quip_solver_core::{
     IsingGraph, Lease, LeaseSink, LeaseStopped, SampleError, SampleParams, SamplerResult,
@@ -472,7 +472,8 @@ fn seed_of(nonce: &[u8; 32], salt: u64) -> u64 {
 
 /// Work one family lease: screen every salt on the CPU, solve the best on the GPU.
 ///
-/// `solve` runs one family job with a cancel check, returning reads with exact energies.
+/// `solve` runs one generated salt (its instance and the lease's contract) with a cancel check,
+/// returning reads with exact energies.
 ///
 /// # Errors
 /// A fatal device error from `solve`.
@@ -491,7 +492,8 @@ where
     F: Fn(
         &IsingGraph,
         &SampleParams,
-        &FamilyContext,
+        &Instance,
+        &'static Contract,
         &dyn Fn() -> bool,
     ) -> Result<Vec<SamplerResult>, SampleError>,
 {
@@ -581,9 +583,7 @@ where
                 .collect();
             let h: Vec<f64> = inst.h().iter().map(|&x| f64::from(x) / 1000.0).collect();
             let jv: Vec<f64> = inst.j().iter().map(|&x| f64::from(x) / 1000.0).collect();
-            let graph = IsingGraph::new(h, jv, edges);
-            let ctx = family.context(c.idx, Arc::clone(inst));
-            (graph, ctx)
+            IsingGraph::new(h, jv, edges)
         };
         let my_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut am_holder = false;
@@ -698,7 +698,7 @@ where
                              sweeps: usize,
                              tag: &str|
              -> Result<Option<Vec<SamplerResult>>, SampleError> {
-                let (graph, ctx) = build(c);
+                let graph = build(c);
                 let mut p = params.clone();
                 if reads > 0 {
                     p.num_reads = reads;
@@ -706,7 +706,7 @@ where
                 }
                 p.seed = seed_of(&lease.nonce(c.idx), c.idx ^ 0x5eed ^ (sweeps as u64));
                 let ts = Instant::now();
-                match solve(&graph, &p, &ctx, &stopped) {
+                match solve(&graph, &p, &c.inst, family.contract(), &stopped) {
                     Ok(mut rs) if !rs.is_empty() => {
                         let off = c.inst.offset_milli();
                         for r in &mut rs {
