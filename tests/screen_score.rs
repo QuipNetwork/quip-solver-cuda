@@ -45,7 +45,7 @@ fn the_score_is_a_weighted_sum_of_four_counts() {
         let expected: f64 = parts.iter().zip(DEFAULT_WEIGHTS).map(|(p, w)| p * w).sum();
         assert!((total - expected).abs() < 1e-6, "{total} vs {expected}");
         // A screened-out salt reports the energy of its all-up state.
-        let sum: i64 = inst.j().iter().map(|&j| i64::from(j)).sum();
+        let sum: i64 = inst.h().iter().chain(inst.j()).map(|&w| i64::from(w)).sum();
         assert_eq!(all_up, sum);
     }
 }

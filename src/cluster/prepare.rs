@@ -203,6 +203,8 @@ impl PreparedGraph {
                 (u, v, if jm.abs() < 500 { scaled(r) } else { r })
             })
             .collect();
+        // A weak scale above 1 raises the residual sum the kernel accumulates.
+        check_residual_sum(weak_edges.iter().map(|edge| edge.2))?;
         let weak_rows = rows(n, &weak_edges, &original_to_device);
         let shape = ClusterShape {
             nodes: n,
@@ -302,7 +304,12 @@ impl PreparedGraph {
         Self::from_instance_scaled(instance, contract, weights, limits, anneals, 1.0)
     }
 
-    fn from_instance_scaled(
+    /// [`Self::from_instance`] with the weak couplings scaled by `weak_scale` in the anneal model.
+    ///
+    /// # Errors
+    /// The same as [`Self::from_instance`].
+    #[doc(hidden)]
+    pub fn from_instance_scaled(
         instance: &Instance,
         contract: &Contract,
         weights: Weights,

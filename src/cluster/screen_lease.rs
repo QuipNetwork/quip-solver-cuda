@@ -454,7 +454,8 @@ pub fn score(inst: &Instance, weights: &[f64; 4]) -> (f64, i64) {
         + weights[1] * pair_tt as f64
         + weights[2] * f_mean / 1000.0
         + weights[3] * m2 / 1000.0;
-    let all_up: i64 = j.iter().map(|&w| i64::from(w)).sum();
+    // Every spin +1: the fields and the couplings each count once.
+    let all_up: i64 = inst.h().iter().chain(j).map(|&w| i64::from(w)).sum();
     (s, all_up)
 }
 

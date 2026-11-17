@@ -241,15 +241,37 @@ pub(crate) struct Knobs {
 
 static KNOBS: std::sync::RwLock<Option<Knobs>> = std::sync::RwLock::new(None);
 
-fn parse_beta(v: &str) -> Option<(f64, f64)> {
+/// The default family beta range `(hot, cold)`.
+const DEFAULT_BETA: (f64, f64) = (1.0, 8.0);
+
+/// A usable beta range: both bounds finite and positive, hot below cold.
+fn beta_pair(hot: f64, cold: f64) -> Option<(f64, f64)> {
+    (hot.is_finite() && cold.is_finite() && hot > 0.0 && hot < cold).then_some((hot, cold))
+}
+
+/// `"stock"` is `Ok(None)` (the job's own range), `"hot,cold"` is `Ok(Some(..))`, anything else is
+/// an error so the caller keeps its current range.
+fn parse_beta(v: &str) -> Result<Option<(f64, f64)>, ()> {
     if v.trim() == "stock" {
-        return None;
+        return Ok(None);
     }
-    let mut it = v.split(',').filter_map(|x| x.trim().parse::<f64>().ok());
-    match (it.next(), it.next()) {
-        (Some(hot), Some(cold)) if hot > 0.0 && cold > 0.0 => Some((hot, cold)),
-        _ => Some((1.0, 8.0)),
+    let parts: Vec<f64> = v
+        .split(',')
+        .map(|x| x.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| ())?;
+    match parts[..] {
+        [hot, cold] => beta_pair(hot, cold).map(Some).ok_or(()),
+        _ => Err(()),
     }
+}
+
+/// [`parse_beta`] for a setting named `source`, warning and keeping `current` on a bad value.
+fn beta_or(source: &str, v: &str, current: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    parse_beta(v).unwrap_or_else(|()| {
+        tracing::warn!(source, value = v, "ignoring an invalid otsuka beta range");
+        current
+    })
 }
 
 pub(crate) fn knobs() -> Knobs {
@@ -261,8 +283,8 @@ pub(crate) fn knobs() -> Knobs {
     }
     let k = Knobs {
         beta: match std::env::var("QUIP_OTSUKA_BETA") {
-            Ok(v) => parse_beta(&v),
-            Err(_) => Some((1.0, 8.0)),
+            Ok(v) => beta_or("QUIP_OTSUKA_BETA", &v, Some(DEFAULT_BETA)),
+            Err(_) => Some(DEFAULT_BETA),
         },
         chunk: envn("QUIP_OTSUKA_CHUNK", 16).max(1),
         resamples: envn("QUIP_OTSUKA_RESAMPLES", 256),
@@ -307,16 +329,18 @@ pub(crate) fn knobs_from_toml(backend_toml: &str) {
         k.sweeps = v;
     }
     match t.get("otsuka_beta") {
-        Some(toml::Value::String(v)) => k.beta = parse_beta(v),
-        Some(toml::Value::Array(a)) if a.len() == 2 => {
+        Some(toml::Value::String(v)) => k.beta = beta_or("otsuka_beta", v, k.beta),
+        Some(toml::Value::Array(a)) => {
             let f = |x: &toml::Value| x.as_float().or_else(|| x.as_integer().map(|i| i as f64));
-            if let (Some(hot), Some(cold)) = (f(&a[0]), f(&a[1])) {
-                if hot > 0.0 && cold > 0.0 {
+            match (a.len(), a.first().and_then(f), a.get(1).and_then(f)) {
+                (2, Some(hot), Some(cold)) if beta_pair(hot, cold).is_some() => {
                     k.beta = Some((hot, cold));
                 }
+                _ => tracing::warn!(value = ?a, "ignoring an invalid otsuka_beta"),
             }
         }
-        _ => {}
+        Some(other) => tracing::warn!(value = ?other, "ignoring an invalid otsuka_beta"),
+        None => {}
     }
     *KNOBS
         .write()
@@ -350,6 +374,104 @@ impl Pop {
     )]
     fn unit(&mut self) -> f64 {
         (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// The beta from which the population step pairs replicas for Houdayer moves, as in the CPU
+/// sampler. Below it the replicas differ almost everywhere and a move only swaps a pair.
+const HOUDAYER_BETA: f32 = 3.0;
+
+/// Systematic resampling: the replica each slot copies, drawn in proportion to
+/// `exp(-step * (E - E_min))` (energies in milli) with the single uniform offset `unit` in `[0, 1)`.
+/// The result keeps the population size and lists replicas in ascending order.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "milli energies and replica counts are far below 2^52"
+)]
+fn systematic_resample(energy: &[i64], step: f64, unit: f64) -> Vec<usize> {
+    let r = energy.len();
+    if r == 0 {
+        return Vec::new();
+    }
+    let low = energy.iter().copied().min().unwrap_or(0);
+    let weights: Vec<f64> = energy
+        .iter()
+        .map(|&e| (-step * (e - low) as f64 / 1000.0).exp())
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let stride = total / r as f64;
+    let mut mark = unit * stride;
+    let mut picks = Vec::with_capacity(r);
+    let mut reach = 0.0;
+    for (i, &w) in weights.iter().enumerate() {
+        reach += w;
+        while mark < reach && picks.len() < r {
+            picks.push(i);
+            mark += stride;
+        }
+    }
+    // Rounding in the running sum can leave the last slot unfilled.
+    picks.resize(r, r - 1);
+    picks
+}
+
+/// `rounds` rounds of Houdayer moves over random pairs of `states`. Each move picks a node where the
+/// pair differs, grows the connected cluster of differing nodes over `adj`, and swaps it between
+/// the two. Every edge that leaves the cluster ends on a node where the pair agrees, so a move
+/// keeps the summed energy of the pair.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "node and replica indices stay below MAX_PACKED_NODES and MAX_READS"
+)]
+fn houdayer_rounds(
+    states: &mut [Vec<i8>],
+    adj: &[Vec<u32>],
+    rounds: usize,
+    next: &mut dyn FnMut() -> u64,
+) {
+    let replicas = states.len();
+    let nodes = adj.len();
+    let mut order: Vec<usize> = (0..replicas).collect();
+    let mut seen = vec![false; nodes];
+    let mut differ: Vec<u32> = Vec::new();
+    let mut cluster: Vec<u32> = Vec::new();
+    for _ in 0..rounds {
+        for i in (1..replicas).rev() {
+            let j = (next() % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        for pair in order.chunks_exact(2) {
+            let (lo, hi) = (pair[0].min(pair[1]), pair[0].max(pair[1]));
+            let (left, right) = states.split_at_mut(hi);
+            let (sa, sb) = (&mut left[lo], &mut right[0]);
+            differ.clear();
+            differ.extend((0..nodes as u32).filter(|&u| sa[u as usize] != sb[u as usize]));
+            if differ.is_empty() {
+                continue;
+            }
+            let root = differ[(next() % differ.len() as u64) as usize];
+            cluster.clear();
+            cluster.push(root);
+            seen[root as usize] = true;
+            let mut at = 0;
+            while at < cluster.len() {
+                let node = cluster[at] as usize;
+                at += 1;
+                for &v in &adj[node] {
+                    let v = v as usize;
+                    if !seen[v] && sa[v] != sb[v] {
+                        seen[v] = true;
+                        cluster.push(v as u32);
+                    }
+                }
+            }
+            for &node in &cluster {
+                let node = node as usize;
+                seen[node] = false;
+                sa[node] = -sa[node];
+                sb[node] = -sb[node];
+            }
+        }
     }
 }
 
@@ -693,22 +815,6 @@ impl ClusterDevice {
     /// `exp(-(beta - last_beta) (E - E_min))` with systematic resampling (true model energies), takes
     /// Houdayer cluster swaps between random pairs from beta 3, and uploads the result. This is the
     /// GPU counterpart of `anneal_population` in quip-solver-cpu's Otsuka sampler.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "resampling and Houdayer swaps share the downloaded replicas"
-    )]
-    #[expect(
-        clippy::many_single_char_names,
-        reason = "g, n, r, a, b follow the population-annealing notation of the CPU sampler"
-    )]
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "milli energies and replica counts are far below 2^52"
-    )]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "node and replica indices stay below MAX_PACKED_NODES and MAX_READS"
-    )]
     fn population_step(
         &self,
         pop: &mut Pop,
@@ -749,69 +855,13 @@ impl ClusterDevice {
         }
         let step = f64::from(beta - pop.last_beta);
         if step > 0.0 {
-            let low = low as f64;
-            let weights: Vec<f64> = energy
-                .iter()
-                .map(|&e| (-step * (e as f64 - low) / 1000.0).exp())
-                .collect();
-            let total: f64 = weights.iter().sum();
-            let stride = total / r as f64;
-            let mut mark = pop.unit() * stride;
-            let mut picks = Vec::with_capacity(r);
-            let mut reach = 0.0;
-            for (i, &w) in weights.iter().enumerate() {
-                reach += w;
-                while mark < reach && picks.len() < r {
-                    picks.push(i);
-                    mark += stride;
-                }
-            }
-            picks.resize(r, r - 1);
+            let picks = systematic_resample(&energy, step, pop.unit());
             states = picks.iter().map(|&i| states[i].clone()).collect();
         }
-        if pop.houdayer > 0 && beta >= 3.0 {
-            let mut order: Vec<usize> = (0..r).collect();
-            let mut seen = vec![false; n];
-            let mut differ: Vec<u32> = Vec::new();
-            let mut cluster: Vec<u32> = Vec::new();
-            for _ in 0..pop.houdayer {
-                for i in (1..r).rev() {
-                    let j = (pop.next() % (i as u64 + 1)) as usize;
-                    order.swap(i, j);
-                }
-                for pair in order.chunks_exact(2) {
-                    let (a, b) = (pair[0].min(pair[1]), pair[0].max(pair[1]));
-                    let (left, right) = states.split_at_mut(b);
-                    let (sa, sb) = (&mut left[a], &mut right[0]);
-                    differ.clear();
-                    differ.extend((0..n as u32).filter(|&u| sa[u as usize] != sb[u as usize]));
-                    if differ.is_empty() {
-                        continue;
-                    }
-                    let root = differ[(pop.next() % differ.len() as u64) as usize];
-                    cluster.clear();
-                    cluster.push(root);
-                    seen[root as usize] = true;
-                    let mut at = 0;
-                    while at < cluster.len() {
-                        let u = cluster[at] as usize;
-                        at += 1;
-                        for &v in &pop.adj[u] {
-                            let v = v as usize;
-                            if !seen[v] && sa[v] != sb[v] {
-                                seen[v] = true;
-                                cluster.push(v as u32);
-                            }
-                        }
-                    }
-                    for &u in &cluster {
-                        let u = u as usize;
-                        seen[u] = false;
-                        sa[u] = -sa[u];
-                        sb[u] = -sb[u];
-                    }
-                }
-            }
+        if pop.houdayer > 0 && beta >= HOUDAYER_BETA {
+            let adj = std::mem::take(&mut pop.adj);
+            houdayer_rounds(&mut states, &adj, pop.houdayer, &mut || pop.next());
+            pop.adj = adj;
         }
         let mut up = vec![0i8; r * n];
         for (block, state) in up.chunks_exact_mut(n).zip(&states) {
@@ -979,6 +1029,96 @@ mod tests {
     use super::*;
     use crate::capacity::DeviceLimits;
     use crate::cluster::{Model, Motifs, Weights};
+
+    #[test]
+    fn beta_settings_accept_ranges_and_stock_and_reject_the_rest() {
+        assert_eq!(parse_beta("stock"), Ok(None));
+        assert_eq!(parse_beta(" 0.5 , 12 "), Ok(Some((0.5, 12.0))));
+        for bad in [
+            "", "1", "1,8,9", "8,1", "0,8", "-1,8", "1,x", "1,inf", "stock,1",
+        ] {
+            assert_eq!(parse_beta(bad), Err(()), "{bad:?}");
+        }
+        assert_eq!(
+            beta_or("test", "8,1", Some(DEFAULT_BETA)),
+            Some(DEFAULT_BETA)
+        );
+        assert_eq!(beta_or("test", "stock", Some(DEFAULT_BETA)), None);
+    }
+
+    #[test]
+    fn systematic_resampling_keeps_the_count_and_favours_low_energies() {
+        // Zero step: every replica is kept once.
+        assert_eq!(
+            systematic_resample(&[5, -3, 0, 7], 0.0, 0.5),
+            vec![0, 1, 2, 3]
+        );
+        // A large step puts every slot on the lowest replica.
+        assert_eq!(
+            systematic_resample(&[5_000, -3_000, 0, 7_000], 50.0, 0.3),
+            vec![1; 4]
+        );
+        // Any offset in [0, 1) gives a full, ordered population.
+        for unit in [0.0, 0.25, 0.999_999] {
+            let picks = systematic_resample(&[0, 1_000, 2_000, 3_000, 0], 1.0, unit);
+            assert_eq!(picks.len(), 5);
+            assert!(picks.windows(2).all(|w| w[0] <= w[1]));
+        }
+        assert!(systematic_resample(&[], 1.0, 0.5).is_empty());
+    }
+
+    fn pair_energy(edges: &[(usize, usize, i64)], s: &[i8]) -> i64 {
+        edges
+            .iter()
+            .map(|&(u, v, j)| j * i64::from(s[u]) * i64::from(s[v]))
+            .sum()
+    }
+
+    #[test]
+    fn houdayer_moves_keep_each_pairs_summed_energy() {
+        let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let n = 40;
+        let mut edges = Vec::new();
+        for u in 0..n {
+            for v in u + 1..n {
+                if next() % 5 == 0 {
+                    edges.push((u, v, i64::try_from(next() % 2001).unwrap() - 1000));
+                }
+            }
+        }
+        let mut adj = vec![Vec::new(); n];
+        for &(u, v, _) in &edges {
+            adj[u].push(u32::try_from(v).unwrap());
+            adj[v].push(u32::try_from(u).unwrap());
+        }
+        let mut states: Vec<Vec<i8>> = (0..2)
+            .map(|_| {
+                (0..n)
+                    .map(|_| if next() % 2 == 0 { 1 } else { -1 })
+                    .collect()
+            })
+            .collect();
+        for _ in 0..50 {
+            let before = pair_energy(&edges, &states[0]) + pair_energy(&edges, &states[1]);
+            let spins_before: Vec<i32> = (0..n)
+                .map(|u| i32::from(states[0][u]) + i32::from(states[1][u]))
+                .collect();
+            houdayer_rounds(&mut states, &adj, 1, &mut next);
+            let after = pair_energy(&edges, &states[0]) + pair_energy(&edges, &states[1]);
+            assert_eq!(before, after);
+            // A swap moves spins between the pair; it never changes their per-node sum.
+            let spins_after: Vec<i32> = (0..n)
+                .map(|u| i32::from(states[0][u]) + i32::from(states[1][u]))
+                .collect();
+            assert_eq!(spins_before, spins_after);
+        }
+    }
 
     #[test]
     fn cluster_requires_memory_pools() {

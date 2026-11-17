@@ -298,16 +298,6 @@ impl<D: ClusterBackend, S: Sampler> OtsukaSampler<D, S> {
                 spins,
             });
         }
-        let n = graph.h.len();
-        let bad: Vec<usize> = reads
-            .iter()
-            .map(|r| r.spins.len())
-            .filter(|&l| l != n)
-            .collect();
-        if !bad.is_empty() {
-            tracing::warn!(nodes = n, dropped = bad.len(), lengths = ?bad, "dropped cluster reads of the wrong length");
-            reads.retain(|r| r.spins.len() == n);
-        }
         Ok(reads)
     }
 
