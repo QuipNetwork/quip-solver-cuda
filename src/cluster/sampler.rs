@@ -402,6 +402,15 @@ fn sample_error(error: ClusterDeviceError) -> SampleError {
 }
 
 impl<D: ClusterBackend, S: Sampler> Sampler for OtsukaSampler<D, S> {
+    /// A plain job runs on the SA fallback, so the ladder is its ladder.
+    fn beta_ladder(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+    ) -> Option<quip_solver_core::BetaLadder> {
+        self.sa.beta_ladder(graph, params)
+    }
+
     fn sample(
         &self,
         graph: &IsingGraph,

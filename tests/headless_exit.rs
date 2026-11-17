@@ -57,3 +57,16 @@ fn check_and_solve_exit_69_without_a_device() {
         }
     }
 }
+
+#[test]
+fn msa_descent_lists_only_sample_jobs() {
+    let out = headless(
+        env!("CARGO_BIN_EXE_quip-cuda-msa-descent"),
+        "--capabilities",
+    );
+    let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(caps["supportedKinds"], serde_json::json!(["ISING_SAMPLE"]));
+    assert_eq!(caps["generators"], serde_json::json!([]));
+    // An empty list is omitted from the JSON.
+    assert!(caps.get("generatedFamilies").is_none(), "{caps}");
+}

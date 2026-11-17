@@ -221,7 +221,8 @@ Such a model gets greedy descent without tiles.
 
 The descent runs on jobs with at most 262,144 nodes and 4,194,304 edges. A
 job of 200,000 nodes at degree 20 fits. A larger job logs the skip and returns
-its raw reads. Lease salts run without descent. The binary logs `kernel_s`,
+its raw reads. The binary lists only `ISING_SAMPLE` and rejects coordinator
+leases with `UNSUPPORTED_KIND`. The binary logs `kernel_s`,
 `descent_s`, and the raw, greedy, loop, and final best energies of each job.
 
 `tests/msa_descent.rs` checks the descent against the research code on

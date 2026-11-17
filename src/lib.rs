@@ -87,6 +87,14 @@ impl MsaSampler {
 }
 
 impl Sampler for MsaSampler {
+    fn beta_ladder(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+    ) -> Option<quip_solver_core::BetaLadder> {
+        Some(streaming::beta_ladder(graph, params))
+    }
+
     fn generates_locally() -> bool {
         true
     }
@@ -366,6 +374,14 @@ impl CudaSampler {
 }
 
 impl Sampler for CudaSampler {
+    fn beta_ladder(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+    ) -> Option<quip_solver_core::BetaLadder> {
+        Some(streaming::beta_ladder(graph, params))
+    }
+
     fn sample(
         &self,
         graph: &IsingGraph,
