@@ -113,11 +113,55 @@ pub struct DeviceLayout {
     pub link_w: Vec<i32>,
 }
 
+/// Local build (`QUIP_OTSUKA_WEAK_SCALE`): the full and residual ELL tables
+/// with every weak coupling (`|J| <` [`WEAK_LIMIT_MILLI`] in the model)
+/// multiplied by the scale. The degrees and slot layout are those of
+/// [`DeviceLayout`]; only the coupling halves of the words differ. The anneal
+/// sweeps read these; final descent, device energies, and every reported
+/// energy use the exact tables.
+#[derive(Debug)]
+pub struct AnnealEll {
+    /// The scale on the weak couplings.
+    pub weak_scale: f64,
+    /// Scaled residual adjacency, slot-major like [`DeviceLayout::weak_ell`].
+    pub weak_ell: Vec<i32>,
+    /// Scaled full adjacency, slot-major like [`DeviceLayout::all_ell`].
+    pub all_ell: Vec<i32>,
+}
+
+/// Model couplings below this magnitude, in milli, are weak: the
+/// twisted-dimer weak layer (45 or 62 milli) against the 1000-milli tiles
+/// and pairs.
+pub const WEAK_LIMIT_MILLI: i32 = 500;
+
+/// The weak coupling `j` scaled by `scale` and rounded. Strong couplings and
+/// zero pass unchanged; a weak coupling keeps its sign and stays nonzero and
+/// weak, so the ELL degrees do not change.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn scale_weak(j: i32, scale: f64) -> i32 {
+    if j == 0 || j.abs() >= WEAK_LIMIT_MILLI {
+        return j;
+    }
+    let s = (f64::from(j) * scale).round().clamp(
+        -f64::from(WEAK_LIMIT_MILLI - 1),
+        f64::from(WEAK_LIMIT_MILLI - 1),
+    ) as i32;
+    if s == 0 {
+        j.signum()
+    } else {
+        s
+    }
+}
+
 /// A validated original graph, its permutations, and bounded device inputs.
 #[derive(Debug)]
 pub struct PreparedGraph {
     original: OtsukaGraph,
     layout: DeviceLayout,
+    /// Local build (`QUIP_OTSUKA_WEAK_SCALE`): the ELL tables the anneal
+    /// sweeps read when the weak couplings are scaled. `None` at scale 1.
+    anneal: Option<AnnealEll>,
     device_to_original: Vec<usize>,
     original_to_device: Vec<usize>,
     footprint: Footprint,
@@ -140,6 +184,25 @@ impl PreparedGraph {
         weights: Weights,
         limits: &DeviceLimits,
         anneals: usize,
+    ) -> Result<Self, PrepareError> {
+        Self::with_weak_scale(model, motifs, weights, limits, anneals, 1.0)
+    }
+
+    /// Local build: [`Self::new`] with the anneal sweeps reading the weak
+    /// couplings scaled by `weak_scale` ([`AnnealEll`]). At scale 1 this is
+    /// [`Self::new`] exactly. The original graph, the exact ELL tables, and
+    /// every energy stay the instance's own.
+    ///
+    /// # Errors
+    /// The same as [`Self::new`].
+    #[allow(clippy::too_many_lines)] // the stock preparation plus the scaled tables
+    pub fn with_weak_scale(
+        model: &Model<'_>,
+        motifs: &Motifs<'_>,
+        weights: Weights,
+        limits: &DeviceLimits,
+        anneals: usize,
+        weak_scale: f64,
     ) -> Result<Self, PrepareError> {
         let original = OtsukaGraph::new(model, motifs, weights)?;
         let n = original.n;
@@ -190,6 +253,53 @@ impl PreparedGraph {
         }
         let (weak_deg, weak_ell) = ell(&weak_rows, shape.weak_width)?;
         let (all_deg, all_ell) = ell(&all_rows, shape.all_width)?;
+        // Local build: the scaled tables share the exact ones' degrees, because
+        // scale_weak keeps every nonzero coupling nonzero.
+        #[allow(clippy::float_cmp)]
+        let anneal = if weak_scale == 1.0 {
+            None
+        } else {
+            let scaled = |es: &[Edge], weak: &dyn Fn(usize) -> bool| -> Vec<Edge> {
+                es.iter()
+                    .enumerate()
+                    .map(|(at, &(u, v, j))| {
+                        (
+                            u,
+                            v,
+                            if weak(at) {
+                                scale_weak(j, weak_scale)
+                            } else {
+                                j
+                            },
+                        )
+                    })
+                    .collect()
+            };
+            let model_weak = |at: usize| original.edges[at].2.abs() < WEAK_LIMIT_MILLI;
+            let all_scaled = scaled(&original.edges, &model_weak);
+            let weak_scaled = scaled(&weak_edges, &model_weak);
+            check_residual_sum(weak_scaled.iter().map(|edge| edge.2))?;
+            let (deg_w, weak_ell_s) = ell(
+                &rows(n, &weak_scaled, &original_to_device),
+                shape.weak_width,
+            )?;
+            let (deg_a, all_ell_s) =
+                ell(&rows(n, &all_scaled, &original_to_device), shape.all_width)?;
+            debug_assert!(
+                deg_w == weak_deg && deg_a == all_deg,
+                "scaling keeps degrees"
+            );
+            if deg_w != weak_deg || deg_a != all_deg {
+                return Err(PrepareError::IndexOverflow {
+                    array: "scaled ELL degrees",
+                });
+            }
+            Some(AnnealEll {
+                weak_scale,
+                weak_ell: weak_ell_s,
+                all_ell: all_ell_s,
+            })
+        };
         let id = |u: usize| int_index(original_to_device[u], "motif node");
         let tiles = original
             .tiles
@@ -237,6 +347,7 @@ impl PreparedGraph {
         Ok(Self {
             original,
             layout,
+            anneal,
             device_to_original,
             original_to_device,
             footprint,
@@ -259,6 +370,22 @@ impl PreparedGraph {
         limits: &DeviceLimits,
         anneals: usize,
     ) -> Result<Self, PrepareError> {
+        Self::from_instance_scaled(instance, contract, weights, limits, anneals, 1.0)
+    }
+
+    /// Local build: [`Self::from_instance`] with the weak couplings scaled by
+    /// `weak_scale` in the anneal tables ([`Self::with_weak_scale`]).
+    ///
+    /// # Errors
+    /// The same as [`Self::from_instance`].
+    pub fn from_instance_scaled(
+        instance: &Instance,
+        contract: &Contract,
+        weights: Weights,
+        limits: &DeviceLimits,
+        anneals: usize,
+        weak_scale: f64,
+    ) -> Result<Self, PrepareError> {
         if contract.family_id != TWISTED_DIMER_V1.family_id
             || contract.revision != TWISTED_DIMER_V1.revision
         {
@@ -266,7 +393,7 @@ impl PreparedGraph {
         }
         let (tiles, gauges) = local_gauges(instance).ok_or(PrepareError::Metadata)?;
         let pairs = metadata_pairs(instance.metadata()).ok_or(PrepareError::Metadata)?;
-        Self::new(
+        Self::with_weak_scale(
             &Model {
                 h_milli: instance.h(),
                 edges: instance.edges(),
@@ -280,6 +407,7 @@ impl PreparedGraph {
             weights,
             limits,
             anneals,
+            weak_scale,
         )
     }
 
@@ -306,6 +434,12 @@ impl PreparedGraph {
     #[must_use]
     pub fn layout(&self) -> &DeviceLayout {
         &self.layout
+    }
+
+    /// Local build: the scaled anneal tables, when the weak scale is not 1.
+    #[must_use]
+    pub fn anneal_ell(&self) -> Option<&AnnealEll> {
+        self.anneal.as_ref()
     }
 
     /// Original coefficients and motifs for rescoring in original node order.
@@ -517,6 +651,39 @@ fn ell(rows: &[Vec<(usize, i32)>], width: usize) -> Result<(Vec<i32>, Vec<i32>),
     Ok((deg, table))
 }
 
+/// Local build (CPU polish): the validated host graph of a family instance at
+/// `weights`, with the same checks as [`PreparedGraph::from_instance`] and no
+/// device layout.
+///
+/// # Errors
+/// Unsupported family, unreadable metadata, or a graph rejection.
+pub(crate) fn host_graph(
+    instance: &Instance,
+    contract: &Contract,
+    weights: Weights,
+) -> Result<OtsukaGraph, PrepareError> {
+    if contract.family_id != TWISTED_DIMER_V1.family_id
+        || contract.revision != TWISTED_DIMER_V1.revision
+    {
+        return Err(PrepareError::UnsupportedFamily);
+    }
+    let (tiles, gauges) = local_gauges(instance).ok_or(PrepareError::Metadata)?;
+    let pairs = metadata_pairs(instance.metadata()).ok_or(PrepareError::Metadata)?;
+    Ok(OtsukaGraph::new(
+        &Model {
+            h_milli: instance.h(),
+            edges: instance.edges(),
+            j_milli: instance.j(),
+        },
+        &Motifs {
+            tiles: &tiles,
+            gauges: &gauges,
+            pairs: &pairs,
+        },
+        weights,
+    )?)
+}
+
 fn metadata_pairs(region: &[u8]) -> Option<Vec<(u32, u32)>> {
     let (count, mut rest) = region.split_first_chunk::<2>()?;
     for _ in 0..u16::from_le_bytes(*count) {
@@ -590,6 +757,153 @@ mod tests {
                 array: "tile indices"
             })
         );
+    }
+
+    #[test]
+    fn scale_weak_rounds_keeps_sign_and_leaves_strong() {
+        assert_eq!(scale_weak(45, 1.5), 68);
+        assert_eq!(scale_weak(-45, 1.5), -68);
+        assert_eq!(scale_weak(45, 1.25), 56);
+        assert_eq!(scale_weak(45, 2.0), 90);
+        assert_eq!(scale_weak(45, 1.0), 45);
+        assert_eq!(scale_weak(1000, 2.0), 1000);
+        assert_eq!(scale_weak(-1000, 0.5), -1000);
+        assert_eq!(scale_weak(750, 2.0), 750);
+        assert_eq!(scale_weak(0, 2.0), 0);
+        assert_eq!(scale_weak(1, 0.25), 1, "a weak coupling stays nonzero");
+        assert_eq!(scale_weak(-1, 0.25), -1);
+        assert_eq!(scale_weak(400, 2.0), 499, "a weak coupling stays weak");
+    }
+
+    /// A graph of two gauged tiles, one pair, and weak links, as the
+    /// twisted-dimer cells are built (strong 1000, pair -1000, weak 45).
+    #[allow(clippy::type_complexity)]
+    fn two_tiles() -> (
+        Vec<i32>,
+        Vec<(u32, u32)>,
+        Vec<i32>,
+        Vec<[u32; 4]>,
+        Vec<[i8; 4]>,
+        Vec<(u32, u32)>,
+    ) {
+        let tiles = vec![[0, 1, 2, 3], [4, 5, 6, 7]];
+        let gauges = vec![[1, -1, 1, 1], [1, 1, -1, 1]];
+        let mut edges = Vec::new();
+        let mut j = Vec::new();
+        for (t, g) in tiles.iter().zip(&gauges) {
+            for a in 0..4 {
+                for b in a + 1..4 {
+                    edges.push((t[a], t[b]));
+                    j.push(1000 * i32::from(g[a] * g[b]));
+                }
+            }
+        }
+        let pairs = vec![(3, 4)];
+        edges.push((3, 4));
+        j.push(-1000);
+        for (u, v, w) in [(0, 4, 45), (1, 5, -45), (2, 6, 45), (0, 7, -45), (2, 5, 45)] {
+            edges.push((u, v));
+            j.push(w);
+        }
+        (vec![0; 8], edges, j, tiles, gauges, pairs)
+    }
+
+    fn limits() -> DeviceLimits {
+        DeviceLimits {
+            shared_bytes_per_block: 48 << 10,
+            shared_bytes_per_block_optin: 100 << 10,
+            free_bytes: 1 << 30,
+            sm_count: 48,
+            threads_per_sm: 1536,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn coupling(word: i32) -> i32 {
+        i32::from(i16::from_ne_bytes((word as u16).to_ne_bytes()))
+    }
+
+    #[test]
+    fn weak_scale_one_is_the_stock_preparation() {
+        let (h, edges, j, tiles, gauges, pairs) = two_tiles();
+        let model = Model {
+            h_milli: &h,
+            edges: &edges,
+            j_milli: &j,
+        };
+        let motifs = Motifs {
+            tiles: &tiles,
+            gauges: &gauges,
+            pairs: &pairs,
+        };
+        let w = Weights {
+            pair_milli: 250,
+            tile_milli: 250,
+        };
+        let stock = PreparedGraph::new(&model, &motifs, w, &limits(), 4).unwrap();
+        let one = PreparedGraph::with_weak_scale(&model, &motifs, w, &limits(), 4, 1.0).unwrap();
+        assert!(stock.anneal_ell().is_none() && one.anneal_ell().is_none());
+        assert_eq!(stock.layout().all_ell, one.layout().all_ell);
+        assert_eq!(stock.layout().weak_ell, one.layout().weak_ell);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn weak_scale_touches_only_the_anneal_tables_and_weak_couplings() {
+        let (h, edges, j, tiles, gauges, pairs) = two_tiles();
+        let model = Model {
+            h_milli: &h,
+            edges: &edges,
+            j_milli: &j,
+        };
+        let motifs = Motifs {
+            tiles: &tiles,
+            gauges: &gauges,
+            pairs: &pairs,
+        };
+        let w = Weights {
+            pair_milli: 250,
+            tile_milli: 250,
+        };
+        let stock = PreparedGraph::new(&model, &motifs, w, &limits(), 4).unwrap();
+        let scaled = PreparedGraph::with_weak_scale(&model, &motifs, w, &limits(), 4, 1.5).unwrap();
+        // The exact tables, the graph, and its energies are unchanged.
+        assert_eq!(stock.layout().all_ell, scaled.layout().all_ell);
+        assert_eq!(stock.layout().weak_ell, scaled.layout().weak_ell);
+        assert_eq!(stock.layout().all_deg, scaled.layout().all_deg);
+        let spins = [1, -1, 1, 1, -1, 1, -1, -1];
+        assert_eq!(
+            stock.energy(&spins).unwrap(),
+            scaled.energy(&spins).unwrap()
+        );
+        let a = scaled.anneal_ell().expect("scaled tables");
+        assert!((a.weak_scale - 1.5).abs() < f64::EPSILON);
+        let (mut weak_seen, mut strong_seen) = (0, 0);
+        for (exact, anneal) in [
+            (&stock.layout().all_ell, &a.all_ell),
+            (&stock.layout().weak_ell, &a.weak_ell),
+        ] {
+            assert_eq!(exact.len(), anneal.len());
+            for (&e, &s) in exact.iter().zip(anneal.iter()) {
+                assert_eq!(e as u32 >> 16, s as u32 >> 16, "same neighbour");
+                let (je, js) = (coupling(e), coupling(s));
+                if je != 0 && je.abs() < WEAK_LIMIT_MILLI {
+                    assert_eq!(js, scale_weak(je, 1.5));
+                    assert_eq!(je.abs(), 45);
+                    assert_eq!(js.abs(), 68);
+                    weak_seen += 1;
+                } else {
+                    assert_eq!(
+                        js, je,
+                        "strong couplings and soft-weight residuals are kept"
+                    );
+                    strong_seen += usize::from(je != 0);
+                }
+            }
+        }
+        // Five weak edges, both directions, in both tables.
+        assert_eq!(weak_seen, 20);
+        assert!(strong_seen > 0);
     }
 
     #[test]

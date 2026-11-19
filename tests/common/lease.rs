@@ -135,7 +135,7 @@ impl Session {
             .stderr(Stdio::piped())
             .env(
                 "RUST_LOG",
-                "info,quip_solver_cuda::lease=debug,quip_solver_cuda::lease_turn=debug",
+                "info,quip_solver_cuda::lease=debug,quip_solver_cuda::lease_turn=debug,quip_solver_cuda::cluster::sampler=debug",
             )
             .env("QUIP_SESSION_TOKEN", "test-token")
             .kill_on_drop(true)

@@ -499,3 +499,124 @@ extern "C" __global__ void test_components(int n, int m, const int2* edges, int*
             .collect::<Vec<_>>()
     );
 }
+
+/// Local build (all7): the deep lane's device probe, on the population
+/// anneal with device checkpoints (the live path). A probe that never stops
+/// the run leaves it bit-identical to the unprobed run (the readback only
+/// synchronizes), a probe at every checkpoint sees lineage bests that never
+/// rise, and a probe that stops at its first call returns a full set of
+/// valid, exactly rescored reads after one checkpoint.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+#[serial]
+fn deep_probe_is_inert_until_it_stops_the_run() {
+    use quip_solver_core::{BetaSchedule, IsingGraph, SampleParams};
+    use quip_solver_cuda::cluster::sampler::{ClusterBackend, ClusterWork, GpuCluster};
+    use quip_solver_cuda::cluster::tuning::OtsukaTuning;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    let weights = Weights {
+        tile_milli: 250,
+        pair_milli: 250,
+    };
+    let tuning = OtsukaTuning {
+        chunk: 64,
+        population: true,
+        resamples: 64,
+        device_pa: true,
+        sweep_v2: true,
+        sweep_v3: true,
+        tile_milli: 250,
+        pair_milli: 250,
+        ..OtsukaTuning::default()
+    };
+    let lane = GpuCluster::load(0, tuning).unwrap();
+    let h = vec![0.0; graph(weights).original_graph().num_nodes()];
+    let mut edges = Vec::new();
+    let mut j = Vec::new();
+    // The fixture's model, as the job graph the work is built from.
+    let tiles = [[0, 1, 2, 3], [3, 4, 5, 6]];
+    let gauges = [[1, -1, 1, 1], [-1, 1, 1, -1]];
+    let mut fixture_edges = vec![(0, 4), (5, 7), (1, 5), (2, 6), (1, 4), (6, 7)];
+    let mut fixture_j = vec![-1000, -1000, 300, -200, 700, 500];
+    for (tile, gauge) in tiles.iter().zip(gauges) {
+        for a in 0..4 {
+            for b in a + 1..4 {
+                fixture_edges.push((tile[a], tile[b]));
+                fixture_j.push(1000 * gauge[a] * gauge[b]);
+            }
+        }
+    }
+    for (&(u, v), &jm) in fixture_edges.iter().zip(&fixture_j) {
+        edges.push((u, v));
+        j.push(f64::from(jm) / 1000.0);
+    }
+    let ising = IsingGraph::new(h, j, edges);
+    let params = SampleParams {
+        num_reads: 32,
+        num_sweeps: 65_536,
+        sweeps_per_beta: 1,
+        beta_range: Some((1.0, 12.0)),
+        schedule: BetaSchedule::Geometric,
+        seed: 7,
+    };
+    let work = ClusterWork::new(&ising, &params).unwrap();
+    let base = lane
+        .run(graph(weights), &work, &|| false, &|| false)
+        .unwrap();
+    let seen = Mutex::new(Vec::new());
+    let never = lane
+        .run_probed_every(
+            graph(weights),
+            &work,
+            &|| false,
+            &|| false,
+            &|e| {
+                seen.lock().unwrap().push(e);
+                false
+            },
+            Duration::ZERO,
+        )
+        .unwrap();
+    assert_eq!(base.spins, never.spins, "a probe that never stops is inert");
+    assert_eq!(base.energies, never.energies);
+    let seen = seen.into_inner().unwrap();
+    assert!(
+        seen.len() >= 32,
+        "probed at every checkpoint: {}",
+        seen.len()
+    );
+    assert!(
+        seen.windows(2).all(|w| w[1] <= w[0]),
+        "lineage bests never rise"
+    );
+    let calls = Mutex::new(0_usize);
+    let early = lane
+        .run_probed_every(
+            graph(weights),
+            &work,
+            &|| false,
+            &|| false,
+            &|_| {
+                *calls.lock().unwrap() += 1;
+                true
+            },
+            Duration::ZERO,
+        )
+        .unwrap();
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1,
+        "the run stops at its first probe"
+    );
+    assert_eq!(early.spins.len(), 32);
+    let check = graph(weights);
+    for (s, &e) in early.spins.iter().zip(&early.energies) {
+        assert!(s.iter().all(|&v| v == 1 || v == -1));
+        assert_eq!(
+            check.energy(s).unwrap(),
+            e,
+            "harvested reads are rescored exactly"
+        );
+    }
+}

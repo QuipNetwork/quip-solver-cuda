@@ -1015,6 +1015,7 @@ dependencies = [
  "blake3",
  "clap",
  "cudarc",
+ "ising-generators",
  "nvml-wrapper",
  "proptest",
  "quip-proto",

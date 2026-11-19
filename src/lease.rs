@@ -12,11 +12,11 @@ use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{channel, Receiver};
 
-fn fault(error: impl std::fmt::Display) -> SampleError {
+pub(crate) fn fault(error: impl std::fmt::Display) -> SampleError {
     SampleError::DeviceFault(format!("CUDA lease: {error}"))
 }
 
-fn check_capacity(topology: &TopologyView, max_nodes: usize) -> Result<(), SampleError> {
+pub(crate) fn check_capacity(topology: &TopologyView, max_nodes: usize) -> Result<(), SampleError> {
     if topology.num_nodes > max_nodes {
         return Err(SampleError::Capacity);
     }
@@ -334,13 +334,13 @@ fn full_solve(
     )
 }
 
-fn run_full_batch(
+pub(crate) fn run_full_batch<T: Send>(
     sampler: &CudaSampler,
     jobs: Receiver<StreamJob>,
     batch_len: usize,
     stopped: impl Fn() -> bool + Sync,
-    report: impl FnOnce(Receiver<StreamResult>, &CancelToken) -> Result<bool, SampleError> + Send,
-) -> Result<bool, SampleError> {
+    report: impl FnOnce(Receiver<StreamResult>, &CancelToken) -> Result<T, SampleError> + Send,
+) -> Result<T, SampleError> {
     // One result per job fits even while the reporter is blocked in core.
     let (out_tx, out_rx) = channel(batch_len);
     let cancel = CancelToken::default();

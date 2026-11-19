@@ -28,7 +28,70 @@ use crate::topology::{fill_coefficients, SelfFeedingTopology};
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg};
 use quip_protocol::scoring::energy_milli;
-use quip_solver_core::beta::default_ising_beta_range;
+/// Local build (`BudFox`, 2026-11-13): `QUIP_BETA_RANGE=hot,cold` replaces the
+/// default beta range wherever a job names none. Unset = upstream behaviour.
+/// The first default computed is logged once, so the stock range is visible.
+fn default_ising_beta_range(graph: &IsingGraph) -> (f64, f64) {
+    static ENV: std::sync::OnceLock<Option<(f64, f64)>> = std::sync::OnceLock::new();
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    let stock = quip_solver_core::beta::default_ising_beta_range(graph);
+    LOGGED.call_once(|| {
+        eprintln!(
+            "quip-beta: stock default range = {stock:?} (n={})",
+            graph.h.len()
+        )
+    });
+    let env = *ENV.get_or_init(|| {
+        let v = std::env::var("QUIP_BETA_RANGE").ok()?;
+        let (a, b) = v.split_once(',')?;
+        let hot = a.trim().parse::<f64>().ok()?;
+        let cold = b.trim().parse::<f64>().ok()?;
+        let ok = hot.is_finite() && cold.is_finite() && hot > 0.0 && cold >= hot;
+        eprintln!(
+            "quip-beta: QUIP_BETA_RANGE={v:?} {}",
+            if ok { "applied" } else { "ignored" }
+        );
+        ok.then_some((hot, cold))
+    });
+    env.unwrap_or(stock)
+}
+
+/// Local build (`BudFox`, 2026-11-13): `QUIP_MSA_MAX_WIDTH=N` caps the msa
+/// self-feeding session at `N` nonces (one SM each). Unset, `0` or
+/// unparsable = upstream width (`max_sms`). The msa kernel runs one block per
+/// nonce, so a cap does NOT make an instance finish sooner: it only leaves
+/// SMs idle (or free for another process under MPS).
+fn msa_max_width() -> Option<usize> {
+    static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        let v = std::env::var("QUIP_MSA_MAX_WIDTH").ok()?;
+        let cap = v.trim().parse::<usize>().ok().filter(|&c| c >= 1);
+        eprintln!(
+            "quip-lanes: QUIP_MSA_MAX_WIDTH={v:?} {}",
+            if cap.is_some() { "applied" } else { "ignored" }
+        );
+        cap
+    })
+}
+
+/// Local build (`BudFox`, 2026-11-13): `QUIP_MSA_FULL_GRID=1` launches an msa
+/// session with every nonce of its width, not only the nonces the cold start
+/// managed to fill. The unfilled blocks park in the kernel's entry wait for a
+/// READY slot (the same wait that covers feeder starvation, QUI-828) and
+/// `refill_slots` revives them as jobs arrive. Without it a bursty feeder (the
+/// stage-0 family screen hands over 64 survivors per window) pins the session
+/// at the cold-start count until the round ends. Unset = upstream behaviour.
+fn msa_full_grid(kernel: KernelKind) -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    kernel == KernelKind::Msa
+        && *ENV.get_or_init(|| {
+            let on = std::env::var("QUIP_MSA_FULL_GRID").is_ok_and(|v| v.trim() == "1");
+            if on {
+                eprintln!("quip-lanes: QUIP_MSA_FULL_GRID=1 applied");
+            }
+            on
+        })
+}
 use quip_solver_core::BetaSchedule;
 use quip_solver_core::SampleError as WireSampleError;
 use quip_solver_core::{
@@ -2957,7 +3020,11 @@ impl SlotState {
 /// ```
 #[must_use]
 pub fn stream_width(device: &CudaDevice, kernel: KernelKind) -> usize {
-    capacity::instances(kernel, device.max_sms)
+    let width = capacity::instances(kernel, device.max_sms);
+    match (kernel, msa_max_width()) {
+        (KernelKind::Msa, Some(cap)) => width.min(cap),
+        _ => width,
+    }
 }
 
 enum Pull {
@@ -3558,8 +3625,15 @@ fn run_session(
 
     let (cold, halt) = drain_cold_start(&mut feed, seed, width);
     let active_nonces = cold.len();
+    // Blocks launched. Upstream launches only the cold-start nonces; with
+    // QUIP_MSA_FULL_GRID the rest park in the entry wait and fill later.
+    let launched = if msa_full_grid(kernel) {
+        width
+    } else {
+        active_nonces
+    };
     eprintln!(
-        "quip-solver-cuda: self-feeding session launching with {active_nonces}/{width} nonces active"
+        "quip-solver-cuda: self-feeding session launching with {active_nonces}/{width} nonces active ({launched} launched)"
     );
     let mut slots: Vec<SlotState> = (0..width).map(|_| SlotState::default()).collect();
     for (nonce_id, job) in cold.into_iter().enumerate() {
@@ -3571,7 +3645,7 @@ fn run_session(
     }
 
     if let Err(e) = sess.launch(
-        active_nonces,
+        launched,
         beta.len(),
         sweeps_per_beta,
         session_seed(job_seed),
@@ -3592,7 +3666,7 @@ fn run_session(
     let stall_floor = ctx.stall.floor(beta.len().saturating_mul(sweeps_per_beta));
     let halt = pump_session(
         &mut sess,
-        &mut slots[..active_nonces],
+        &mut slots[..launched],
         &mut feed,
         halt,
         ctx,

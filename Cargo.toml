@@ -80,6 +80,8 @@ tonic = "=0.12.3"
 tokio-stream = { version = "=0.1.19", features = ["net"] }
 tempfile = "=3.27.0"
 quip-solver-conformance = "0.0.15"
+# Local build: decodes the live topology fixture in the stage-0 parity test.
+ising-generators = { version = "0.0.15", features = ["blob"] }
 # Fixture hashes of the descent parity records; already in the build graph.
 blake3 = "=1.8.5"
 proptest = "1"

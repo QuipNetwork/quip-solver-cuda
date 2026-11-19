@@ -50,7 +50,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let identity = cuda_otsuka_identity(&device.limits, cap.min(device.max_nodes));
+    let mut identity = cuda_otsuka_identity(&device.limits, cap.min(device.max_nodes));
+    local_budget(&mut identity.adapt);
     if identity.max_nodes == 0 {
         eprintln!("device has no capacity for an Otsuka session");
         return ExitCode::FAILURE;
@@ -60,4 +61,38 @@ fn main() -> ExitCode {
         let gov = UtilGovernor::start(&device.pci_bus_id, cli.utilization, cli.yielding);
         OtsukaSampler::new(device, gov, cli.stall).map_err(|e| OpenError(e.to_string()))
     })
+}
+
+/// Local build (`BudFox`, 2026-11-13): `QUIP_OTSUKA_SWEEP_MULT` scales the
+/// sweep envelope the session derives per lease (stock 256..2048, and a
+/// dimer lease sits at difficulty 0, so it runs the minimum). `QUIP_OTSUKA_READS`
+/// pins reads per instance (stock 64 at difficulty 0, at most 256): one CUDA
+/// block per read, so reads also set how many SMs one instance occupies.
+/// Unset = upstream.
+fn local_budget(adapt: &mut quip_solver_core::adapt::AdaptBounds) {
+    if let Some(m) = std::env::var("QUIP_OTSUKA_SWEEP_MULT")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        if m.is_finite() && m > 0.0 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let scale = |x: u32| ((f64::from(x) * m).round() as u32).max(1);
+            adapt.min_sweeps = scale(adapt.min_sweeps);
+            adapt.max_sweeps = scale(adapt.max_sweeps);
+            eprintln!(
+                "quip-otsuka: QUIP_OTSUKA_SWEEP_MULT={m} -> min {} max {}",
+                adapt.min_sweeps, adapt.max_sweeps
+            );
+        }
+    }
+    if let Ok(v) = std::env::var("QUIP_OTSUKA_READS") {
+        match v.trim().parse::<u32>() {
+            Ok(r) if (1..=256).contains(&r) => {
+                adapt.min_reads = r;
+                adapt.max_reads = r;
+                eprintln!("quip-otsuka: QUIP_OTSUKA_READS={r} applied");
+            }
+            _ => eprintln!("quip-otsuka: QUIP_OTSUKA_READS={v:?} ignored (1..=256)"),
+        }
+    }
 }

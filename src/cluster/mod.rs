@@ -4,11 +4,25 @@
 //! Family contexts come from the session after canonical metadata validation.
 //! Preparation performs no CUDA calls.
 
+/// Local build (all7): the late-round deep lane (`QUIP_OTSUKA_DEEP_LANES`).
+pub mod deep;
 /// On-demand device upload and bounded cluster anneals.
 pub mod device;
+/// Local build (all12): the ease-race booster (`QUIP_OTSUKA_EASE_BOOST`).
+pub mod ease;
+/// Local build: host CPU polish of lease reads (`QUIP_OTSUKA_CPU_POLISH`).
+pub mod polish;
+/// Local build (all6): best-first pool of screened lease salts (`QUIP_OTSUKA_POOL`).
+pub mod pool;
 mod prepare;
 /// Family routing and production streaming for `quip-cuda-otsuka`.
 pub mod sampler;
+/// Local build: stage 1, the short-anneal screen (`QUIP_OTSUKA_STAGE1_*`).
+pub mod stage1;
+/// Local build (all5): stage 2, re-anneal deep instances (`QUIP_OTSUKA_STAGE2_*`).
+pub mod stage2;
+/// Local build: opt-in Otsuka knobs (`QUIP_OTSUKA_*`).
+pub mod tuning;
 
 use std::collections::HashMap;
 use std::fmt;

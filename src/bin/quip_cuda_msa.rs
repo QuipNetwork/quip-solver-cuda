@@ -134,6 +134,41 @@ fn main() -> ExitCode {
     device.max_nodes = nodes;
     let mut identity = cuda_msa_identity(nodes, edges);
     identity.adapt = quip_solver_cuda::cuda_msa_adapt(u32::try_from(reads).unwrap_or(128));
+    // Local build (`BudFox`, 2026-11-13): QUIP_MSA_SWEEP_MULT scales the sweep
+    // envelope the coordinator derives per lease (min 7392, max 29568).
+    if let Some(m) = std::env::var("QUIP_MSA_SWEEP_MULT")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        if m.is_finite() && m > 0.0 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let scale = |x: u32| ((f64::from(x) * m).round() as u32).max(1);
+            identity.adapt.min_sweeps = scale(identity.adapt.min_sweeps);
+            identity.adapt.max_sweeps = scale(identity.adapt.max_sweeps);
+            eprintln!(
+                "quip-sweeps: QUIP_MSA_SWEEP_MULT={m} -> min {} max {}",
+                identity.adapt.min_sweeps, identity.adapt.max_sweeps
+            );
+        }
+    }
+    // Local build (`BudFox`, 2026-11-13): QUIP_MSA_READS pins reads per
+    // instance (adapt min = max). The kernel keeps 64 reads per u64 replica
+    // word and one block per nonce, so 64 reads = one word = half the work per
+    // instance: each lane finishes an instance in about half the time, at the
+    // same SM count. Unset = upstream (the device's msa read cap, 128).
+    if let Ok(v) = std::env::var("QUIP_MSA_READS") {
+        match v.trim().parse::<u32>() {
+            Ok(r) if r >= 1 && usize::try_from(r).is_ok_and(|r| r <= reads) => {
+                identity.adapt.min_reads = r;
+                identity.adapt.max_reads = r;
+                eprintln!(
+                    "quip-reads: QUIP_MSA_READS={r} applied ({} replica words)",
+                    r.div_ceil(64)
+                );
+            }
+            _ => eprintln!("quip-reads: QUIP_MSA_READS={v:?} ignored (1..={reads})"),
+        }
+    }
     run(identity, &cli.common, || {
         // The governor binds by PCI bus id, not by ordinal: NVML's index
         // space is PCI-ordered and does not track the CUDA ordinal this

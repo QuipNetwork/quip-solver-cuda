@@ -33,6 +33,7 @@ pub mod descent;
 mod cutoff;
 pub mod driver_budget;
 pub mod families;
+pub mod family_screen;
 mod jit_cache;
 pub mod kernel;
 mod lease;
@@ -97,7 +98,24 @@ impl Sampler for MsaSampler {
         params: &SampleParams,
         sink: &quip_solver_core::LeaseSink,
     ) -> Result<(), SampleError> {
+        // Local build: family leases reach here only with QUIP_FAMILY_SCREEN=1,
+        // because only then does `declaration` claim a family.
+        if let Some(family) = lease.family() {
+            return family_screen::sample(self, lease, family, topology, params, sink);
+        }
         lease::sample(self, lease, topology, params, sink)
+    }
+
+    fn declaration() -> quip_solver_core::families::Declaration {
+        if family_screen::config().enabled {
+            quip_solver_core::families::Declaration {
+                solver_id: "",
+                generated: family_screen::CLAIMS,
+                accepted: &[],
+            }
+        } else {
+            quip_solver_core::families::Declaration::GENERIC
+        }
     }
 
     fn sample(
