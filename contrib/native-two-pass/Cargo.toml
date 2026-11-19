@@ -1,0 +1,39 @@
+[package]
+name = "quip-native-two-pass"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.97"
+license = "AGPL-3.0-or-later"
+description = "Verified reversed two-pass QUIP ICE solver"
+[[bin]]
+name = "quip-cuda-native-two-pass"
+path = "solver.rs"
+[dependencies]
+batsat = "=0.6.0"
+quip-proto = "=0.0.15"
+quip-protocol = "=0.0.15"
+quip-solver-core = "=0.0.15"
+cudarc = { version = "0.19", default-features = false, features = ["std","driver","nvrtc","cuda-12090","dynamic-loading"] }
+nvml-wrapper = "0.11"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter","fmt"] }
+tokio = { version = "1", features = ["rt-multi-thread","macros","net","time","signal","io-util","sync"] }
+[dev-dependencies]
+quip-solver-conformance = "=0.0.15"
+proptest = "1"
+serial_test = "3.5"
+tempfile = "=3.27.0"
+tonic = "=0.12.3"
+tokio-stream = { version = "=0.1.19", features = ["net"] }
+tokio = { version = "1", features = ["rt-multi-thread","macros","net","time","signal","io-util","sync","process"] }
+
+[features]
+long-tests = []
+
+# Detach from any parent workspace: this crate builds on its own.
+[workspace]
