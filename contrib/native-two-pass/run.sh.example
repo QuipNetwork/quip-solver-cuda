@@ -1,0 +1,7 @@
+#!/bin/sh
+# Example launcher: point the miner's [cuda.N] binary at a script like this one.
+# screen_target_milli in the config should follow the live round threshold.
+set -eu
+export QUIP_TWO_PASS_REFINEMENT=native-cluster-rebase
+export QUIP_PARALLEL_STREAMS=6   # concurrent solve engines; 4-6 on a 5090, 3-4 on a laptop GPU
+exec "$(dirname "$0")/target/release/quip-cuda-native-two-pass" --search-config "$(dirname "$0")/configs/example.json" "$@"

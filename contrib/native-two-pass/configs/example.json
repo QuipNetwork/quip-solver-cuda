@@ -1,0 +1,19 @@
+{
+  "cpu_workers": 8,
+  "probe_updates": 3000,
+  "probe_cutoff_milli": -5079000,
+  "screen_target_milli": -5090000,
+  "reroll_seeds": 24,
+  "reroll_within_milli": 9000,
+  "reroll_min_p": 0.004,
+  "probe0_updates": 700,
+  "probe0_replicas": 96,
+  "probe0_keep": 0.05,
+  "probe0_warmup": 60,
+  "cold": { "updates": 30000, "refinement_pass_limit": 2 },
+  "ramp_base": 15000,
+  "ramp_step": 5000,
+  "fusion_width": 18,
+  "fusion_donors": 64,
+  "weak_scale": 1.2
+}
