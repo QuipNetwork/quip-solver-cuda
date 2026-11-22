@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Example 2-Feeder (GPU 0, 1) launcher for a 4x RTX 4090 / 56-core host
+# pairing with 2 downstream solvers on GPU 2, 3.
+set -euo pipefail
+
+BIN="./target/release/quip-super-sdp-feeder"
+TOKEN="${QUIP_FEEDER_TOKEN:-change-me}"
+
+# Keep total BP threads below physical online core count (e.g. 2 x 24 = 48 / 56 cores)
+# and run feeders at `nice -n 5` so downstream solver host threads never contend.
+nice -n 5 "$BIN" \
+  --device 0 \
+  --listen 127.0.0.1:19901 \
+  --token "$TOKEN" \
+  --streams 3 \
+  --batch 4096 \
+  --bp-threads 24 \
+  --bm4-pre-steps 35 --bm4-pre-keep 0.16 \
+  --bm60-steps 60 --bm60-keep 0.012 \
+  --bm30-keep 0.036 \
+  --mode super --deep-reps 4 --deep-iters 160 --gw-trials 20 --stage-e-keep 1.0 &
+
+nice -n 5 "$BIN" \
+  --device 1 \
+  --listen 127.0.0.1:19902 \
+  --token "$TOKEN" \
+  --streams 3 \
+  --batch 4096 \
+  --bp-threads 24 \
+  --bm4-pre-steps 35 --bm4-pre-keep 0.16 \
+  --bm60-steps 60 --bm60-keep 0.012 \
+  --bm30-keep 0.036 \
+  --mode super --deep-reps 4 --deep-iters 160 --gw-trials 20 --stage-e-keep 1.0 &
+
+wait

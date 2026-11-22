@@ -1,0 +1,28 @@
+[package]
+name = "quip-super-sdp-feeder"
+version = "0.5.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "GPU-native FastDimer + Burer-Monteiro SDP + Goemans-Williamson + deep K4-BP screening feeder for quip/twisted-ice-dimer"
+
+[[bin]]
+name = "quip-super-sdp-feeder"
+path = "src/main.rs"
+
+[dependencies]
+ising-generators = "=0.0.15"
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "cuda-12090",
+    "dynamic-loading",
+] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+
+# Detach from the parent quip-solver-cuda workspace so this reference crate builds standalone.
+[workspace]
