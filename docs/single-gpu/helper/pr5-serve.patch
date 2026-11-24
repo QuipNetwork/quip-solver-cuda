@@ -1,0 +1,317 @@
+Patch to the native two-pass solver of QuipNetwork/quip-solver-cuda PR #5 (contrib/native-two-pass, commit 97faa92).
+The patched file is a derivative of that crate and is licensed, like it, under AGPL-3.0-or-later; the SPDX header of
+solver.rs is unchanged. Adds two opt-in features to solver.rs only (no new dependencies; kernel.cu, Cargo.toml and
+Cargo.lock untouched):
+  - search-config keys struct_cutoff / struct_streams: a CPU structural prefilter in the native miner (E83);
+  - a --serve mode: a persistent helper that answers solve requests on stdin/stdout (PROTOCOL.md, E84).
+Without --serve and without struct_cutoff the solver behaves as PR #5 at 97faa92.
+Apply from the root of a PR #5 checkout:  patch -p1 < pr5-serve.patch
+
+diff --git a/contrib/native-two-pass/solver.rs b/contrib/native-two-pass/solver.rs
+index f173ace..01d93f5 100755
+--- a/contrib/native-two-pass/solver.rs
++++ b/contrib/native-two-pass/solver.rs
+@@ -10724,6 +10724,8 @@ mod native_seed {
+         pub stats: serde_json::Value,
+     }
+     impl NativeSeed {
++        #[doc = " serve patch: compile/load the lazily built native-cluster module now (serve start-up)."]
++        pub(crate) fn serve_warm_cluster_kernel(&self) -> Result<(), String> { self.kernel.native_cluster_function().map(|_| ()) }
+         #[doc = " Open a persistent CUDA seeding engine."]
+         #[doc = " # Errors"]
+         #[doc = " Returns CUDA or JIT errors."]
+@@ -12511,8 +12513,9 @@ struct SearchConfig {
+     archive_policy:String,pair_refinement:bool,pair_triples:bool,
+     auxiliary_prefix:usize,auxiliary_suffix:usize,
+     damping_base:f32,damping_step:f32,penalty_base:f32,penalty_step:f32,temperature_milli:f32,seeded_ramp_scale:f32,weak_scale:f32,ramp_base:f32,ramp_step:f32,rho_cap:f32,ramp_power:f32,clone_every:usize,clone_start:usize,clone_end:usize,clone_fraction:f64,weight_growth:f32,damping_decay:f32,temp_anneal:f32,adapt_scale:f32,cold_clusters:bool,cold_thermal:bool,lean_level:u8,probe_updates:usize,probe0_updates:usize,probe0_replicas:usize,probe0_keep:f64,probe0_warmup:usize,probe_cutoff_milli:Option<i64>,
++    struct_cutoff:Option<f64>,struct_streams:usize,
+ }
+-impl Default for SearchConfig{fn default()->Self{Self{speed_checkpoint_slice:false,speed_integer_reduction:false,speed_i64_score:false,speed_edge_schedule:false,speed_fusion_cache:true,cold:StageConfig{refinement_pass_limit:2,..StageConfig::default()},first:StageConfig{updates:3500,refinement_pass_limit:2,..StageConfig::default()},second:StageConfig{updates:3500,refinement_pass_limit:1,..StageConfig::default()},native_cluster_updates:None,screen_cold_cutoff_milli:None,screen_keep_fraction:None,screen_window:200,screen_warmup:30,screen_target_milli:None,reroll_seeds:0,reroll_within_milli:2500,reroll_min_p:0.0,trajectory_shift:0,native_cluster_exact_loops:false,native_cluster_exact_mode:"triangles9".into(),native_cluster_max_arity:8,native_cluster_followup_max_arity:None,native_cluster_passes:1,native_cluster_selection:"weak".into(),native_cluster_followup_selection:None,cpu_workers:0,replicas:192,minsum_replicas:Some(42),fusion_donors:32,fusion_width:14,fusion_table_entries:1000000,archive_policy:"records".into(),pair_refinement:true,pair_triples:true,auxiliary_prefix:1500,auxiliary_suffix:1500,damping_base:0.1,damping_step:0.1,penalty_base:250.,penalty_step:125.,temperature_milli:45.,seeded_ramp_scale:1.,weak_scale:1.,ramp_base:3000.,ramp_step:1000.,rho_cap:0.95,ramp_power:0.,clone_every:0,clone_start:1000,clone_end:4000,clone_fraction:0.25,weight_growth:0.,damping_decay:0.,temp_anneal:0.,adapt_scale:0.,cold_clusters:false,cold_thermal:false,lean_level:0,probe_updates:0,probe0_updates:0,probe0_replicas:192,probe0_keep:0.0,probe0_warmup:60,probe_cutoff_milli:None}}}
++impl Default for SearchConfig{fn default()->Self{Self{speed_checkpoint_slice:false,speed_integer_reduction:false,speed_i64_score:false,speed_edge_schedule:false,speed_fusion_cache:true,cold:StageConfig{refinement_pass_limit:2,..StageConfig::default()},first:StageConfig{updates:3500,refinement_pass_limit:2,..StageConfig::default()},second:StageConfig{updates:3500,refinement_pass_limit:1,..StageConfig::default()},native_cluster_updates:None,screen_cold_cutoff_milli:None,screen_keep_fraction:None,screen_window:200,screen_warmup:30,screen_target_milli:None,reroll_seeds:0,reroll_within_milli:2500,reroll_min_p:0.0,trajectory_shift:0,native_cluster_exact_loops:false,native_cluster_exact_mode:"triangles9".into(),native_cluster_max_arity:8,native_cluster_followup_max_arity:None,native_cluster_passes:1,native_cluster_selection:"weak".into(),native_cluster_followup_selection:None,cpu_workers:0,replicas:192,minsum_replicas:Some(42),fusion_donors:32,fusion_width:14,fusion_table_entries:1000000,archive_policy:"records".into(),pair_refinement:true,pair_triples:true,auxiliary_prefix:1500,auxiliary_suffix:1500,damping_base:0.1,damping_step:0.1,penalty_base:250.,penalty_step:125.,temperature_milli:45.,seeded_ramp_scale:1.,weak_scale:1.,ramp_base:3000.,ramp_step:1000.,rho_cap:0.95,ramp_power:0.,clone_every:0,clone_start:1000,clone_end:4000,clone_fraction:0.25,weight_growth:0.,damping_decay:0.,temp_anneal:0.,adapt_scale:0.,cold_clusters:false,cold_thermal:false,lean_level:0,probe_updates:0,probe0_updates:0,probe0_replicas:192,probe0_keep:0.0,probe0_warmup:60,probe_cutoff_milli:None,struct_cutoff:None,struct_streams:0}}}
+ impl SearchConfig{
+     fn validate(&self)->Result<(),String>{
+         if !self.ramp_base.is_finite()||!(100.0..=50000.0).contains(&self.ramp_base)||!self.ramp_step.is_finite()||!(0.0..=20000.0).contains(&self.ramp_step)||!self.rho_cap.is_finite()||self.rho_cap<=0.||self.rho_cap>0.999||!self.ramp_power.is_finite()||!(0.0..=8.0).contains(&self.ramp_power){return Err("ramp_base 100..50000, ramp_step 0..20000, rho_cap in (0,0.999], ramp_power 0..8".into());}
+@@ -12524,6 +12527,8 @@ impl SearchConfig{
+         if self.probe0_replicas<32||self.probe0_replicas>self.replicas||self.probe0_replicas<self.effective_minsum(){return Err("probe0_replicas must be between max(32,minsum) and replicas".into());}
+         if self.probe0_updates!=0&&(self.probe_updates==0||self.probe0_updates<500||self.probe0_updates>=self.probe_updates||self.probe0_updates%100!=0||!(self.probe0_keep>0.0&&self.probe0_keep<=1.0)){return Err("probe0_updates needs probe_updates, 500..probe_updates multiple of 100, and 0<probe0_keep<=1".into());}
+         if self.probe_updates!=0&&(self.probe_updates<1000||self.probe_updates>6000||self.probe_updates%100!=0){return Err("probe_updates must be 0 or a multiple of 100 in 1000..6000".into());}
++        if let Some(c)=self.struct_cutoff{if !c.is_finite()||c<=0.{return Err("struct_cutoff must be finite and positive".into());}}
++        if self.struct_streams>64||(self.struct_streams>0&&self.struct_cutoff.is_none()){return Err("struct_streams must be 0..64 and needs struct_cutoff".into());}
+         if self.reroll_seeds>64||!(0..=100000).contains(&self.reroll_within_milli){return Err("reroll_seeds must be 0..64 and reroll_within_milli 0..100000".into());}
+         if let Some(q)=self.screen_keep_fraction{if !q.is_finite()||q<=0.||q>1.{return Err("screen_keep_fraction must be in (0,1]".into());}}
+         if !(10..=10000).contains(&self.screen_window)||self.screen_warmup>self.screen_window{return Err("screen_window must be 10..10000 and at least screen_warmup".into());}
+@@ -12679,6 +12684,40 @@ fn screen_gate(cold_best_milli:i64)->Option<String>{
+     let mut window=SCREEN_WINDOW.lock().unwrap_or_else(|e|e.into_inner());
+     screen_decide(cfg.screen_cold_cutoff_milli,cfg.screen_keep_fraction,cfg.screen_warmup,cfg.screen_window,&mut window,cold_best_milli)
+ }
++#[cfg(test)]mod serve_protocol_tests{
++    use super::*;
++    #[test]fn parses_solve_cancel_and_bad_requests(){
++        assert_eq!(serve_parse_request(r#"{"id":7,"instance":"/dev/shm/quip-bp/ab.json"}"#),ServeRequest::Solve{id:7,instance:PathBuf::from("/dev/shm/quip-bp/ab.json"),shift:0,max_reads:8});
++        assert_eq!(serve_parse_request(r#"{"id":18446744073709551615,"instance":"/a.json","shift":3,"max_reads":64,"extra":1}"#),ServeRequest::Solve{id:u64::MAX,instance:PathBuf::from("/a.json"),shift:3,max_reads:64});
++        assert_eq!(serve_parse_request(r#"{"id":1,"instance":"/a.json","shift":null,"max_reads":null}"#),ServeRequest::Solve{id:1,instance:PathBuf::from("/a.json"),shift:0,max_reads:8});
++        assert_eq!(serve_parse_request(r#"{"cancel":9}"#),ServeRequest::Cancel(9));
++        for(line,id)in[("not json",0),("[1,2]",0),(r#"{"cancel":-1}"#,0),(r#"{"instance":"/a.json"}"#,0),(r#"{"id":-3,"instance":"/a.json"}"#,0),(r#"{"id":2}"#,2),(r#"{"id":2,"instance":"rel.json"}"#,2),(r#"{"id":2,"instance":"/a.json","max_reads":0}"#,2),(r#"{"id":2,"instance":"/a.json","max_reads":65}"#,2),(r#"{"id":2,"instance":"/a.json","max_reads":2.5}"#,2),(r#"{"id":2,"instance":"/a.json","shift":-1}"#,2),(r#"{"id":2,"instance":7}"#,2)]{
++            match serve_parse_request(line){ServeRequest::Bad{id:got,error}=>{assert_eq!(got,id,"{line}");assert!(!error.is_empty());}other=>panic!("{line} parsed as {other:?}")}
++        }
++        let line=serve_error_line(4,true,"x \"y\"\n");assert!(!line.contains('\n'));let v:serde_json::Value=serde_json::from_str(&line).unwrap();assert_eq!(v,serde_json::json!({"id":4,"ok":false,"cancelled":true,"error":"x \"y\"\n"}));
++    }
++    #[test]fn spins_energy_and_read_selection(){
++        assert_eq!(serve_spin_string(&[1,-1,-1,1]).unwrap(),"1001");assert_eq!(serve_spin_string(&[]).unwrap(),"");assert!(serve_spin_string(&[1,0]).is_err());
++        let h=[3,-7,0];let j=[-1000,45,17];let edges=[(0u32,1u32),(1,2),(2,2)];
++        // +1,-1,+1: 3+7+0 + (-1000)(-1) + 45(-1) + 17(1)
++        assert_eq!(serve_energy_milli(&h,&j,&edges,&[1,-1,1]).unwrap(),3+7+1000-45+17);
++        assert!(serve_energy_milli(&h,&j,&edges,&[1,-1]).is_err());assert!(serve_energy_milli(&h,&j,&edges,&[1,2,1]).is_err());assert!(serve_energy_milli(&h,&j,&[(0,3),(0,1),(1,2)],&[1,1,1]).is_err());
++        let r=|s:&[i8],e:i64|SamplerResult{spins:s.to_vec(),energy_milli:e};
++        let picked=serve_select_reads(vec![r(&[1,1],5),r(&[-1,1],-3),r(&[1,-1],-3),r(&[-1,1],-3),r(&[-1,-1],0)],3);
++        assert_eq!(picked.iter().map(|x|(x.spins.clone(),x.energy_milli)).collect::<Vec<_>>(),vec![(vec![-1,1],-3),(vec![1,-1],-3),(vec![-1,-1],0)]);
++        assert_eq!(serve_select_reads(vec![r(&[1],2),r(&[1],2)],8).len(),1);
++        assert_eq!(SERVE_SHIFT.with(|s|s.get()),0);{let _s=ServeShiftScope::new(2u64.wrapping_mul(SERVE_SHIFT_STEP));assert_eq!(SERVE_SHIFT.with(|s|s.get()),0x3C6EF372FE94F82A);}assert_eq!(SERVE_SHIFT.with(|s|s.get()),0);
++    }
++}
++#[cfg(test)]mod struct_prefilter_config_tests{
++    use super::*;
++    #[test]fn struct_keys_default_off_validate_and_stay_out_of_the_kernel(){
++        let d=SearchConfig::default();assert!(d.struct_cutoff.is_none());assert_eq!(d.struct_streams,0);let v=serde_json::to_value(&d).unwrap();assert!(v["struct_cutoff"].is_null()&&v.get("struct_cutoff").is_some());assert_eq!(v["struct_streams"],0);
++        let c=search_config_from_patch(serde_json::json!({"struct_cutoff":1025.3,"struct_streams":3})).unwrap();assert_eq!(c.struct_cutoff,Some(1025.3));assert_eq!(c.struct_streams,3);assert_eq!(c.kernel_prefix(),d.kernel_prefix());
++        for bad in [serde_json::json!({"struct_cutoff":-1.0}),serde_json::json!({"struct_cutoff":0.0}),serde_json::json!({"struct_streams":2}),serde_json::json!({"struct_cutoff":1000.0,"struct_streams":65})]{assert!(search_config_from_patch(bad).is_err());}
++        let mut n=d.clone();n.struct_cutoff=Some(f64::NAN);assert!(n.validate().is_err());n.struct_cutoff=Some(f64::INFINITY);assert!(n.validate().is_err());
++    }
++}
+ #[cfg(test)]mod screen_gate_tests{
+     use super::*;use std::collections::VecDeque;
+     #[test]fn reroll_only_for_unscreened_near_misses(){
+@@ -13519,6 +13558,34 @@ fn run_baseline(
+     batch.stats["effective_minsum_replicas"]=serde_json::json!(search_config().effective_minsum());
+     Ok(batch)
+ }
++// structural prefilter patch: CPU structural prefilter (opt-in; struct_cutoff unset = unchanged behaviour).
++// A rejected salt returns one valid read: every spin +1, whose exact energy over the instance's
++// own h/J/edges is sum(h)+sum(J) (each J term is J*s_u*s_v = J, self-edges included), the same
++// integer-milli value graph_score() recomputes in family_until.
++fn struct_reject_read(instance:&Instance)->Result<SamplerResult,String>{
++    let(h,j,edges)=(instance.h(),instance.j(),instance.edges());let n=h.len();
++    if n==0||edges.len()!=j.len()||edges.iter().any(|&(u,v)|u as usize>=n||v as usize>=n){return Err("struct reject read: graph shape".into());}
++    let energy=h.iter().map(|&v|i64::from(v)).sum::<i64>()+j.iter().map(|&v|i64::from(v)).sum::<i64>();
++    Ok(SamplerResult{spins:vec![1i8;n],energy_milli:energy})
++}
++struct StructStats{seen:u64,rejected:u64,passed:u64,scored_passed:u64,errors:u64,passed_score_sum:f64,since:Option<Instant>}
++static STRUCT_STATS:Mutex<StructStats>=Mutex::new(StructStats{seen:0,rejected:0,passed:0,scored_passed:0,errors:0,passed_score_sum:0.,since:None});
++fn struct_record(score:Option<f64>,rejected:bool){
++    let mut s=STRUCT_STATS.lock().unwrap_or_else(|e|e.into_inner());let now=Instant::now();let since=*s.since.get_or_insert(now);
++    s.seen+=1;if rejected{s.rejected+=1;}else{s.passed+=1;match score{Some(v)=>{s.scored_passed+=1;s.passed_score_sum+=v;}None=>s.errors+=1}}
++    let window=now.duration_since(since);
++    if window.as_secs()>=60{
++        let mean=if s.scored_passed>0{Some(s.passed_score_sum/s.scored_passed as f64)}else{None};
++        tracing::info!(window_s=window.as_secs(),seen=s.seen,rejected_struct=s.rejected,passed=s.passed,score_errors=s.errors,mean_passed_score=?mean,cutoff=?search_config().struct_cutoff,"STRUCT_PREFILTER");
++        *s=StructStats{seen:0,rejected:0,passed:0,scored_passed:0,errors:0,passed_score_sum:0.,since:Some(now)};
++    }
++}
++// Counts GPU solves in flight when struct_streams > 0, so at most engines.len() salts hold an engine
++// while extra stream workers keep scoring. Waiters sleep on the condvar (no spinning).
++static GPU_SLOTS:(Mutex<usize>,std::sync::Condvar)=(Mutex::new(0),std::sync::Condvar::new());
++struct GpuSlot;
++impl GpuSlot{fn acquire(limit:usize,stopped:&dyn Fn()->bool)->Result<Self,SampleError>{let(m,cv)=&GPU_SLOTS;let mut used=m.lock().unwrap_or_else(|e|e.into_inner());loop{if *used<limit.max(1){*used+=1;return Ok(GpuSlot);}if stopped(){return Err(SampleError::DeviceBusy);}used=cv.wait_timeout(used,std::time::Duration::from_millis(100)).unwrap_or_else(|e|e.into_inner()).0;}}}
++impl Drop for GpuSlot{fn drop(&mut self){let(m,cv)=&GPU_SLOTS;let mut used=m.lock().unwrap_or_else(|e|e.into_inner());*used=used.saturating_sub(1);drop(used);cv.notify_one();}}
+ struct NativeNode {
+     engines: Vec<Mutex<native_seed::NativeSeed>>,
+     governor: nvml_gov::UtilGovernor,
+@@ -13559,13 +13626,32 @@ impl NativeNode {
+         if stop() {
+             return Err(SampleError::DeviceBusy);
+         }
++        let struct_score=if let Some(cut)=search_config().struct_cutoff{
++            let scored=structural_screen::from_instance(instance).map(|f|f.default_score());
++            if let Err(e)=&scored{tracing::debug!(nonce=%nonce,error=%e,"STRUCT_SCORE_ERROR");}
++            let mut rejected=None;
++            if let Ok(score)=scored{if score>cut{match struct_reject_read(instance){Ok(read)=>rejected=Some((score,read)),Err(e)=>tracing::warn!(nonce=%nonce,error=%e,"STRUCT_REJECT_READ_FAILED")}}}
++            struct_record(scored.as_ref().ok().copied(),rejected.is_some());
++            if let Some((score,read))=rejected{
++                let final_best=read.energy_milli;
++                let mut stats=serde_json::json!({});
++                stats["screened_out"]=serde_json::json!({"reason":format!("structural score {score:.3} above cutoff {cut}"),"stage":"struct"});
++                stats["struct_score"]=serde_json::json!(score);
++                tracing::info!(nonce = %nonce, stage = %"struct", p0_milli = ?None::<i64>, probe_milli = ?None::<i64>, final_best_milli = final_best, reroll = %"", elapsed_ms = start.elapsed().as_millis() as u64, struct_score = score, "DRAW_LOG");
++                tracing::info!(nonce, best_milli = final_best, solve_ms = start.elapsed().as_millis(), population = 1usize, "NATIVE_TWO_PASS_COMPLETE");
++                return Ok(native_seed::SeedBatch{reads:vec![read],early_reads:Vec::new(),record_reads:Vec::new(),stats});
++            }
++            scored.ok()
++        }else{None};
++        let _gpu_slot=if search_config().struct_streams>0{Some(GpuSlot::acquire(self.engines.len(),stopped)?)}else{None};
+         let engine = {
+             let mut got = None;
+             for e in &self.engines { if let Ok(g) = e.try_lock() { got = Some(g); break; } }
+             match got { Some(g) => g, None => self.engines[0].lock().map_err(|_| SampleError::DeviceFault("native engine lock poisoned".into()))? }
+         };
+         let fail = |e: String| if stop() { SampleError::DeviceBusy } else { SampleError::DeviceFault(e) };
+-        let _ts = if search_config().trajectory_shift!=0 { Some(TrajectoryScope::new(search_config().trajectory_shift)) } else { None };
++        let serve_shift=SERVE_SHIFT.with(|s|s.get());
++        let _ts = if search_config().trajectory_shift!=0||serve_shift!=0 { Some(TrajectoryScope::new(search_config().trajectory_shift.wrapping_add(serve_shift))) } else { None };
+         let mut p0_out: Option<native_seed::SeedBatch> = None; let mut p0_energy: Option<i64> = None; let mut probe_log: Option<i64> = None;
+         if search_config().probe_updates > 0 && search_config().probe0_updates > 0 {
+             let p0 = { let _phase = ProbePhaseScope::new(); let _o = Probe0Scope::new(search_config().probe0_updates); let _c = if search_config().probe0_replicas != search_config().replicas { Some(CfgOverrideScope::new(probe0_config())) } else { None }; run_baseline(&engine, instance, &stop) }.map_err(&fail)?;
+@@ -13607,7 +13693,7 @@ impl NativeNode {
+                         let p=0.5*erfc_approx(z/std::f64::consts::SQRT_2);
+                         if p<min_p{break;}
+                     }
+-                    let _shift=TrajectoryScope::new(i.wrapping_mul(0x9E3779B97F4A7C15));let _bypass=ScreenBypassScope::new();
++                    let _shift=TrajectoryScope::new(i.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(serve_shift.rotate_left(32)));let _bypass=ScreenBypassScope::new();
+                     match run_baseline(&engine,instance,&stop){
+                         Ok(next)=>{let e=next.reads.iter().map(|r|r.energy_milli).min().unwrap_or(i64::MAX);tried.push(e);if e<best_so_far{best_so_far=e;batch=next;}if best_so_far<=target{break;}}
+                         Err(_)=>break,
+@@ -13617,12 +13703,13 @@ impl NativeNode {
+             }
+         }
+         if let Some(e) = p0_energy { batch.stats["probe0_milli"] = serde_json::json!(e); }
++        if let Some(s) = struct_score { batch.stats["struct_score"] = serde_json::json!(s); }
+         {
+             let stage = batch.stats.get("screened_out").and_then(|v| v.get("stage")).and_then(|v| v.as_str()).unwrap_or("full").to_owned();
+             if stage != "probe0" {
+                 let final_best = batch.reads.iter().map(|r| r.energy_milli).min().unwrap_or(i64::MAX);
+                 let reroll = batch.stats.get("reroll").map(|v| v.to_string()).unwrap_or_default();
+-                tracing::info!(nonce = %nonce, stage = %stage, p0_milli = ?p0_energy, probe_milli = ?probe_log, final_best_milli = final_best, reroll = %reroll, elapsed_ms = start.elapsed().as_millis() as u64, "DRAW_LOG");
++                if let Some(score)=struct_score{tracing::info!(nonce = %nonce, stage = %stage, p0_milli = ?p0_energy, probe_milli = ?probe_log, final_best_milli = final_best, reroll = %reroll, elapsed_ms = start.elapsed().as_millis() as u64, struct_score = score, "DRAW_LOG");}else{tracing::info!(nonce = %nonce, stage = %stage, p0_milli = ?p0_energy, probe_milli = ?probe_log, final_best_milli = final_best, reroll = %reroll, elapsed_ms = start.elapsed().as_millis() as u64, "DRAW_LOG");}
+             }
+         }
+         batch.stats["speed_fusion_cache"]=fusion_cache.report();
+@@ -13754,7 +13841,7 @@ impl Sampler for NativeNode {
+     ) {
+         let jobs = Mutex::new(jobs);
+         std::thread::scope(|scope| {
+-            for _ in 1..self.engines.len() {
++            for _ in 1..self.stream_width() {
+                 let (jobs, out, cancel) = (&jobs, out.clone(), &cancel);
+                 scope.spawn(move || self.stream_worker(jobs, out, cancel));
+             }
+@@ -13762,7 +13849,7 @@ impl Sampler for NativeNode {
+         });
+     }
+     fn stream_width(&self) -> usize {
+-        self.engines.len()
++        self.engines.len() + search_config().struct_streams
+     }
+     fn declared_stream_width() -> u32 {
+         0
+@@ -13885,6 +13972,9 @@ struct Cli {
+     probe_dir: Option<PathBuf>,
+     #[arg(long, requires="probe_dir")]
+     probe_output: Option<PathBuf>,
++    /// serve patch: persistent solve helper, one JSON request per stdin line, answers on stdout.
++    #[arg(long, conflicts_with_all=["screen_canonical","replay_canonical","replay_output","probe_dir","probe_output","print_search_config"])]
++    serve: bool,
+ }
+ fn load_canonical_instance(input:&std::path::Path)->Result<Instance,Box<dyn std::error::Error>>{
+     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(input)?)?;
+@@ -13968,6 +14058,101 @@ fn probe_batch(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+     eprintln!("probe: finished {count} salts in {:.1}s", started.elapsed().as_secs_f64());
+     Ok(())
+ }
++// serve patch: persistent --serve mode (docs/single-gpu/helper/PROTOCOL.md v1). One solve at a time; stdout carries protocol lines only.
++thread_local!{static SERVE_SHIFT:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
++const SERVE_SHIFT_STEP:u64=0x9E3779B97F4A7C15;
++struct ServeShiftScope(u64);impl ServeShiftScope{fn new(shift:u64)->Self{Self(SERVE_SHIFT.with(|s|s.replace(shift)))}}impl Drop for ServeShiftScope{fn drop(&mut self){SERVE_SHIFT.with(|s|s.set(self.0));}}
++#[derive(Debug,PartialEq)]
++enum ServeRequest{Solve{id:u64,instance:PathBuf,shift:u64,max_reads:usize},Cancel(u64),Bad{id:u64,error:String}}
++fn serve_parse_request(line:&str)->ServeRequest{
++    use ServeRequest::{Bad,Cancel,Solve};
++    let v:serde_json::Value=match serde_json::from_str(line){Ok(v)=>v,Err(e)=>return Bad{id:0,error:format!("malformed request: {e}")}};
++    let Some(obj)=v.as_object() else{return Bad{id:0,error:"request is not a JSON object".into()}};
++    if let Some(c)=obj.get("cancel"){return match c.as_u64(){Some(id)=>Cancel(id),None=>Bad{id:0,error:"cancel id is not a u64".into()}};}
++    let Some(id)=obj.get("id").and_then(|x|x.as_u64()) else{return Bad{id:0,error:"missing or invalid id".into()}};
++    let bad=|error:&str|Bad{id,error:error.into()};
++    let instance=match obj.get("instance").and_then(|x|x.as_str()){Some(p) if std::path::Path::new(p).is_absolute()=>PathBuf::from(p),Some(_)=>return bad("instance path is not absolute"),None=>return bad("missing instance path")};
++    let shift=match obj.get("shift"){None|Some(serde_json::Value::Null)=>0,Some(x)=>match x.as_u64(){Some(s)=>s,None=>return bad("shift is not a u64")}};
++    let max_reads=match obj.get("max_reads"){None|Some(serde_json::Value::Null)=>8,Some(x)=>match x.as_u64(){Some(m) if (1..=64).contains(&m)=>m as usize,_=>return bad("max_reads is not an integer 1..64")}};
++    Solve{id,instance,shift,max_reads}
++}
++fn serve_spin_string(spins:&[i8])->Result<String,String>{spins.iter().map(|&s|match s{1=>Ok('1'),-1=>Ok('0'),_=>Err(format!("spin value {s} is not +1/-1"))}).collect()}
++// Exact energy on the instance's own h/J (dense positions), WITHOUT offset_milli; same sum graph_score computes.
++fn serve_energy_milli(h:&[i32],j:&[i32],edges:&[(u32,u32)],spins:&[i8])->Result<i64,String>{
++    if spins.len()!=h.len()||edges.len()!=j.len(){return Err("spin/graph shape".into());}
++    let mut e=0i128;for(&hv,&s)in h.iter().zip(spins){if s!=1&&s!=-1{return Err("spin not +1/-1".into());}e+=i128::from(hv)*i128::from(s);}
++    for(&(u,v),&jv)in edges.iter().zip(j){let(u,v)=(u as usize,v as usize);if u>=spins.len()||v>=spins.len(){return Err("edge out of range".into());}e+=i128::from(jv)*i128::from(spins[u])*i128::from(spins[v]);}
++    i64::try_from(e).map_err(|_|"energy overflow".into())
++}
++// Ascending energy (ties by spins), identical states removed, at most max reads.
++fn serve_select_reads(mut reads:Vec<SamplerResult>,max:usize)->Vec<SamplerResult>{reads.sort_by(|a,b|a.energy_milli.cmp(&b.energy_milli).then_with(||a.spins.cmp(&b.spins)));reads.dedup_by(|a,b|a.spins==b.spins);reads.truncate(max.max(1));reads}
++fn serve_error_line(id:u64,cancelled:bool,error:&str)->String{serde_json::json!({"id":id,"ok":false,"cancelled":cancelled,"error":error}).to_string()}
++fn serve_emit(line:&str){use std::io::Write;let out=std::io::stdout();let mut lock=out.lock();if let Err(e)=lock.write_all(line.as_bytes()).and_then(|()|lock.write_all(b"\n")).and_then(|()|lock.flush()){tracing::warn!(error=%e,"SERVE_STDOUT_WRITE_FAILED");}}
++struct ServeState{busy:std::sync::atomic::AtomicBool,inflight:std::sync::atomic::AtomicU64,cancel:std::sync::atomic::AtomicBool}
++enum ServeFailure{Error(String),Panic(String)}
++fn serve_solve(sampler:&NativeNode,path:&std::path::Path,shift:u64,max_reads:usize,nodes_max:usize,stopped:&dyn Fn()->bool)->Result<(serde_json::Value,i64,usize),ServeFailure>{
++    let instance=load_canonical_instance(path).map_err(|e|ServeFailure::Error(format!("instance: {e}")))?;
++    let n=instance.h().len();if n>nodes_max{return Err(ServeFailure::Error(format!("instance has {n} nodes, above nodes_max {nodes_max}")));}
++    if stopped(){return Err(ServeFailure::Error("cancelled before start".into()));}
++    let result={let _shift=ServeShiftScope::new(shift.wrapping_mul(SERVE_SHIFT_STEP));std::panic::catch_unwind(std::panic::AssertUnwindSafe(||sampler.solve_instance(&instance,stopped)))};
++    let batch=match result{Ok(Ok(b))=>b,Ok(Err(e))=>return Err(ServeFailure::Error(e.to_string())),Err(p)=>{let msg=p.downcast_ref::<&str>().map(|s|(*s).to_owned()).or_else(||p.downcast_ref::<String>().cloned()).unwrap_or_else(||"non-string panic".into());return Err(ServeFailure::Panic(msg));}};
++    let screened_out=batch.stats.get("screened_out").is_some();
++    let stage=batch.stats.get("screened_out").and_then(|v|v.get("stage")).and_then(|v|v.as_str()).unwrap_or("full").to_owned();
++    let mut checked=Vec::with_capacity(batch.reads.len());let mut mismatched=0usize;
++    for r in batch.reads{match serve_energy_milli(instance.h(),instance.j(),instance.edges(),&r.spins){Ok(e)=>{if e!=r.energy_milli{mismatched+=1;}checked.push(SamplerResult{spins:r.spins,energy_milli:e});}Err(err)=>{mismatched+=1;tracing::error!(error=%err,"SERVE_READ_REJECTED");}}}
++    if mismatched>0{tracing::error!(mismatched,"SERVE_ENERGY_MISMATCH (reads reported with recomputed exact energy)");}
++    let reads=serve_select_reads(checked,max_reads);
++    let best=reads.first().map(|r|r.energy_milli).ok_or_else(||ServeFailure::Error("solver returned no valid read".into()))?;
++    let mut out=Vec::with_capacity(reads.len());for r in &reads{out.push(serde_json::json!({"energy_milli":r.energy_milli,"spins":serve_spin_string(&r.spins).map_err(ServeFailure::Error)?}));}
++    Ok((serde_json::json!({"ok":true,"energy_milli":best,"reads":out,"stage":stage,"screened_out":screened_out}),best,reads.len()))
++}
++fn serve(cli:&Cli)->std::process::ExitCode{
++    use std::sync::atomic::Ordering::SeqCst;
++    let nodes_max=cli.max_nodes.unwrap_or(5000);
++    let opened=Instant::now();
++    let sampler=match NativeNode::open(cli.device,cli.utilization,cli.yielding){Ok(s)=>s,Err(e)=>{eprintln!("serve: open: {e}");return std::process::ExitCode::FAILURE;}};
++    for engine in &sampler.engines{match engine.lock(){Ok(g)=>{if let Err(e)=g.serve_warm_cluster_kernel(){tracing::warn!(error=%e,"SERVE_WARM_CLUSTER_KERNEL_FAILED (it will be retried lazily on first use)");}}Err(_)=>{eprintln!("serve: engine lock poisoned at start-up");return std::process::ExitCode::FAILURE;}}}
++    tracing::info!(device=cli.device,engines=sampler.engines.len(),nodes_max,open_and_jit_ms=opened.elapsed().as_millis() as u64,refinement=%std::env::var("QUIP_TWO_PASS_REFINEMENT").unwrap_or_default(),"SERVE_READY");
++    if search_config().screen_target_milli.is_some(){tracing::warn!("SERVE: re-rolls are enabled in the search config; shifted requests run their own re-rolls");}
++    let state=std::sync::Arc::new(ServeState{busy:std::sync::atomic::AtomicBool::new(false),inflight:std::sync::atomic::AtomicU64::new(0),cancel:std::sync::atomic::AtomicBool::new(false)});
++    let(tx,rx)=std::sync::mpsc::channel::<(u64,PathBuf,u64,usize)>();
++    serve_emit(&serde_json::json!({"ready":true,"proto":1,"nodes_max":nodes_max}).to_string());
++    let reader_state=state.clone();
++    let spawned=std::thread::Builder::new().name("serve-stdin".into()).spawn(move||{
++        use std::io::BufRead;
++        let st=reader_state;let stdin=std::io::stdin();let mut input=stdin.lock();let mut buf=Vec::new();
++        loop{
++            buf.clear();
++            match input.read_until(b'\n',&mut buf){Ok(0)=>break,Ok(_)=>{},Err(e)=>{tracing::warn!(error=%e,"SERVE_STDIN_READ_FAILED (treated as EOF)");break;}}
++            let text=String::from_utf8_lossy(&buf);let text=text.trim();if text.is_empty(){continue;}
++            match serve_parse_request(text){
++                ServeRequest::Cancel(id)=>{if st.busy.load(SeqCst)&&st.inflight.load(SeqCst)==id{st.cancel.store(true,SeqCst);tracing::info!(id,"SERVE_CANCEL");}}
++                ServeRequest::Bad{id,error}=>{tracing::warn!(id,error=%error,"SERVE_BAD_REQUEST");serve_emit(&serve_error_line(id,false,&error));}
++                ServeRequest::Solve{id,instance,shift,max_reads}=>{
++                    if st.busy.compare_exchange(false,true,SeqCst,SeqCst).is_err(){serve_emit(&serve_error_line(id,false,"busy: another solve is in flight"));continue;}
++                    st.inflight.store(id,SeqCst);st.cancel.store(false,SeqCst);
++                    if tx.send((id,instance,shift,max_reads)).is_err(){break;}
++                }
++            }
++        }
++        st.cancel.store(true,SeqCst);
++        tracing::info!("SERVE_STDIN_EOF");
++    });
++    if let Err(e)=spawned{eprintln!("serve: stdin thread: {e}");return std::process::ExitCode::FAILURE;}
++    while let Ok((id,path,shift,max_reads))=rx.recv(){
++        let started=Instant::now();
++        let stopped=||state.cancel.load(SeqCst);
++        let outcome=serve_solve(&sampler,&path,shift,max_reads,nodes_max,&stopped);
++        let solve_ms=started.elapsed().as_millis() as u64;let cancelled=state.cancel.load(SeqCst);
++        state.busy.store(false,SeqCst);
++        match outcome{
++            Ok((mut answer,best,count))=>{answer["id"]=serde_json::json!(id);answer["solve_ms"]=serde_json::json!(solve_ms);tracing::info!(id,shift,best_milli=best,reads=count,solve_ms,stage=%answer["stage"].as_str().unwrap_or(""),"SERVE_SOLVED");serve_emit(&answer.to_string());}
++            Err(ServeFailure::Error(e))=>{let e=if cancelled{format!("cancelled ({e})")}else{e};tracing::warn!(id,shift,cancelled,solve_ms,error=%e,"SERVE_SOLVE_FAILED");serve_emit(&serve_error_line(id,cancelled,&e));}
++            Err(ServeFailure::Panic(msg))=>{tracing::error!(id,shift,solve_ms,panic=%msg,"SERVE_SOLVE_PANICKED (exiting: engine state is not trusted after a panic)");serve_emit(&serve_error_line(id,cancelled,&format!("panic: {msg}")));return std::process::ExitCode::from(3);}
++        }
++    }
++    std::process::ExitCode::SUCCESS
++}
+ fn main() -> std::process::ExitCode {
+     let mut cli = Cli::parse();
+     let config=match (||->Result<SearchConfig,String>{let c=if let Some(path)=&cli.search_config{let data=std::fs::read_to_string(path).map_err(|e|e.to_string())?;if path.extension().is_some_and(|e|e=="toml"){search_config_from_patch(serde_json::to_value(toml::from_str::<toml::Value>(&data).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?)?}else{search_config_from_patch(serde_json::from_str(&data).map_err(|e|e.to_string())?)?}}else{SearchConfig::default()};c.validate()?;Ok(c)})(){Ok(c)=>c,Err(e)=>{eprintln!("search configuration: {e}");return std::process::ExitCode::from(2);}};
+@@ -14005,6 +14190,10 @@ fn main() -> std::process::ExitCode {
+         drop(tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into())).try_init());
+         return match probe_batch(&cli) { Ok(()) => std::process::ExitCode::SUCCESS, Err(e) => { eprintln!("probe: {e}"); std::process::ExitCode::FAILURE } };
+     }
++    if cli.serve {
++        drop(tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())).try_init());
++        return serve(&cli);
++    }
+     let id = identity(cli.max_nodes.unwrap_or(5000));
+     if cli.common.capabilities {
+         return quip_solver_core::run(id, &cli.common, || {
