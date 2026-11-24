@@ -22,6 +22,7 @@ pub mod accept_table;
 pub mod bench;
 pub mod capacity;
 pub mod cluster;
+pub mod pairworm;
 pub mod coefficients;
 pub mod corpus;
 pub mod cuda_device;
@@ -33,7 +34,6 @@ pub mod descent;
 mod cutoff;
 pub mod driver_budget;
 pub mod families;
-pub mod headless;
 mod jit_cache;
 pub mod kernel;
 mod lease;
@@ -87,14 +87,6 @@ impl MsaSampler {
 }
 
 impl Sampler for MsaSampler {
-    fn beta_ladder(
-        &self,
-        graph: &IsingGraph,
-        params: &SampleParams,
-    ) -> Option<quip_solver_core::BetaLadder> {
-        Some(streaming::beta_ladder(graph, params))
-    }
-
     fn generates_locally() -> bool {
         true
     }
@@ -201,10 +193,10 @@ struct CudaConfig {
 
 /// CUDA adapt envelope (from `GPU/cuda_miner.py`).
 const CUDA_ADAPT: quip_solver_core::adapt::AdaptBounds = quip_solver_core::adapt::AdaptBounds {
-    min_sweeps: 256,
-    max_sweeps: 2048,
-    min_reads: 64,
-    max_reads: 256,
+    min_sweeps: 131072,
+    max_sweeps: 131072,
+    min_reads: 2048,
+    max_reads: 2048,
     reads_solution_min_factor: 0,
     reads_solution_max_factor: 0,
     reads_solution_floor_factor: 0,
@@ -301,26 +293,6 @@ pub fn cuda_msa_identity(max_nodes: usize, max_edges: usize) -> BackendIdentity 
     }
 }
 
-/// Backend identity for `quip-cuda-msa` and `quip-cuda-msa-descent` on a
-/// device with `limits`, the node limit optionally reduced by `--max-nodes`
-/// but never below [`capacity::MSA_DEFAULT_NODES`]. Reads per nonce follow
-/// the device's opt-in shared memory ([`cuda_msa_adapt`]).
-#[must_use]
-pub fn cuda_msa_identity_at(
-    limits: &capacity::DeviceLimits,
-    max_nodes: Option<usize>,
-) -> BackendIdentity {
-    let reads = capacity::max_reads(KernelKind::Msa, limits);
-    let nodes = capacity::msa_max_nodes(limits, reads).min(
-        max_nodes
-            .unwrap_or(usize::MAX)
-            .max(capacity::MSA_DEFAULT_NODES),
-    );
-    let mut identity = cuda_msa_identity(nodes, capacity::msa_max_couplers(limits, reads));
-    identity.adapt = cuda_msa_adapt(u32::try_from(reads).unwrap_or(128));
-    identity
-}
-
 /// Backend identity for `quip-cuda-gibbs` at its device-memory node and
 /// coupler limits ([`capacity::advertised_nodes`],
 /// [`capacity::advertised_couplers`]), the node limit optionally reduced by
@@ -374,14 +346,6 @@ impl CudaSampler {
 }
 
 impl Sampler for CudaSampler {
-    fn beta_ladder(
-        &self,
-        graph: &IsingGraph,
-        params: &SampleParams,
-    ) -> Option<quip_solver_core::BetaLadder> {
-        Some(streaming::beta_ladder(graph, params))
-    }
-
     fn sample(
         &self,
         graph: &IsingGraph,

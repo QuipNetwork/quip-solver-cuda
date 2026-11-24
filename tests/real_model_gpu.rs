@@ -471,7 +471,6 @@ fn real_sparse_acceptance_matches_replica_oracle() {
                     seed: 42,
                     schedule: BetaSchedule::Linear,
                     beta_range: Some((1_000_000.0, 2.0)),
-                    ..SampleParams::default()
                 };
                 let mut repeated = Vec::new();
                 for _ in 0..2 {

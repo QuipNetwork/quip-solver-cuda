@@ -18,6 +18,8 @@ mod generation_cost;
 
 /// Research schedule and policy defaults from `run_cluster.py:39-46`.
 /// Weights belong to the prepared graph. Research defaults use 250 milli.
+const ICM_EVERY_DEFAULT: usize = 32;
+
 #[derive(Clone, Debug)]
 pub struct ClusterSchedule {
     /// Total cluster sweeps, in `1..=i32::MAX`.
@@ -160,6 +162,9 @@ pub struct ClusterDevice {
     graph: PreparedGraph,
     stream: Arc<CudaStream>,
     function: CudaFunction,
+    energy_fn: CudaFunction,
+    resample_fn: CudaFunction,
+    icm_fn: CudaFunction,
     tiles: CudaSlice<i32>,
     gauges: CudaSlice<i8>,
     pairs: CudaSlice<i32>,
@@ -176,6 +181,9 @@ pub struct ClusterDevice {
 pub(crate) struct ClusterKernel {
     stream: Arc<CudaStream>,
     function: CudaFunction,
+    energy_fn: CudaFunction,
+    resample_fn: CudaFunction,
+    icm_fn: CudaFunction,
 }
 
 impl ClusterKernel {
@@ -185,19 +193,24 @@ impl ClusterKernel {
         // Refuse before JIT or stream creation, while SA is still idle.
         check_async_alloc(ctx.has_async_alloc())?;
         let arch = device_arch(&ctx);
+        // QC_LINEINFO: keep source line information in the PTX so Nsight Compute can attribute stalls to lines.
+        let defs: &[&str] = if std::env::var("QC_LINEINFO").is_ok() { &["--generate-line-info"] } else { &[] };
         let module = jit_cache::load_or_compile(
             &ctx,
             "cluster",
             SOURCE,
-            &[],
+            defs,
             &format!("sm_{arch}"),
             driver_version()?,
             0,
-            || compile_for_arch(SOURCE, 0, arch, &[]),
+            || compile_for_arch(SOURCE, 0, arch, defs),
         )?;
         // Resolve the function before SA launches. Lazy module loading can
         // synchronize the primary context, even with nonblocking streams.
         let function = module.load_function("quip_cluster_anneal")?;
+        let energy_fn = module.load_function("quip_cluster_energy")?;
+        let resample_fn = module.load_function("quip_cluster_resample")?;
+        let icm_fn = module.load_function("quip_cluster_icm")?;
         let static_shared = usize::try_from(function.shared_size_bytes()?)
             .map_err(|_| ClusterDeviceError::Parameter("negative static shared memory"))?;
         if static_shared > CLUSTER_STATIC_SHARED_BYTES {
@@ -208,280 +221,50 @@ impl ClusterKernel {
         // cudarc synchronizes the context when creating its first stream.
         // Retain this stream too, so no per-job creation waits on resident SA.
         let stream = ctx.new_stream()?;
-        Ok(Self { stream, function })
+        Ok(Self { stream, function, energy_fn, resample_fn, icm_fn })
     }
 }
 
-fn envn(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(default)
+/// Thermal best energies (twice milli) of recent deep runs at the racing checkpoint.
+/// Host-side time spent per phase of a cluster run, in microseconds, summed over all runs (reported once a minute).
+pub static PROF_US: [std::sync::atomic::AtomicU64; 9] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+thread_local! {
+    /// Reads to download from the next run; 0 = the `QC_KEEP` default. Screening stages only need the best read.
+    static KEEP_OVERRIDE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // (sweeps done, total sweeps, best population energy in milli) of the deep run in flight on this thread.
+    static DEEP_PROGRESS: std::cell::Cell<(usize, usize, i64)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+/// Progress of the deep run this thread last started (sweeps done, total sweeps, best energy in milli); clears it.
+pub fn take_deep_progress() -> Option<(usize, usize, i64)> {
+    let v = DEEP_PROGRESS.with(|p| p.replace((0, 0, 0)));
+    (v.1 > 0).then_some(v)
+}
+/// Set the number of reads the next runs of this thread return (0 restores the default).
+pub fn set_keep_override(keep: usize) {
+    KEEP_OVERRIDE.with(|k| k.set(keep));
+}
+fn prof_add(slot: usize, since: std::time::Instant) {
+    PROF_US[slot].fetch_add(u64::try_from(since.elapsed().as_micros()).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Otsuka population-anneal settings. Each comes from the `otsuka_*` key of the miner's config
-/// section, else the `QUIP_OTSUKA_*` environment variable, else the default:
-///
-/// - `beta`: the family beta range `(hot, cold)` for jobs that carry none. Default `(1, 8)`, near the
-///   CPU sampler's `FAMILY_BETA_RANGE`; the generic SA range (about 0.04 to 105) wastes most of the
-///   ladder on twisted-ice instances. `"stock"` restores the job's own range.
-/// - `chunk`: sweeps per kernel launch. Default 16.
-/// - `resamples`: population steps per anneal. Default 256; 0 turns the population step off.
-/// - `houdayer`: Houdayer swap rounds per population step from beta 3. Default 1.
-/// - `reads`, `sweeps`: pin the job budget. Default 0 (the job's own budget).
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Knobs {
-    pub beta: Option<(f64, f64)>,
-    pub chunk: usize,
-    pub resamples: usize,
-    pub houdayer: usize,
-    pub reads: usize,
-    pub sweeps: usize,
-}
-
-static KNOBS: std::sync::RwLock<Option<Knobs>> = std::sync::RwLock::new(None);
-
-/// The default family beta range `(hot, cold)`.
-const DEFAULT_BETA: (f64, f64) = (1.0, 8.0);
-
-/// A usable beta range: both bounds finite and positive, hot below cold.
-fn beta_pair(hot: f64, cold: f64) -> Option<(f64, f64)> {
-    (hot.is_finite() && cold.is_finite() && hot > 0.0 && hot < cold).then_some((hot, cold))
-}
-
-/// `"stock"` is `Ok(None)` (the job's own range), `"hot,cold"` is `Ok(Some(..))`, anything else is
-/// an error so the caller keeps its current range.
-fn parse_beta(v: &str) -> Result<Option<(f64, f64)>, ()> {
-    if v.trim() == "stock" {
-        return Ok(None);
-    }
-    let parts: Vec<f64> = v
-        .split(',')
-        .map(|x| x.trim().parse::<f64>())
-        .collect::<Result<_, _>>()
-        .map_err(|_| ())?;
-    match parts[..] {
-        [hot, cold] => beta_pair(hot, cold).map(Some).ok_or(()),
-        _ => Err(()),
-    }
-}
-
-/// [`parse_beta`] for a setting named `source`, warning and keeping `current` on a bad value.
-fn beta_or(source: &str, v: &str, current: Option<(f64, f64)>) -> Option<(f64, f64)> {
-    parse_beta(v).unwrap_or_else(|()| {
-        tracing::warn!(source, value = v, "ignoring an invalid otsuka beta range");
-        current
-    })
-}
-
-pub(crate) fn knobs() -> Knobs {
-    if let Some(k) = *KNOBS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
-        return k;
-    }
-    let k = Knobs {
-        beta: match std::env::var("QUIP_OTSUKA_BETA") {
-            Ok(v) => beta_or("QUIP_OTSUKA_BETA", &v, Some(DEFAULT_BETA)),
-            Err(_) => Some(DEFAULT_BETA),
-        },
-        chunk: envn("QUIP_OTSUKA_CHUNK", 16).max(1),
-        resamples: envn("QUIP_OTSUKA_RESAMPLES", 256),
-        houdayer: envn("QUIP_OTSUKA_HOUDAYER", 1),
-        reads: envn("QUIP_OTSUKA_READS", 0),
-        sweeps: envn("QUIP_OTSUKA_SWEEPS", 0),
-    };
-    *KNOBS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(k);
-    k
-}
-
-/// The `otsuka_*` keys of the miner's config section override env and defaults.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "an integer beta bound in the config is a small number"
-)]
-pub(crate) fn knobs_from_toml(backend_toml: &str) {
-    let Ok(t) = backend_toml.parse::<toml::Table>() else {
-        return;
-    };
-    let mut k = knobs();
-    let int = |key: &str| {
-        t.get(key)
-            .and_then(toml::Value::as_integer)
-            .and_then(|v| usize::try_from(v).ok())
-    };
-    if let Some(v) = int("otsuka_chunk") {
-        k.chunk = v.max(1);
-    }
-    if let Some(v) = int("otsuka_resamples") {
-        k.resamples = v;
-    }
-    if let Some(v) = int("otsuka_houdayer") {
-        k.houdayer = v;
-    }
-    if let Some(v) = int("otsuka_reads") {
-        k.reads = v;
-    }
-    if let Some(v) = int("otsuka_sweeps") {
-        k.sweeps = v;
-    }
-    match t.get("otsuka_beta") {
-        Some(toml::Value::String(v)) => k.beta = beta_or("otsuka_beta", v, k.beta),
-        Some(toml::Value::Array(a)) => {
-            let f = |x: &toml::Value| x.as_float().or_else(|| x.as_integer().map(|i| i as f64));
-            match (a.len(), a.first().and_then(f), a.get(1).and_then(f)) {
-                (2, Some(hot), Some(cold)) if beta_pair(hot, cold).is_some() => {
-                    k.beta = Some((hot, cold));
-                }
-                _ => tracing::warn!(value = ?a, "ignoring an invalid otsuka_beta"),
-            }
-        }
-        Some(other) => tracing::warn!(value = ?other, "ignoring an invalid otsuka_beta"),
-        None => {}
-    }
-    *KNOBS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(k);
-    tracing::info!(?k, "otsuka settings");
-}
-
-/// Host state of the population anneal (resampling and Houdayer moves between launches).
-struct Pop {
-    every: usize,
-    since: usize,
-    last_beta: f32,
-    houdayer: usize,
-    rng: u64,
-    best: Option<(Vec<i8>, i64)>,
-    adj: Vec<Vec<u32>>,
-    steps: usize,
-    host: std::time::Duration,
-}
-
-impl Pop {
-    fn next(&mut self) -> u64 {
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 7;
-        self.rng ^= self.rng << 17;
-        self.rng
-    }
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "53 random bits scaled to [0, 1) are exact in f64"
-    )]
-    fn unit(&mut self) -> f64 {
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64
-    }
-}
-
-/// The beta from which the population step pairs replicas for Houdayer moves, as in the CPU
-/// sampler. Below it the replicas differ almost everywhere and a move only swaps a pair.
-const HOUDAYER_BETA: f32 = 3.0;
-
-/// Systematic resampling: the replica each slot copies, drawn in proportion to
-/// `exp(-step * (E - E_min))` (energies in milli) with the single uniform offset `unit` in `[0, 1)`.
-/// The result keeps the population size and lists replicas in ascending order.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "milli energies and replica counts are far below 2^52"
-)]
-fn systematic_resample(energy: &[i64], step: f64, unit: f64) -> Vec<usize> {
-    let r = energy.len();
-    if r == 0 {
-        return Vec::new();
-    }
-    let low = energy.iter().copied().min().unwrap_or(0);
-    let weights: Vec<f64> = energy
-        .iter()
-        .map(|&e| (-step * (e - low) as f64 / 1000.0).exp())
-        .collect();
-    let total: f64 = weights.iter().sum();
-    let stride = total / r as f64;
-    let mut mark = unit * stride;
-    let mut picks = Vec::with_capacity(r);
-    let mut reach = 0.0;
-    for (i, &w) in weights.iter().enumerate() {
-        reach += w;
-        while mark < reach && picks.len() < r {
-            picks.push(i);
-            mark += stride;
-        }
-    }
-    // Rounding in the running sum can leave the last slot unfilled.
-    picks.resize(r, r - 1);
-    picks
-}
-
-/// `rounds` rounds of Houdayer moves over random pairs of `states`. Each move picks a node where the
-/// pair differs, grows the connected cluster of differing nodes over `adj`, and swaps it between
-/// the two. Every edge that leaves the cluster ends on a node where the pair agrees, so a move
-/// keeps the summed energy of the pair.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "node and replica indices stay below MAX_PACKED_NODES and MAX_READS"
-)]
-fn houdayer_rounds(
-    states: &mut [Vec<i8>],
-    adj: &[Vec<u32>],
-    rounds: usize,
-    next: &mut dyn FnMut() -> u64,
-) {
-    let replicas = states.len();
-    let nodes = adj.len();
-    let mut order: Vec<usize> = (0..replicas).collect();
-    let mut seen = vec![false; nodes];
-    let mut differ: Vec<u32> = Vec::new();
-    let mut cluster: Vec<u32> = Vec::new();
-    for _ in 0..rounds {
-        for i in (1..replicas).rev() {
-            let j = (next() % (i as u64 + 1)) as usize;
-            order.swap(i, j);
-        }
-        for pair in order.chunks_exact(2) {
-            let (lo, hi) = (pair[0].min(pair[1]), pair[0].max(pair[1]));
-            let (left, right) = states.split_at_mut(hi);
-            let (sa, sb) = (&mut left[lo], &mut right[0]);
-            differ.clear();
-            differ.extend((0..nodes as u32).filter(|&u| sa[u as usize] != sb[u as usize]));
-            if differ.is_empty() {
-                continue;
-            }
-            let root = differ[(next() % differ.len() as u64) as usize];
-            cluster.clear();
-            cluster.push(root);
-            seen[root as usize] = true;
-            let mut at = 0;
-            while at < cluster.len() {
-                let node = cluster[at] as usize;
-                at += 1;
-                for &v in &adj[node] {
-                    let v = v as usize;
-                    if !seen[v] && sa[v] != sb[v] {
-                        seen[v] = true;
-                        cluster.push(v as u32);
-                    }
-                }
-            }
-            for &node in &cluster {
-                let node = node as usize;
-                seen[node] = false;
-                sa[node] = -sa[node];
-                sb[node] = -sb[node];
-            }
-        }
-    }
-}
+static RACE_WINDOW: std::sync::Mutex<std::collections::VecDeque<i32>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
 
 struct WorkControl<'a> {
     work: &'a super::sampler::ClusterWork,
     stopped: &'a dyn Fn() -> bool,
     cancelled: &'a dyn Fn() -> bool,
     chunk: usize,
-    /// Run the host population step between launches (the miner's job path).
-    population: bool,
 }
 
 impl ClusterDevice {
@@ -509,6 +292,9 @@ impl ClusterDevice {
         )?;
         check_memory(&graph, graph.footprint().instances, ctx.mem_get_info()?.0)?;
         let function = kernel.function.clone();
+        let energy_fn = kernel.energy_fn.clone();
+        let resample_fn = kernel.resample_fn.clone();
+        let icm_fn = kernel.icm_fn.clone();
         function.set_attribute(
             CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             i32::try_from(graph.dynamic_shared_bytes())
@@ -531,6 +317,9 @@ impl ClusterDevice {
             graph,
             stream,
             function,
+            energy_fn,
+            resample_fn,
+            icm_fn,
         })
     }
 
@@ -578,25 +367,7 @@ impl ClusterDevice {
         stopped: &dyn Fn() -> bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ClusterRun, ClusterDeviceError> {
-        self.run_work_chunked(work, stopped, cancelled, 1, false)
-    }
-
-    /// Run a host-built ladder as the miner does: `otsuka_chunk` sweeps per launch and the host
-    /// population step between launches (see [`Knobs`]).
-    ///
-    /// Unlike [`Self::run_work`], the result depends on the launch chunk, because the population
-    /// step runs at launch boundaries.
-    ///
-    /// # Errors
-    /// Returns the same validation and device errors as `run_work`.
-    #[doc(hidden)]
-    pub fn run_work_population(
-        &mut self,
-        work: &super::sampler::ClusterWork,
-        stopped: &dyn Fn() -> bool,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<ClusterRun, ClusterDeviceError> {
-        self.run_work_chunked(work, stopped, cancelled, knobs().chunk, true)
+        self.run_work_chunked(work, stopped, cancelled, work.sweeps_per_beta.max(1))
     }
 
     /// Run the identical host ladder with larger launch chunks as a GPU oracle.
@@ -610,7 +381,7 @@ impl ClusterDevice {
         work: &super::sampler::ClusterWork,
         chunk: usize,
     ) -> Result<ClusterRun, ClusterDeviceError> {
-        self.run_work_chunked(work, &|| false, &|| false, chunk, false)
+        self.run_work_chunked(work, &|| false, &|| false, chunk)
     }
 
     fn run_work_chunked(
@@ -619,11 +390,13 @@ impl ClusterDevice {
         stopped: &dyn Fn() -> bool,
         cancelled: &dyn Fn() -> bool,
         chunk: usize,
-        population: bool,
     ) -> Result<ClusterRun, ClusterDeviceError> {
         let schedule = ClusterSchedule {
             sweeps: work.betas.len() * work.sweeps_per_beta,
-            chunk: 1,
+            chunk: 1 + (std::env::var("QC_SKIP").ok().map_or(0, |v| v.parse::<usize>().unwrap()) << 8),
+            beta_knee: std::env::var("QC_LAM").ok().map_or(0.0, |v| v.parse().unwrap()),
+            rounds: std::env::var("QC_ROUNDS").ok().map_or(2, |v| v.parse().unwrap()),
+            single_every: std::env::var("QC_SINGLE").ok().map_or(1, |v| v.parse().unwrap()),
             ..Default::default()
         };
         self.run_inner(
@@ -636,20 +409,11 @@ impl ClusterDevice {
                 stopped,
                 cancelled,
                 chunk,
-                population,
             }),
         )
         .map(|(run, _)| run)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the population step hooks into the launch loop it shares with stock runs"
-    )]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "node indices stay below MAX_PACKED_NODES, far below u32::MAX"
-    )]
     fn run_inner(
         &mut self,
         schedule: &ClusterSchedule,
@@ -658,6 +422,7 @@ impl ClusterDevice {
         final_descent: bool,
         control: Option<&WorkControl<'_>>,
     ) -> Result<(ClusterRun, Vec<u64>), ClusterDeviceError> {
+        let t_init = std::time::Instant::now();
         let params = schedule.params()?;
         let ctx = self.stream.context();
         check_shared(
@@ -685,34 +450,21 @@ impl ClusterDevice {
         let (spins, rng) = initial_state(spin_count, rng_count, seed);
         let mut spins = self.stream.clone_htod(&spins)?;
         let mut rng = self.stream.clone_htod(&rng)?;
+        let mut spins_alt = self.stream.alloc_zeros::<i8>(spins.len())?;
         let config = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (512, 1, 1),
             shared_mem_bytes: u32::try_from(self.graph.dynamic_shared_bytes())
                 .map_err(|_| ClusterDeviceError::Parameter("shared memory exceeds u32"))?,
         };
-        let total_sweeps = usize::try_from(params.sweeps).unwrap_or(0);
-        let resamples = knobs().resamples;
-        let population = control.is_some_and(|c| c.population);
-        let mut pop = (population && resamples > 0 && anneals > 1).then(|| Pop {
-            every: (total_sweeps / resamples).max(1),
-            since: 0,
-            last_beta: 0.0,
-            houdayer: knobs().houdayer,
-            rng: seed ^ 0x9e37_79b9_7f4a_7c15 | 1,
-            best: None,
-            adj: {
-                let g = self.graph.original_graph();
-                let mut adj = vec![Vec::new(); g.num_nodes()];
-                for &(u, v, _) in &g.edges {
-                    adj[u].push(v as u32);
-                    adj[v].push(u as u32);
-                }
-                adj
-            },
-            steps: 0,
-            host: std::time::Duration::ZERO,
-        });
+        let mut active: usize = anneals;
+        prof_add(0, t_init);
+        let t_loop = std::time::Instant::now();
+        // QC_ISL2 (experiment): after the shrink, run G independent groups of ISL2 reads (PA inside each group);
+        // at QC_PICK_AT of the schedule keep only the group with the best energy.
+        let isl_after: usize = std::env::var("QC_ISL2").ok().map_or(0, |v| v.parse().unwrap());
+        let pick_at: f64 = std::env::var("QC_PICK_AT").ok().map_or(0.6, |v| v.parse().unwrap());
+        let mut picked = false;
         if let Some(control) = control {
             control.work.for_each_chunk(
                 control.stopped,
@@ -723,6 +475,7 @@ impl ClusterDevice {
                         beta_max: beta,
                         ..params
                     };
+                    let t_kernel = std::time::Instant::now();
                     self.launch(
                         constant_beta,
                         i32::try_from(start)
@@ -740,21 +493,162 @@ impl ClusterDevice {
                         } else {
                             1
                         },
-                        config,
+                        LaunchConfig { grid_dim: (u32::try_from(active).unwrap_or(blocks), 1, 1), ..config },
                         &mut spins,
                         &mut rng,
                     )?;
                     self.stream.synchronize()?;
-                    if let Some(pop) = pop.as_mut() {
-                        if !descent {
-                            if pop.steps == 0 && pop.since == 0 {
-                                pop.last_beta = beta;
+                    prof_add(7, t_kernel);
+                    let pa_every: usize = std::env::var("QC_PA_EVERY").ok().map_or(32, |v| v.parse().unwrap());
+                    let done = start + count;
+                    let total_sweeps = control.work.betas.len() * control.work.sweeps_per_beta;
+                    // Houdayer ICM between random pairs of reads (QC_ICM_EVERY sweeps, multiple of the chunk; 0 = off).
+                    {
+                        let icm_every: usize = std::env::var("QC_ICM_EVERY").ok().map_or(ICM_EVERY_DEFAULT, |v| v.parse().unwrap());
+                        if icm_every > 0 && !descent && done % icm_every == 0 && active >= 2 && done < total_sweeps {
+                            let nn = self.graph.original_graph().num_nodes();
+                            let hdr = self.graph.layout().header;
+                            let mut perm: Vec<i32> = (0..active as i32).collect();
+                            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (done as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
+                            for i in (1..perm.len()).rev() {
+                                x ^= x << 13;
+                                x ^= x >> 7;
+                                x ^= x << 17;
+                                perm.swap(i, (x % (i as u64 + 1)) as usize);
                             }
-                            pop.since += count;
-                            if pop.since >= pop.every {
-                                pop.since = 0;
-                                self.population_step(pop, beta, &mut spins)?;
+                            let perm_dev = self.stream.clone_htod(&perm)?;
+                            let mut ib = self.stream.launch_builder(&self.icm_fn);
+                            let salt = (x >> 32) as u32;
+                            let maxsize = (nn / 2) as i32;
+                            ib.arg(&hdr[0]).arg(&self.all_deg).arg(&self.all_ell).arg(&perm_dev).arg(&mut spins).arg(&salt).arg(&maxsize);
+                            let icfg = LaunchConfig {
+                                grid_dim: (u32::try_from(active / 2).unwrap_or(1), 1, 1),
+                                block_dim: (512, 1, 1),
+                                shared_mem_bytes: u32::try_from((nn + 2) * 4).unwrap_or(0),
+                            };
+                            // SAFETY: arguments match quip_cluster_icm.
+                            unsafe { ib.launch(icfg) }?;
+                        }
+                    }
+                    let pa_until: f64 = std::env::var("QC_PA_UNTIL").ok().map_or(1.0, |v| v.parse().unwrap());
+                    if pa_every > 0 && !descent && done % pa_every == 0 && done < total_sweeps && (done as f64) < pa_until * total_sweeps as f64 {
+                        let t_pa = std::time::Instant::now();
+                        let frac: f64 = std::env::var("QC_PA_FRAC").ok().map_or(0.3, |v| v.parse().unwrap());
+                        let nn = self.graph.original_graph().num_nodes();
+                        let hdr = self.graph.layout().header;
+                        let mut out = self.stream.alloc_zeros::<i32>(active)?;
+                        {
+                            let mut eb = self.stream.launch_builder(&self.energy_fn);
+                            eb.arg(&hdr[0]).arg(&self.all_deg).arg(&self.all_ell).arg(&self.h).arg(&spins).arg(&mut out);
+                            let cfg = LaunchConfig { grid_dim: (u32::try_from(active).unwrap_or(blocks), 1, 1), block_dim: (512, 1, 1), shared_mem_bytes: 0 };
+                            // SAFETY: arguments match quip_cluster_energy.
+                            unsafe { eb.launch(cfg) }?;
+                        }
+                        let en = self.stream.clone_dtoh(&out)?;
+                        self.stream.synchronize()?;
+                        if anneals >= 2048 {
+                            DEEP_PROGRESS.with(|p| p.set((done, total_sweeps, en.iter().copied().min().unwrap_or(0) as i64 / 2)));
+                        }
+                        if std::env::var("QC_TRACE").is_ok() {
+                            eprintln!("TRACE {} {}", done, en.iter().copied().min().unwrap_or(0) as f64 * 0.0005);
+                        }
+                        if anneals >= 2048 && std::env::var("QC_RACE").map_or(true, |v| v != "0") {
+                            let at: f64 = std::env::var("QC_RACE_AT").ok().map_or(0.25, |v| v.parse().unwrap());
+                            let keep: f64 = std::env::var("QC_RACE_KEEP").ok().map_or(0.5, |v| v.parse().unwrap());
+                            let first = (at * total_sweeps as f64) as usize;
+                            if done >= first && done < first + pa_every.max(32) {
+                                let best = en.iter().copied().min().unwrap_or(i32::MAX);
+                                let mut w = RACE_WINDOW.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let n = w.len();
+                                let rank = w.iter().filter(|&&e| e < best).count();
+                                w.push_back(best);
+                                while w.len() > 64 {
+                                    w.pop_front();
+                                }
+                                if n >= 16 && (rank as f64) > keep * n as f64 {
+                                    return Err(ClusterDeviceError::Cancelled);
+                                }
                             }
+                        }
+                        let total_n = en.len();
+                        let isl: usize = if isl_after > 0 && active < anneals && !picked {
+                            isl_after.clamp(2, total_n.max(2))
+                        } else {
+                            std::env::var("QC_ISL").ok().map_or(total_n, |v| v.parse().unwrap()).clamp(2, total_n.max(2))
+                        };
+                        let mut map: Vec<i32> = (0..total_n as i32).collect();
+                        let mut changed = false;
+                        for start in (0..total_n).step_by(isl) {
+                            let end = (start + isl).min(total_n);
+                            let mut order: Vec<(i32, usize)> = (start..end).map(|i| (en[i], i)).collect();
+                            order.sort();
+                            let n = order.len();
+                            let losers = ((n as f64) * frac) as usize;
+                            let winners = n - losers;
+                            if winners > 0 && losers > 0 {
+                                for j in 0..losers {
+                                    map[order[n - 1 - j].1] = order[j % winners].1 as i32;
+                                }
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            let map_dev = self.stream.clone_htod(&map)?;
+                            let mut cb = self.stream.launch_builder(&self.resample_fn);
+                            cb.arg(&hdr[0]).arg(&map_dev).arg(&spins).arg(&mut spins_alt);
+                            let cfg = LaunchConfig { grid_dim: (u32::try_from(active).unwrap_or(blocks), 1, 1), block_dim: (512, 1, 1), shared_mem_bytes: 0 };
+                            // SAFETY: arguments match quip_cluster_resample.
+                            unsafe { cb.launch(cfg) }?;
+                            std::mem::swap(&mut spins, &mut spins_alt);
+                        }
+                        let shrink_at: f64 = std::env::var("QC_SHRINK_AT").ok().map_or(0.35, |v| v.parse().unwrap());
+                        let shrink_to: usize = std::env::var("QC_SHRINK_TO").ok().map_or(256, |v| v.parse().unwrap());
+                        if anneals >= 2048 && (done as f64) >= shrink_at * total_sweeps as f64 && active > shrink_to {
+                            // keep the best `shrink_to` rows: copy them to the front, then run only those blocks
+                            let en2 = self.energies(&spins, active)?;
+                            let mut order: Vec<(i32, usize)> = en2.iter().copied().enumerate().map(|(i, e)| (e, i)).collect();
+                            order.sort();
+                            let mut map: Vec<i32> = (0..anneals as i32).collect();
+                            if isl_after > 0 && shrink_to % isl_after == 0 {
+                                // deal the best rows round-robin so every group gets a mix of the survivors
+                                let groups = shrink_to / isl_after;
+                                for k in 0..shrink_to {
+                                    map[(k % groups) * isl_after + k / groups] = order[k].1 as i32;
+                                }
+                            } else {
+                                for j in 0..shrink_to {
+                                    map[j] = order[j].1 as i32;
+                                }
+                            }
+                            let map_dev = self.stream.clone_htod(&map)?;
+                            let mut cb = self.stream.launch_builder(&self.resample_fn);
+                            cb.arg(&hdr[0]).arg(&map_dev).arg(&spins).arg(&mut spins_alt);
+                            let cfgc = LaunchConfig { grid_dim: (u32::try_from(active).unwrap_or(blocks), 1, 1), block_dim: (512, 1, 1), shared_mem_bytes: 0 };
+                            // SAFETY: arguments match quip_cluster_resample.
+                            unsafe { cb.launch(cfgc) }?;
+                            std::mem::swap(&mut spins, &mut spins_alt);
+                            active = shrink_to;
+                        }
+                        prof_add(6, t_pa);
+                        if isl_after > 0 && !picked && active < anneals && active > isl_after && (done as f64) >= pick_at * total_sweeps as f64 {
+                            let en3 = self.energies(&spins, active)?;
+                            let groups = active / isl_after;
+                            let best_g = (0..groups)
+                                .min_by_key(|g| en3[g * isl_after..(g + 1) * isl_after].iter().copied().min().unwrap_or(i32::MAX))
+                                .unwrap_or(0);
+                            let mut map: Vec<i32> = (0..anneals as i32).collect();
+                            for j in 0..isl_after {
+                                map[j] = (best_g * isl_after + j) as i32;
+                            }
+                            let map_dev = self.stream.clone_htod(&map)?;
+                            let mut cb = self.stream.launch_builder(&self.resample_fn);
+                            cb.arg(&hdr[0]).arg(&map_dev).arg(&spins).arg(&mut spins_alt);
+                            let cfgc = LaunchConfig { grid_dim: (u32::try_from(active).unwrap_or(blocks), 1, 1), block_dim: (512, 1, 1), shared_mem_bytes: 0 };
+                            // SAFETY: arguments match quip_cluster_resample.
+                            unsafe { cb.launch(cfgc) }?;
+                            std::mem::swap(&mut spins, &mut spins_alt);
+                            active = isl_after;
+                            picked = true;
                         }
                     }
                     Ok(())
@@ -771,7 +665,34 @@ impl ClusterDevice {
                 self.launch(params, 0, 0, 1, config, &mut spins, &mut rng)?;
             }
         }
-        let states = self.stream.clone_dtoh(&spins)?;
+        prof_add(1, t_loop);
+        let t_post = std::time::Instant::now();
+        // Production jobs return only the best `keep` reads: ranking happens on the GPU, so a screened-out job
+        // no longer downloads, rescoring and ships every read. Test and oracle paths keep every read.
+        let keep: usize = match KEEP_OVERRIDE.with(std::cell::Cell::get) {
+            0 => std::env::var("QC_KEEP").ok().map_or(16, |v| v.parse().unwrap()),
+            k => k,
+        };
+        let nn_all = self.graph.original_graph().num_nodes();
+        let states = if control.is_some() && final_descent && keep > 0 && keep < anneals {
+            let en = self.energies(&spins, anneals)?;
+            let mut order: Vec<(i32, usize)> = en.iter().copied().enumerate().map(|(i, e)| (e, i)).collect();
+            order.sort_unstable();
+            let mut map: Vec<i32> = (0..anneals as i32).collect();
+            for (j, item) in order.iter().take(keep).enumerate() {
+                map[j] = item.1 as i32;
+            }
+            let hdr = self.graph.layout().header;
+            let map_dev = self.stream.clone_htod(&map)?;
+            let mut cb = self.stream.launch_builder(&self.resample_fn);
+            cb.arg(&hdr[0]).arg(&map_dev).arg(&spins).arg(&mut spins_alt);
+            let cfgc = LaunchConfig { grid_dim: (u32::try_from(keep).unwrap_or(1), 1, 1), block_dim: (512, 1, 1), shared_mem_bytes: 0 };
+            // SAFETY: arguments match quip_cluster_resample (only the first `keep` blocks run).
+            unsafe { cb.launch(cfgc) }?;
+            self.stream.clone_dtoh(&spins_alt.slice(0..keep * nn_all))?
+        } else {
+            self.stream.clone_dtoh(&spins)?
+        };
         let rng_state = if final_descent {
             Vec::new()
         } else {
@@ -790,91 +711,30 @@ impl ClusterDevice {
             result.energies.push(self.graph.energy(&original)?);
             result.spins.push(original);
         }
-        if let Some(pop) = pop {
-            tracing::debug!(
-                steps = pop.steps,
-                host_ms = u64::try_from(pop.host.as_millis()).unwrap_or(u64::MAX),
-                "otsuka population steps"
-            );
-            if let Some((state, e)) = pop.best {
-                let low = result.energies.iter().copied().min().unwrap_or(i64::MAX);
-                if e < low {
-                    if let Some(worst) =
-                        (0..result.energies.len()).max_by_key(|&i| result.energies[i])
-                    {
-                        result.energies[worst] = e;
-                        result.spins[worst] = state;
-                    }
-                }
-            }
+        prof_add(2, t_post);
+        if std::env::var("QC_PROF").is_ok() {
+            static LAST: std::sync::Mutex<[u64; 9]> = std::sync::Mutex::new([0; 9]);
+            let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cur: [u64; 9] = std::array::from_fn(|i| PROF_US[i].load(std::sync::atomic::Ordering::Relaxed));
+            let d: Vec<u64> = (0..9).map(|i| cur[i] - last[i]).collect();
+            eprintln!("PROF_RUN init_us={} loop_us={} kernel_wait_us={} pa_host_us={} post_us={}", d[0], d[1], d[7], d[6], d[2]);
+            *last = cur;
         }
         Ok((result, rng_state))
     }
 
-    /// One population step on the host. Downloads the replicas, resamples them in proportion to
-    /// `exp(-(beta - last_beta) (E - E_min))` with systematic resampling (true model energies), takes
-    /// Houdayer cluster swaps between random pairs from beta 3, and uploads the result. This is the
-    /// GPU counterpart of `anneal_population` in quip-solver-cpu's Otsuka sampler.
-    fn population_step(
-        &self,
-        pop: &mut Pop,
-        beta: f32,
-        spins: &mut CudaSlice<i8>,
-    ) -> Result<(), ClusterDeviceError> {
-        let t0 = std::time::Instant::now();
-        let g = self.graph.original_graph();
-        let n = g.num_nodes();
-        let o2d = self.graph.original_to_device();
-        let d2o = self.graph.device_to_original();
-        let dev = self.stream.clone_dtoh(spins)?;
+    /// Twice the energy (milli) of the first `n` anneals, permuted layout.
+    fn energies(&self, spins: &CudaSlice<i8>, n: usize) -> Result<Vec<i32>, ClusterDeviceError> {
+        let hdr = self.graph.layout().header;
+        let mut out = self.stream.alloc_zeros::<i32>(n)?;
+        let mut eb = self.stream.launch_builder(&self.energy_fn);
+        eb.arg(&hdr[0]).arg(&self.all_deg).arg(&self.all_ell).arg(&self.h).arg(spins).arg(&mut out);
+        let cfg = LaunchConfig { grid_dim: (n as u32, 1, 1), block_dim: (512, 1, 1), shared_mem_bytes: 0 };
+        // SAFETY: arguments match quip_cluster_energy.
+        unsafe { eb.launch(cfg) }?;
+        let en = self.stream.clone_dtoh(&out)?;
         self.stream.synchronize()?;
-        let mut states: Vec<Vec<i8>> = dev
-            .chunks_exact(n)
-            .map(|s| o2d.iter().map(|&d| s[d]).collect())
-            .collect();
-        let r = states.len();
-        let mut energy = vec![0i64; r];
-        let per = r.div_ceil(8).max(1);
-        std::thread::scope(|sc| {
-            for (es, ss) in energy.chunks_mut(per).zip(states.chunks(per)) {
-                sc.spawn(move || {
-                    for (e, s) in es.iter_mut().zip(ss) {
-                        *e = g.energy(s);
-                    }
-                });
-            }
-        });
-        let (low_at, low) = energy
-            .iter()
-            .copied()
-            .enumerate()
-            .min_by_key(|&(_, e)| e)
-            .unwrap_or((0, 0));
-        if pop.best.as_ref().is_none_or(|b| low < b.1) {
-            pop.best = Some((states[low_at].clone(), low));
-        }
-        let step = f64::from(beta - pop.last_beta);
-        if step > 0.0 {
-            let picks = systematic_resample(&energy, step, pop.unit());
-            states = picks.iter().map(|&i| states[i].clone()).collect();
-        }
-        if pop.houdayer > 0 && beta >= HOUDAYER_BETA {
-            let adj = std::mem::take(&mut pop.adj);
-            houdayer_rounds(&mut states, &adj, pop.houdayer, &mut || pop.next());
-            pop.adj = adj;
-        }
-        let mut up = vec![0i8; r * n];
-        for (block, state) in up.chunks_exact_mut(n).zip(&states) {
-            for (d, slot) in block.iter_mut().enumerate() {
-                *slot = state[d2o[d]];
-            }
-        }
-        self.stream.memcpy_htod(&up, spins)?;
-        self.stream.synchronize()?;
-        pop.last_beta = beta;
-        pop.steps += 1;
-        pop.host += t0.elapsed();
-        Ok(())
+        Ok(en)
     }
 
     // The flat argument order matches quip_cluster_anneal in kernels/cluster.cu.
@@ -1029,96 +889,6 @@ mod tests {
     use super::*;
     use crate::capacity::DeviceLimits;
     use crate::cluster::{Model, Motifs, Weights};
-
-    #[test]
-    fn beta_settings_accept_ranges_and_stock_and_reject_the_rest() {
-        assert_eq!(parse_beta("stock"), Ok(None));
-        assert_eq!(parse_beta(" 0.5 , 12 "), Ok(Some((0.5, 12.0))));
-        for bad in [
-            "", "1", "1,8,9", "8,1", "0,8", "-1,8", "1,x", "1,inf", "stock,1",
-        ] {
-            assert_eq!(parse_beta(bad), Err(()), "{bad:?}");
-        }
-        assert_eq!(
-            beta_or("test", "8,1", Some(DEFAULT_BETA)),
-            Some(DEFAULT_BETA)
-        );
-        assert_eq!(beta_or("test", "stock", Some(DEFAULT_BETA)), None);
-    }
-
-    #[test]
-    fn systematic_resampling_keeps_the_count_and_favours_low_energies() {
-        // Zero step: every replica is kept once.
-        assert_eq!(
-            systematic_resample(&[5, -3, 0, 7], 0.0, 0.5),
-            vec![0, 1, 2, 3]
-        );
-        // A large step puts every slot on the lowest replica.
-        assert_eq!(
-            systematic_resample(&[5_000, -3_000, 0, 7_000], 50.0, 0.3),
-            vec![1; 4]
-        );
-        // Any offset in [0, 1) gives a full, ordered population.
-        for unit in [0.0, 0.25, 0.999_999] {
-            let picks = systematic_resample(&[0, 1_000, 2_000, 3_000, 0], 1.0, unit);
-            assert_eq!(picks.len(), 5);
-            assert!(picks.windows(2).all(|w| w[0] <= w[1]));
-        }
-        assert!(systematic_resample(&[], 1.0, 0.5).is_empty());
-    }
-
-    fn pair_energy(edges: &[(usize, usize, i64)], s: &[i8]) -> i64 {
-        edges
-            .iter()
-            .map(|&(u, v, j)| j * i64::from(s[u]) * i64::from(s[v]))
-            .sum()
-    }
-
-    #[test]
-    fn houdayer_moves_keep_each_pairs_summed_energy() {
-        let mut rng = 0x2545_f491_4f6c_dd1d_u64;
-        let mut next = move || {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng
-        };
-        let n = 40;
-        let mut edges = Vec::new();
-        for u in 0..n {
-            for v in u + 1..n {
-                if next() % 5 == 0 {
-                    edges.push((u, v, i64::try_from(next() % 2001).unwrap() - 1000));
-                }
-            }
-        }
-        let mut adj = vec![Vec::new(); n];
-        for &(u, v, _) in &edges {
-            adj[u].push(u32::try_from(v).unwrap());
-            adj[v].push(u32::try_from(u).unwrap());
-        }
-        let mut states: Vec<Vec<i8>> = (0..2)
-            .map(|_| {
-                (0..n)
-                    .map(|_| if next() % 2 == 0 { 1 } else { -1 })
-                    .collect()
-            })
-            .collect();
-        for _ in 0..50 {
-            let before = pair_energy(&edges, &states[0]) + pair_energy(&edges, &states[1]);
-            let spins_before: Vec<i32> = (0..n)
-                .map(|u| i32::from(states[0][u]) + i32::from(states[1][u]))
-                .collect();
-            houdayer_rounds(&mut states, &adj, 1, &mut next);
-            let after = pair_energy(&edges, &states[0]) + pair_energy(&edges, &states[1]);
-            assert_eq!(before, after);
-            // A swap moves spins between the pair; it never changes their per-node sum.
-            let spins_after: Vec<i32> = (0..n)
-                .map(|u| i32::from(states[0][u]) + i32::from(states[1][u]))
-                .collect();
-            assert_eq!(spins_before, spins_after);
-        }
-    }
 
     #[test]
     fn cluster_requires_memory_pools() {

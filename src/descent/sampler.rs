@@ -5,8 +5,8 @@
 //! keeps the graph of each job and forwards the plain job to the inner
 //! stream. The post-process thread receives each kernel result, descends
 //! its reads, rescores them exactly, and forwards the result. The GPU keeps
-//! running the next jobs while the host descends. The sampler declines
-//! `ISING_GENERATE` leases, because a lease brings no start states.
+//! running the next jobs while the host descends. Lease salts go to the
+//! inner sampler without descent.
 //!
 //! The descent never fails a job. When it cannot run, or its result fails a
 //! check, the job logs a warning and returns the raw kernel reads. Only a
@@ -323,19 +323,19 @@ fn post_process(
 }
 
 impl<S: Sampler> Sampler for MsaDescentSampler<S> {
-    /// Descent runs after the anneal, so the ladder is the inner sampler's.
-    fn beta_ladder(
-        &self,
-        graph: &IsingGraph,
-        params: &SampleParams,
-    ) -> Option<quip_solver_core::BetaLadder> {
-        self.inner.beta_ladder(graph, params)
+    fn generates_locally() -> bool {
+        S::generates_locally()
     }
 
-    /// Descent needs the start states of a sample job. A lease supplies none,
-    /// so the binary lists only `ISING_SAMPLE` and rejects leases.
-    fn accepts_leases() -> bool {
-        false
+    /// Lease salts run on the inner sampler without descent.
+    fn sample_lease(
+        &self,
+        lease: &quip_solver_core::Lease,
+        topology: &quip_solver_core::TopologyView,
+        params: &SampleParams,
+        sink: &quip_solver_core::LeaseSink,
+    ) -> Result<(), SampleError> {
+        self.inner.sample_lease(lease, topology, params, sink)
     }
 
     fn sample(

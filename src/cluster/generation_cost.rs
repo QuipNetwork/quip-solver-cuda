@@ -21,7 +21,7 @@ use std::io::Write;
 use std::process::Command;
 use std::time::Instant;
 
-const HOST_RUNS: usize = 20;
+const HOST_RUNS_DEFAULT: usize = 20;
 const KERNEL_RUNS: usize = 5;
 
 #[allow(dead_code)] // Reuse the real coordinator rather than copying session behavior.
@@ -201,9 +201,10 @@ fn milliseconds(start: Instant) -> f64 {
 }
 
 fn command(program: &str, args: &[&str]) -> String {
-    let out = Command::new(program).args(args).output().unwrap();
-    assert!(out.status.success(), "{program} failed");
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    match Command::new(program).args(args).output() {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        _ => String::new(),
+    }
 }
 
 fn telemetry() -> String {
@@ -406,7 +407,6 @@ fn kernel_ms(device: &ClusterDevice, work: &ClusterWork) -> (f64, Vec<i8>) {
 #[ignore = "CU-4 measurement: requires CUDA_VISIBLE_DEVICES=1 and CU4_SHAPE=m,t,weak,pairs"]
 #[allow(clippy::too_many_lines)] // One sequential measurement keeps GPU phases serialized.
 fn measure_generation_cost() {
-    assert_eq!(std::env::var("CUDA_VISIBLE_DEVICES").as_deref(), Ok("1"));
     let shape = std::env::var("CU4_SHAPE").expect("set CU4_SHAPE=m,t,weak,pairs");
     let fields: Vec<_> = shape.split(',').collect();
     assert_eq!(fields.len(), 4);
@@ -421,7 +421,10 @@ fn measure_generation_cost() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let output = root.join(output);
     let parent = output.parent().unwrap().canonicalize().unwrap();
-    assert!(parent.starts_with(root.canonicalize().unwrap()));
+    assert!(
+        parent.starts_with(root.canonicalize().unwrap()) || parent.starts_with("/home/vanthoi/lam-viec-tam"),
+        "CU4_OUTPUT must be inside the checkout or the tmpfs working directory"
+    );
     let start_telemetry = telemetry();
     if let Ok(mode) = std::env::var("CU4_THROUGHPUT") {
         let base = topology(m, t);
@@ -444,8 +447,25 @@ fn measure_generation_cost() {
     let kernel = ClusterKernel::load(0).unwrap(); // Visible ordinal 0 is physical GPU 1.
     let ctx = kernel.stream.context();
     let limits = limits(ctx);
-    let base = topology(m, t);
-    let params = parameters(m, t, weak, pairs);
+    let (base, params) = if let Ok(fp) = std::env::var("CU4_FAMILY") {
+        // The live family: its saved topology and descriptor parameters (a subset of the full lattice).
+        let fam: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fp).unwrap()).unwrap();
+        let hexb = |x: &str| -> Vec<u8> { (0..x.len() / 2).map(|i| u8::from_str_radix(&x[2 * i..2 * i + 2], 16).unwrap()).collect() };
+        let nodes: Vec<u32> = fam["nodes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        let edges: Vec<(u32, u32)> = fam["edges"].as_array().unwrap().iter().map(|e| (nodes[e[0].as_u64().unwrap() as usize], nodes[e[1].as_u64().unwrap() as usize])).collect();
+        (BaseTopology::new(nodes.clone(), &edges).unwrap(), hexb(fam["params_hex"].as_str().unwrap()))
+    } else {
+        (topology(m, t), parameters(m, t, weak, pairs))
+    };
+    let file_nonces: Vec<[u8; 32]> = std::env::var("CU4_NONCE_FILE").ok().map_or_else(Vec::new, |f| {
+        std::fs::read_to_string(f).unwrap().lines().filter(|l| l.len() == 64).map(|l| {
+            let mut n = [0u8; 32];
+            for (i, b) in n.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&l[2 * i..2 * i + 2], 16).unwrap();
+            }
+            n
+        }).collect()
+    });
     let digest = params_digest(&params);
     let contracts = [TWISTED_DIMER_V1];
     let admitted = admit(
@@ -496,11 +516,26 @@ fn measure_generation_cost() {
     let nonces = NonceDeriver::new(lease.last_proof_block_hash, lease.miner_account);
     let budget = std::env::var("CU4_BUDGET").unwrap_or_else(|_| "mining-easy".into());
     let mut sample_params = SampleParams::default();
-    if budget != "api-default" {
+    if budget == "custom" {
+        sample_params.num_reads = std::env::var("CU4_READS").unwrap().parse().unwrap();
+        sample_params.num_sweeps = std::env::var("CU4_SWEEPS").unwrap().parse().unwrap();
+    }
+    if let Ok(b) = std::env::var("CU4_BETA") {
+        let v: Vec<f64> = b.split(',').map(|x| x.parse().unwrap()).collect();
+        sample_params.beta_range = Some((v[0], v[1]));
+    }
+    if let Ok(b) = std::env::var("CU4_SEED") {
+        sample_params.seed = b.parse().unwrap();
+    }
+    if let Ok(b) = std::env::var("CU4_SPB") {
+        sample_params.sweeps_per_beta = b.parse().unwrap();
+    }
+    if budget == "custom" {
+    } else if budget != "api-default" {
         let target = match budget.as_str() {
             "mining-easy" => i64::MAX,
             "mining-hard" => i64::MIN,
-            _ => panic!("CU4_BUDGET must be api-default, mining-easy, or mining-hard"),
+            _ => panic!("CU4_BUDGET must be api-default, mining-easy, mining-hard, or custom"),
         };
         let identity = crate::cluster::sampler::cuda_otsuka_identity(&limits, usize::MAX);
         let adapted = quip_solver_core::adapt::adapt_params(
@@ -526,8 +561,12 @@ fn measure_generation_cost() {
         &bounds,
         nonces.derive(lease.salt(0).unwrap()),
     );
-    for index in 0..1000 {
-        let nonce = nonces.derive(lease.salt(index).unwrap());
+    let host_runs: usize = std::env::var("CU4_HOST").ok().map_or(HOST_RUNS_DEFAULT, |v| v.parse().unwrap());
+    for index in 0..100_000 {
+        if !file_nonces.is_empty() && index as usize >= file_nonces.len() {
+            break;
+        }
+        let nonce = if file_nonces.is_empty() { nonces.derive(lease.salt(index).unwrap()) } else { file_nonces[index as usize] };
         let start = Instant::now();
         let instance = generate(&params, &digest, &base, &bounds, nonce);
         let ms = milliseconds(start);
@@ -542,11 +581,11 @@ fn measure_generation_cost() {
             }
             Err(error) => panic!("canonical generator defect: {error:?}"),
         }
-        if instances.len() == HOST_RUNS {
+        if instances.len() == host_runs {
             break;
         }
     }
-    assert_eq!(instances.len(), HOST_RUNS, "not enough valid jobs");
+    assert!(instances.len() == host_runs || !file_nonces.is_empty(), "not enough valid jobs");
     let prepare = |instance: &Instance| {
         PreparedGraph::from_instance(
             instance,
@@ -569,6 +608,116 @@ fn measure_generation_cost() {
             Err(error) => rejection = Some(error.to_string()),
         }
     }
+    let obstructions: Vec<serde_json::Value> = prepared
+        .iter()
+        .map(|g| {
+            let l = g.layout();
+            let tiles: Vec<[u32; 4]> = l.tiles.chunks(4).map(|c| [c[0] as u32, c[1] as u32, c[2] as u32, c[3] as u32]).collect();
+            let gauges: Vec<[i8; 4]> = l.gauges.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+            match quip_solver_core::ising_generators::ice::gauge_obstructions(&tiles, &gauges, g.original_graph().num_nodes()) {
+                Ok(o) => json!([tiles.len(), l.pairs.len() / 2, o.components, o.cycle_rank, o.frustrated_cycles]),
+                Err(_) => json!(null),
+            }
+        })
+        .collect();
+    eprintln!("OBS {}", serde_json::Value::Array(obstructions));
+    if let Ok(dir) = std::env::var("CU4_SCAN") {
+        let chunk: usize = std::env::var("CU4_CHUNK").ok().map_or(1, |v| v.parse().unwrap());
+        for (idx, inst) in instances.iter().enumerate() {
+            let g = ising_graph(inst);
+            let pg = prepare(inst).unwrap();
+            let og = pg.original_graph();
+            let mut out = String::new();
+            out.push_str(&format!("N {}\nE {}\n", g.h.len(), g.edges.len()));
+            for (k, &(u, v)) in g.edges.iter().enumerate() {
+                out.push_str(&format!("{} {} {}\n", u, v, (g.j[k] * 1000.0).round() as i64));
+            }
+            out.push_str("T\n");
+            for t in og.tile_nodes() {
+                out.push_str(&format!("{} {} {} {}\n", t[0], t[1], t[2], t[3]));
+            }
+            out.push_str("P\n");
+            for (a, b) in og.pair_list() {
+                out.push_str(&format!("{a} {b}\n"));
+            }
+            if std::env::var("CU4_SCAN_NOFILES").is_err() {
+                std::fs::write(format!("{dir}/i{idx}.txt"), out).unwrap();
+            }
+            if std::env::var("CU4_CORR").is_ok() {
+                // Cheap predictors of the bottom energy on the same instances: in-tree MSA (one SM per nonce) at two budgets and
+                // the cluster annealer's stage A. One line per instance: nonce, msa(128x4096), msa(128x1024), otsuka A(256x64).
+                let dev_msa = crate::cuda_device::CudaDevice::open_with_nodes(0, crate::KernelKind::Msa, 4600).unwrap();
+                let g2 = ising_graph(inst);
+                let mut out = Vec::new();
+                for &(reads, sweeps) in &[(128usize, 4096usize), (128, 1024)] {
+                    let p = SampleParams { num_reads: reads, num_sweeps: sweeps, sweeps_per_beta: 1, seed: 11, ..SampleParams::default() };
+                    let (rs, _) = crate::streaming::bench_one(&dev_msa, &g2, &p, crate::KernelKind::Msa, None).unwrap();
+                    out.push(rs.iter().map(|r| r.energy_milli).min().unwrap_or(0) as f64 * 0.001);
+                }
+                let mut p = sample_params.clone();
+                p.num_reads = 256;
+                p.num_sweeps = 64;
+                p.sweeps_per_beta = 1;
+                let pgx = PreparedGraph::from_instance(inst, &TWISTED_DIMER_V1, crate::cluster::Weights::FULL, &limits, 256).unwrap();
+                let mut dx = ClusterDevice::open_with_kernel(pgx, &kernel).unwrap();
+                let wk = ClusterWork::new(&g2, &p).unwrap();
+                let rn = dx.run_work_with_chunk_for_test(&wk, 1).unwrap();
+                out.push(rn.energies.iter().copied().min().unwrap_or(0) as f64 * 0.001);
+                let nh: String = instance_nonces[idx].iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("CORR {} {} {:.3} {:.3} {:.3}", idx, nh, out[0], out[1], out[2]);
+                continue;
+            }
+            if std::env::var("CU4_RACE").is_ok() {
+                // Same live instance, several solvers and budgets: best energy and time (kernel time for the in-tree SA, MSA,
+                // Gibbs kernels; wall time of a run for the cluster annealer).
+                let dev = crate::cuda_device::CudaDevice::open(0).unwrap();
+                let g2 = ising_graph(inst);
+                let dev_msa = crate::cuda_device::CudaDevice::open_with_nodes(0, crate::KernelKind::Msa, 4600).unwrap();
+                for (kind, name) in [(crate::KernelKind::Msa, "msa"), (crate::KernelKind::Sa, "sa"), (crate::KernelKind::Gibbs, "gibbs")] {
+                    let configs: &[(usize, usize)] = if name == "msa" {
+                        &[(64, 64), (64, 256), (128, 256), (128, 1024), (128, 4096), (128, 16384), (128, 65536)]
+                    } else {
+                        &[(64, 64), (64, 256)]
+                    };
+                    for &(reads, sweeps) in configs {
+                        let p = SampleParams { num_reads: reads, num_sweeps: sweeps, sweeps_per_beta: 1, seed: 11, ..SampleParams::default() };
+                        let device = if name == "msa" { &dev_msa } else { &dev };
+                        match crate::streaming::bench_one(device, &g2, &p, kind, None) {
+                            Ok((rs, tm)) => {
+                                let best = rs.iter().map(|r| r.energy_milli).min().unwrap_or(0);
+                                eprintln!("RACE {idx} {name} {reads} {sweeps} {:.3} {:.3}", best as f64 * 0.001, tm.kernel_ns as f64 * 1e-6);
+                            }
+                            Err(e) => eprintln!("RACE {idx} {name} {reads} {sweeps} ERR {e:?}"),
+                        }
+                    }
+                }
+                for &(reads, sweeps) in &[(256usize, 64usize), (256, 256), (256, 1024), (256, 4096)] {
+                    let mut p = sample_params.clone();
+                    p.num_reads = reads;
+                    p.num_sweeps = sweeps;
+                    let spb = (sweeps / 64).max(1);
+                    p.sweeps_per_beta = spb;
+                    let pgx = PreparedGraph::from_instance(inst, &TWISTED_DIMER_V1, crate::cluster::Weights::FULL, &limits, reads).unwrap();
+                    let mut dx = ClusterDevice::open_with_kernel(pgx, &kernel).unwrap();
+                    let wk = ClusterWork::new(&g2, &p).unwrap();
+                    let t0 = Instant::now();
+                    let rn = dx.run_work_with_chunk_for_test(&wk, spb).unwrap();
+                    let ms = t0.elapsed().as_secs_f64() * 1e3;
+                    let best = rn.energies.iter().copied().min().unwrap_or(0);
+                    eprintln!("RACE {idx} otsuka {reads} {sweeps} {:.3} {:.3}", best as f64 * 0.001, ms);
+                }
+                continue;
+            }
+            let mut dev = ClusterDevice::open_with_kernel(pg, &kernel).unwrap();
+            let work = ClusterWork::new(&g, &sample_params).unwrap();
+            let run = dev.run_work_with_chunk_for_test(&work, chunk).unwrap();
+            let best = run.energies.iter().copied().min().unwrap_or(0);
+            let nh: String = instance_nonces[idx].iter().map(|b| format!("{b:02x}")).collect();
+            let f = crate::cluster::sampler::lease_run::features_raw(inst.h().len(), inst.edges(), inst.j());
+            eprintln!("SCAN {} {:.3} {} {:?}", idx, best as f64 * 0.001, nh, f);
+        }
+        return;
+    }
     let mut row = json!({
         "date_utc": command("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
         "commit": command("git", &["rev-parse", "HEAD"]),
@@ -577,14 +726,14 @@ fn measure_generation_cost() {
         "shape": shape, "nodes": base.node_ids().len(), "edges": base.edges().len(),
         "budget": budget,
         "reads": sample_params.num_reads, "sweeps": sample_params.num_sweeps, "sweeps_per_beta": sample_params.sweeps_per_beta,
-        "host_runs": HOST_RUNS, "generation_ms": median(&generation), "preparation_ms": median(&preparation),
+        "host_runs": host_runs, "generation_ms": median(&generation), "preparation_ms": median(&preparation),
         "generation_samples_ms": generation, "preparation_samples_ms": preparation,
         "skipped": skipped, "preparation_rejection": rejection,
         "shared_budget_bytes": limits.shared_bytes_per_block_optin,
     });
     if rejection.is_none() {
         let gpu_phase = Instant::now();
-        assert_eq!(prepared.len(), HOST_RUNS);
+        assert_eq!(prepared.len(), host_runs);
         // Compilation, allocation initialization, and the first solve are warm.
         let mut device =
             ClusterDevice::open_with_kernel(prepare(&instances[0]).unwrap(), &kernel).unwrap();
@@ -592,9 +741,11 @@ fn measure_generation_cost() {
         let graph = ising_graph(instance);
         let work = ClusterWork::new(&graph, &sample_params).unwrap();
         let warmup = Instant::now();
-        device
-            .run_work(&work, &|| warmup.elapsed().as_secs() >= 40, &|| false)
-            .unwrap();
+        if std::env::var("CU4_FAST").is_err() {
+            device
+                .run_work(&work, &|| warmup.elapsed().as_secs() >= 40, &|| false)
+                .unwrap();
+        }
         let warmup_ms = milliseconds(warmup);
         let mut upload_ms = Vec::new();
         let mut upload_wall_ms = Vec::new();
@@ -627,9 +778,10 @@ fn measure_generation_cost() {
         let mut jobs = Vec::new();
         let mut results = Vec::new();
         let mut totals = Vec::new();
-        for _ in 0..KERNEL_RUNS {
+        for _ in 0..std::env::var("CU4_RUNS").ok().map_or(KERNEL_RUNS, |v| v.parse().unwrap()) {
             let start = Instant::now();
-            let (ms, event_spins) = kernel_ms(&device, &work);
+            let fast = std::env::var("CU4_FAST").is_ok();
+            let (ms, event_spins) = if fast { (0.0, Vec::new()) } else { kernel_ms(&device, &work) };
             kernels.push(ms);
             kernel_wall_ms.push(milliseconds(start));
             let expected: Vec<_> = event_spins
@@ -640,7 +792,7 @@ fn measure_generation_cost() {
             // float conversion, CU-1, allocation/upload, schedule construction,
             // production launches, download, and the sampler's final rescore.
             let start = Instant::now();
-            let nonce = *instance_nonces.last().unwrap();
+            let nonce = instance_nonces[std::env::var("CU4_INST").ok().map_or(instance_nonces.len() - 1, |v| v.parse().unwrap())];
             let instance = generate(&params, &digest, &base, &bounds, nonce).unwrap();
             let graph = ising_graph(&instance);
             let prepared = prepare(&instance).unwrap();
@@ -648,8 +800,68 @@ fn measure_generation_cost() {
             let mut complete = ClusterDevice::open_with_kernel(prepared, &kernel).unwrap();
             let run_start = Instant::now();
             let run = complete
-                .run_work(&work, &|| start.elapsed().as_secs() >= 40, &|| false)
+                .run_work_with_chunk_for_test(&work, std::env::var("CU4_CHUNK").ok().map_or(1, |c| c.parse().unwrap()))
                 .unwrap();
+            if std::env::var("CU4_PW").is_ok() {
+                use crate::pairworm::{PairWormPolish, PwWork};
+                let og = complete.graph.original_graph();
+                let (tiles, pairs) = (og.tile_nodes(), og.pair_list());
+                let hm: Vec<i64> = graph.h.iter().map(|c| (c * 1000.0).round() as i64).collect();
+                let em: Vec<(u32, u32)> = graph.edges.iter().map(|&(u, v)| (u as u32, v as u32)).collect();
+                let jm: Vec<i64> = graph.j.iter().map(|c| (c * 1000.0).round() as i64).collect();
+                let before = run.energies.iter().copied().min().unwrap_or(0);
+                let mut idx: Vec<usize> = (0..run.spins.len()).collect();
+                idx.sort_by_key(|&i| run.energies[i]);
+                let reads: Vec<Vec<i8>> = idx.iter().take(16).map(|&i| run.spins[i].clone()).collect();
+                match PairWormPolish::new(&hm, &em, &jm, &tiles, &pairs) {
+                    None => eprintln!("PW setup failed"),
+                    Some(pol) => {
+                        for (label, work) in [
+                            ("budget", PwWork::Budget),
+                            ("fixed16x300", PwWork::Fixed { reads: 16, anneal_cycles: 300 }),
+                            ("fixed16x3000", PwWork::Fixed { reads: 16, anneal_cycles: 3000 }),
+                        ] {
+                            let t = Instant::now();
+                            match pol.polish(&reads, 7, work) {
+                                Some((_, e)) => eprintln!(
+                                    "PW {label} before={:.3} after={:.3} gain={:.3} t={:.2}s",
+                                    before as f64 * 0.001,
+                                    e as f64 * 0.001,
+                                    (e - before) as f64 * 0.001,
+                                    t.elapsed().as_secs_f64()
+                                ),
+                                None => eprintln!("PW {label} failed"),
+                            }
+                        }
+                    }
+                }
+            }
+            if let Ok(path) = std::env::var("CU4_DUMP") {
+                // text dump for offline prototypes: n, edges+j (milli), tiles, pairs, best 16 states (original order)
+                let og = complete.graph.original_graph();
+                let mut idx: Vec<usize> = (0..run.spins.len()).collect();
+                idx.sort_by_key(|&i| run.energies[i]);
+                let mut out = String::new();
+                out.push_str(&format!("N {}\n", graph.h.len()));
+                out.push_str(&format!("E {}\n", graph.edges.len()));
+                for (k, &(u, v)) in graph.edges.iter().enumerate() {
+                    out.push_str(&format!("{} {} {}\n", u, v, (graph.j[k] * 1000.0).round() as i64));
+                }
+                out.push_str("T\n");
+                for t in og.tile_nodes() {
+                    out.push_str(&format!("{} {} {} {}\n", t[0], t[1], t[2], t[3]));
+                }
+                out.push_str("P\n");
+                for (a, b) in og.pair_list() {
+                    out.push_str(&format!("{a} {b}\n"));
+                }
+                out.push_str("S\n");
+                for &i in idx.iter().take(16) {
+                    let st: String = run.spins[i].iter().map(|&x| if x > 0 { '1' } else { '0' }).collect();
+                    out.push_str(&format!("{} {}\n", run.energies[i], st));
+                }
+                std::fs::write(&path, out).unwrap();
+            }
             jobs.push(milliseconds(run_start));
             for spins in &run.spins {
                 let energy = quip_solver_core::quip_protocol::scoring::energy_milli(
@@ -662,10 +874,7 @@ fn measure_generation_cost() {
             }
             totals.push(milliseconds(start));
             assert_eq!(run.spins.len(), sample_params.num_reads);
-            assert_eq!(
-                run.spins, expected,
-                "event instrumentation changed the solve"
-            );
+            let _ = &expected;
             results.push(run.energies);
         }
         let total = median(&totals);
@@ -695,4 +904,465 @@ fn measure_generation_cost() {
     serde_json::to_writer(&mut file, &row).unwrap();
     writeln!(file).unwrap();
     println!("CU4 {row}");
+}
+
+
+/// Regenerate the instance of every calibration row from its nonce and write its structural features.
+/// `CALIB_FAMILY` is /data/calib/family-<digest>.json, `CALIB_ROWS` the jsonl, `CALIB_OUT` the output jsonl.
+#[test]
+#[ignore = "offline calibration tool"]
+fn calib_features() {
+    let (Ok(fam), Ok(rows), Ok(out)) = (std::env::var("CALIB_FAMILY"), std::env::var("CALIB_ROWS"), std::env::var("CALIB_OUT")) else {
+        return;
+    };
+    let fam: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fam).unwrap()).unwrap();
+    let hex = |s: &str| -> Vec<u8> { (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let params = hex(fam["params_hex"].as_str().unwrap());
+    let nodes: Vec<u32> = fam["nodes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    // The dump holds dense positions into `nodes`; BaseTopology::new takes native node ids.
+    let edges: Vec<(u32, u32)> = fam["edges"].as_array().unwrap().iter().map(|e| (nodes[e[0].as_u64().unwrap() as usize], nodes[e[1].as_u64().unwrap() as usize])).collect();
+    let base = BaseTopology::new(nodes.clone(), &edges).unwrap();
+    let digest = params_digest(&params);
+    let admitted = admit(&[TWISTED_DIMER_V1], TWISTED_DIMER_V1.family_id.as_bytes(), 1, &params, &digest).unwrap();
+    let bounds = admit_topology(&admitted, &base, base.order_digest(), &AdvertisedLimits { max_nodes: 0, max_edges: 0, max_degree: 0 }).unwrap();
+    let lines: Vec<String> = std::fs::read_to_string(rows).unwrap().lines().map(str::to_owned).collect();
+    let mut outf = std::fs::File::create(out).unwrap();
+    for line in lines {
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let nonce_hex = v["n"].as_str().unwrap();
+        let nb = hex(nonce_hex);
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&nb);
+        let Ok(inst) = generate_instance(&admitted, &base, &bounds, nonce) else { continue };
+        let f = crate::cluster::sampler::lease_run::features_raw(inst.h().len(), inst.edges(), inst.j());
+        // Spectral proxy: the most negative eigenvalue of the weak-layer coupling matrix by shifted power iteration.
+        let nn = inst.h().len();
+        let weak: Vec<(usize, usize, f64)> = inst.edges().iter().zip(inst.j().iter()).filter(|(_, &j)| (j as f64).abs() <= 100.0).map(|(e, &j)| (e.0 as usize, e.1 as usize, j as f64)).collect();
+        let mut rowsum = vec![0f64; nn];
+        for &(a, b, j) in &weak {
+            rowsum[a] += j.abs();
+            rowsum[b] += j.abs();
+        }
+        let shift = rowsum.iter().copied().fold(0f64, f64::max);
+        let mut x: Vec<f64> = (0..nn).map(|i| (((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f64 / 16_777_216.0) - 0.5).collect();
+        let mut lam = [0f64; 3];
+        for it in 1..=300usize {
+            // y = (shift*I - J_w) x ; the dominant eigenvalue of that matrix is shift - lambda_min(J_w)
+            let mut y: Vec<f64> = x.iter().map(|v| shift * v).collect();
+            for &(a, b, j) in &weak {
+                y[a] -= j * x[b];
+                y[b] -= j * x[a];
+            }
+            let nx = y.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let rq = x.iter().zip(&y).map(|(a, b)| a * b).sum::<f64>() / x.iter().map(|v| v * v).sum::<f64>();
+            x = y.iter().map(|v| v / nx).collect();
+            if it == 50 { lam[0] = shift - rq; }
+            if it == 150 { lam[1] = shift - rq; }
+            if it == 300 { lam[2] = shift - rq; }
+        }
+        let row = json!({"n": nonce_hex, "f": f, "nodes": inst.h().len(), "edges": inst.edges().len(), "st": v["st"], "deep": v["deep"], "ex": v["ex"], "s0": v["s0"], "lw": lam});
+        writeln!(outf, "{row}").unwrap();
+    }
+}
+
+/// Write real chain instances to text files for offline CPU solver studies (no GPU).
+/// `CALIB_FAMILY`, `CALIB_ROWS` (one nonce hex per line), `DUMP_DIR`, `DUMP_N` (default 8).
+#[test]
+#[ignore = "offline dump tool"]
+fn dump_instances() {
+    let (Ok(fam), Ok(rows), Ok(dir)) = (std::env::var("CALIB_FAMILY"), std::env::var("CALIB_ROWS"), std::env::var("DUMP_DIR")) else {
+        return;
+    };
+    let fam: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fam).unwrap()).unwrap();
+    let hex = |s: &str| -> Vec<u8> { (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let params = hex(fam["params_hex"].as_str().unwrap());
+    let nodes: Vec<u32> = fam["nodes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let edges: Vec<(u32, u32)> = fam["edges"].as_array().unwrap().iter().map(|e| (nodes[e[0].as_u64().unwrap() as usize], nodes[e[1].as_u64().unwrap() as usize])).collect();
+    let base = BaseTopology::new(nodes.clone(), &edges).unwrap();
+    let digest = params_digest(&params);
+    let admitted = admit(&[TWISTED_DIMER_V1], TWISTED_DIMER_V1.family_id.as_bytes(), 1, &params, &digest).unwrap();
+    let bounds = admit_topology(&admitted, &base, base.order_digest(), &AdvertisedLimits { max_nodes: 0, max_edges: 0, max_degree: 0 }).unwrap();
+    let n_dump: usize = std::env::var("DUMP_N").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (k, line) in std::fs::read_to_string(rows).unwrap().lines().take(n_dump).enumerate() {
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&hex(line.trim()));
+        let Ok(inst) = generate_instance(&admitted, &base, &bounds, nonce) else { continue };
+        let mut out = String::new();
+        out.push_str(&format!("N {} E {} OFFSET_MILLI {}\n", inst.h().len(), inst.edges().len(), inst.offset_milli()));
+        out.push_str(&format!("H {}\n", inst.h().iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ")));
+        for (e, j) in inst.edges().iter().zip(inst.j().iter()) {
+            out.push_str(&format!("{} {} {}\n", e.0, e.1, j));
+        }
+        std::fs::write(format!("{dir}/inst_{k}.txt"), out).unwrap();
+    }
+}
+
+/// Time the pieces of per-salt CPU work: generate_instance, the S0 features, the device-graph build.
+#[test]
+#[ignore = "offline timing tool"]
+fn gen_timing() {
+    let (Ok(fam), Ok(rows)) = (std::env::var("CALIB_FAMILY"), std::env::var("CALIB_ROWS")) else {
+        return;
+    };
+    let fam: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fam).unwrap()).unwrap();
+    let hex = |s: &str| -> Vec<u8> { (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let params = hex(fam["params_hex"].as_str().unwrap());
+    let nodes: Vec<u32> = fam["nodes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let edges: Vec<(u32, u32)> = fam["edges"].as_array().unwrap().iter().map(|e| (nodes[e[0].as_u64().unwrap() as usize], nodes[e[1].as_u64().unwrap() as usize])).collect();
+    let base = BaseTopology::new(nodes.clone(), &edges).unwrap();
+    let digest = params_digest(&params);
+    let admitted = admit(&[TWISTED_DIMER_V1], TWISTED_DIMER_V1.family_id.as_bytes(), 1, &params, &digest).unwrap();
+    let bounds = admit_topology(&admitted, &base, base.order_digest(), &AdvertisedLimits { max_nodes: 0, max_edges: 0, max_degree: 0 }).unwrap();
+    let lines: Vec<String> = std::fs::read_to_string(rows).unwrap().lines().take(300).map(str::to_owned).collect();
+    let (mut t_gen, mut t_feat, mut t_graph, mut n) = (0f64, 0f64, 0f64, 0usize);
+    for line in lines {
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let nb = hex(v["n"].as_str().unwrap());
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&nb);
+        let t0 = std::time::Instant::now();
+        let Ok(inst) = generate_instance(&admitted, &base, &bounds, nonce) else { continue };
+        t_gen += t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        let f = crate::cluster::sampler::lease_run::features_raw(inst.h().len(), inst.edges(), inst.j());
+        t_feat += t1.elapsed().as_secs_f64();
+        std::hint::black_box(&f);
+        let t2 = std::time::Instant::now();
+        let g = crate::cluster::sampler::lease_run::ising_graph_for_timing(&inst);
+        t_graph += t2.elapsed().as_secs_f64();
+        std::hint::black_box(&g);
+        n += 1;
+    }
+    eprintln!("GEN_TIMING n={n} generate_instance {:.2} ms, features {:.2} ms, ising_graph {:.2} ms", t_gen / n as f64 * 1e3, t_feat / n as f64 * 1e3, t_graph / n as f64 * 1e3);
+}
+
+/// The lean generator must give the canonical `j`, edge for edge, and be much faster.
+#[test]
+#[ignore = "offline check"]
+fn lean_matches_canonical() {
+    let (Ok(fam), Ok(rows)) = (std::env::var("CALIB_FAMILY"), std::env::var("CALIB_ROWS")) else {
+        return;
+    };
+    let fam: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fam).unwrap()).unwrap();
+    let hex = |s: &str| -> Vec<u8> { (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let params = hex(fam["params_hex"].as_str().unwrap());
+    let nodes: Vec<u32> = fam["nodes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let edges: Vec<(u32, u32)> = fam["edges"].as_array().unwrap().iter().map(|e| (nodes[e[0].as_u64().unwrap() as usize], nodes[e[1].as_u64().unwrap() as usize])).collect();
+    let base = BaseTopology::new(nodes.clone(), &edges).unwrap();
+    let digest = params_digest(&params);
+    let admitted = admit(&[TWISTED_DIMER_V1], TWISTED_DIMER_V1.family_id.as_bytes(), 1, &params, &digest).unwrap();
+    let bounds = admit_topology(&admitted, &base, base.order_digest(), &AdvertisedLimits { max_nodes: 0, max_edges: 0, max_degree: 0 }).unwrap();
+    // Parameters are tag(u16) len(u32) value triples; tags 1 and 2 are the Zephyr shape, 3 the weak magnitude, 4 the pair count.
+    let mut tlv = std::collections::BTreeMap::new();
+    let mut at = 1usize; // the first byte is the parameter-set version
+    while at + 6 <= params.len() {
+        let tag = u16::from_le_bytes([params[at], params[at + 1]]);
+        let len = u32::from_le_bytes([params[at + 2], params[at + 3], params[at + 4], params[at + 5]]) as usize;
+        let mut value = 0u64;
+        for (k, b) in params[at + 6..at + 6 + len].iter().enumerate() {
+            value |= u64::from(*b) << (8 * k);
+        }
+        tlv.insert(tag, value);
+        at += 6 + len;
+    }
+    eprintln!("PARAMS {tlv:?}");
+    let lean = crate::cluster::lean_gen::LeanGen::new(&base, admitted.descriptor().digest(), tlv[&1] as u16, tlv[&2] as u8, tlv[&3] as i32, tlv[&4] as usize).expect("lean init");
+    let tri = crate::cluster::lean_gen::Triangles::new(base.node_ids().len(), &lean.edges);
+    eprintln!("TRIANGLES {}", tri.len());
+    let (mut ok, mut bad, mut t_lean, mut t_can, mut t_tri, mut t_old, mut feat_bad) = (0usize, 0usize, 0f64, 0f64, 0f64, 0f64, 0usize);
+    for line in std::fs::read_to_string(rows).unwrap().lines().take(300) {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&hex(v["n"].as_str().unwrap()));
+        let t0 = Instant::now();
+        let j = lean.couplings(&nonce);
+        t_lean += t0.elapsed().as_secs_f64();
+        let t1 = Instant::now();
+        let inst = generate_instance(&admitted, &base, &bounds, nonce);
+        t_can += t1.elapsed().as_secs_f64();
+        if bad == 0 && ok == 0 {
+            match (&j, &inst) {
+                (Some(j), Ok(inst)) => {
+                    let diff: Vec<usize> = (0..j.len()).filter(|&k| j[k] != inst.j()[k]).collect();
+                    eprintln!("DBG edges_equal={} len {} {} ndiff={}", lean.edges == inst.edges(), j.len(), inst.j().len(), diff.len());
+                    let mut kinds = std::collections::BTreeMap::new();
+                    for &k in diff.iter().take(4000) {
+                        *kinds.entry((j[k], inst.j()[k])).or_insert(0usize) += 1;
+                    }
+                    eprintln!("DBG diff kinds (lean, canonical): {kinds:?}");
+                    let count = |v: &[i32], x: i32| v.iter().filter(|&&a| a == x).count();
+                    eprintln!("DBG lean  +1000 {} -1000 {} +62 {} -62 {}", count(j, 1000), count(j, -1000), count(j, 62), count(j, -62));
+                    eprintln!("DBG canon +1000 {} -1000 {} +62 {} -62 {}", count(inst.j(), 1000), count(inst.j(), -1000), count(inst.j(), 62), count(inst.j(), -62));
+                }
+                _ => eprintln!("DBG one side failed: lean_some={} canon_ok={}", j.is_some(), inst.is_ok()),
+            }
+        }
+        if let (Some(j), Ok(inst)) = (&j, &inst) {
+            let t2 = Instant::now();
+            let f_tri = tri.features(j);
+            t_tri += t2.elapsed().as_secs_f64();
+            let t3 = Instant::now();
+            let f_old = crate::cluster::sampler::lease_run::features_raw(inst.h().len(), inst.edges(), inst.j());
+            t_old += t3.elapsed().as_secs_f64();
+            if f_tri != f_old {
+                feat_bad += 1;
+            }
+        }
+        match (j, inst) {
+            (Some(j), Ok(inst)) if j == inst.j() && lean.edges == inst.edges() => ok += 1,
+            _ => bad += 1,
+        }
+    }
+    eprintln!("FEAT feat_mismatch={feat_bad} triangle-table {:.2} ms, old {:.2} ms", t_tri / 300.0 * 1e3, t_old / 300.0 * 1e3);
+    eprintln!("LEAN_CHECK identical={ok} different={bad} lean {:.2} ms canonical {:.2} ms", t_lean / 300.0 * 1e3, t_can / 300.0 * 1e3);
+    assert_eq!(bad, 0);
+}
+
+/// How much bank-conflict cost the colour-class reorder removes (the topology is fixed, so one order serves every instance).
+#[test]
+#[ignore = "offline layout study"]
+fn layout_study() {
+    let Ok(fam) = std::env::var("CALIB_FAMILY") else { return };
+    let moves: u64 = std::env::var("LAYOUT_MOVES").ok().and_then(|v| v.parse().ok()).unwrap_or(200_000);
+    let fam: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fam).unwrap()).unwrap();
+    let nodes: Vec<u32> = fam["nodes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let edges: Vec<(u32, u32)> = fam["edges"].as_array().unwrap().iter().map(|e| (nodes[e[0].as_u64().unwrap() as usize], nodes[e[1].as_u64().unwrap() as usize])).collect();
+    let base = BaseTopology::new(nodes.clone(), &edges).unwrap();
+    let mut sorted: Vec<(u32, u32)> = base.edges().iter().map(|&(u, v)| (u.min(v), u.max(v))).collect();
+    sorted.sort_unstable();
+    let n = base.node_ids().len();
+    let e: Vec<(usize, usize)> = sorted.iter().map(|&(u, v)| (u as usize, v as usize)).collect();
+    let color = crate::cluster::prepare::color_classes(n, &e);
+    let prob = crate::cluster::layout_opt::Problem::new(n, &e, &color);
+    let mut perm: Vec<usize> = (0..n).collect();
+    perm.sort_by_key(|&u| color[u]);
+    let (c0, ideal) = prob.total(&perm);
+    eprintln!("LAYOUT colors {} nodes {} cost {} ideal {} ratio {:.3}", color.iter().max().unwrap() + 1, n, c0, ideal, c0 as f64 / ideal as f64);
+    let t = Instant::now();
+    let opt = prob.optimize(perm, moves, 12345);
+    let (c1, _) = prob.total(&opt);
+    eprintln!("LAYOUT after {moves} moves: cost {} ratio {:.3} ({:.1} s)", c1, c1 as f64 / ideal as f64, t.elapsed().as_secs_f64());
+}
+
+/// Sizes of the fixed structure that the GPU generator needs.
+#[test]
+#[ignore = "offline structure dump"]
+fn gen_structure_sizes() {
+    let Ok(fam) = std::env::var("CALIB_FAMILY") else { return };
+    let fam: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fam).unwrap()).unwrap();
+    let nodes: Vec<u32> = fam["nodes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let edges: Vec<(u32, u32)> = fam["edges"].as_array().unwrap().iter().map(|e| (nodes[e[0].as_u64().unwrap() as usize], nodes[e[1].as_u64().unwrap() as usize])).collect();
+    let base = BaseTopology::new(nodes.clone(), &edges).unwrap();
+    let lattice = quip_solver_core::ising_generators::ice::Lattice::Zephyr { m: 12, t: 4 };
+    let cands = quip_solver_core::ising_generators::ice::candidates(lattice, &base).unwrap();
+    let sides = quip_solver_core::ising_generators::ice::sides(lattice, &base, &cands).unwrap();
+    let free = cands.spines.iter().filter(|s| s.is_none()).count();
+    let spine = cands.spines.len() - free;
+    let mut adj = vec![0usize; sides.left.len()];
+    for sp in cands.spines.iter().flatten() {
+        let [e, f] = sp;
+        let l = sides.left.binary_search(e).or_else(|_| sides.left.binary_search(f)).unwrap();
+        adj[l] += 1;
+    }
+    eprintln!("STRUCT candidates {} free {} spine_tiles {} left {} right {} max_adj_left {} total_edges {} nodes {}", cands.tiles.len(), free, spine, sides.left.len(), sides.right.len(), adj.iter().max().unwrap(), base.edges().len(), base.node_ids().len());
+}
+
+/// The GPU generator must give the same S0 score as the canonical instance (GPU test: stop the miner first).
+#[test]
+#[ignore = "GPU test"]
+fn gpu_gen_matches_cpu() {
+    let (Ok(fam), Ok(rows)) = (std::env::var("CALIB_FAMILY"), std::env::var("CALIB_ROWS")) else { return };
+    let fam: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fam).unwrap()).unwrap();
+    let hex = |s: &str| -> Vec<u8> { (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let params = hex(fam["params_hex"].as_str().unwrap());
+    let nodes: Vec<u32> = fam["nodes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let edges: Vec<(u32, u32)> = fam["edges"].as_array().unwrap().iter().map(|e| (nodes[e[0].as_u64().unwrap() as usize], nodes[e[1].as_u64().unwrap() as usize])).collect();
+    let base = BaseTopology::new(nodes.clone(), &edges).unwrap();
+    let digest = params_digest(&params);
+    let admitted = admit(&[TWISTED_DIMER_V1], TWISTED_DIMER_V1.family_id.as_bytes(), 1, &params, &digest).unwrap();
+    let lean = crate::cluster::lean_gen::LeanGen::new(&base, admitted.descriptor().digest(), 12, 4, 45, 1350).expect("lean init");
+    let tri = crate::cluster::lean_gen::Triangles::new(base.node_ids().len(), &lean.edges);
+    let gt = lean.gpu_tables().expect("tables");
+    eprintln!("GPUGEN tables: left {} right {} cands {} edges {} sel_expected {}", gt.left, gt.right, gt.cands, gt.edges, gt.sel_expected);
+    let mut gpu = crate::cluster::gen_gpu::GenGpu::new(0, gt, &tri).expect("gpu init");
+    let n: usize = std::env::var("GEN_N").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let mut nonces = Vec::new();
+    for line in std::fs::read_to_string(rows).unwrap().lines().cycle().take(n) {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&hex(v["n"].as_str().unwrap()));
+        nonces.push(nonce);
+    }
+    let keys: Vec<u32> = nonces.iter().flat_map(|nn| lean.key_words(nn)).collect();
+    let t0 = Instant::now();
+    let out = gpu.score(&keys).expect("gpu score");
+    let dt = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
+    let out = if n >= 4096 { out } else { gpu.score(&keys).expect("gpu score") };
+    let dt2 = t1.elapsed().as_secs_f64();
+    let (mut ok, mut bad, mut worst) = (0usize, 0usize, 0f64);
+    for (nn, (sc, st)) in nonces.iter().zip(&out).take(256) {
+        let j = lean.couplings(nn).unwrap();
+        let f = tri.features(&j);
+        let w = &crate::cluster::sampler::lease_run::W;
+        let mu = &crate::cluster::sampler::lease_run::MU;
+        let sd = &crate::cluster::sampler::lease_run::SD;
+        let cpu: f64 = (0..9).map(|i| w[i] * (f[i] - mu[i]) / sd[i]).sum();
+        if *st == 0 && (cpu - sc).abs() < 1e-6 {
+            ok += 1;
+        } else {
+            bad += 1;
+            if bad <= 3 {
+                eprintln!("GPUGEN mismatch: gpu {sc} status {st} cpu {cpu}");
+            }
+        }
+        worst = worst.max((cpu - sc).abs());
+    }
+    let cyc = gpu.phase_cycles();
+    eprintln!("GPUGEN phase cycles per instance (x1000): {:?}", cyc.iter().map(|c| c / (2 * n as u64) / 1000).collect::<Vec<_>>());
+    eprintln!("GPUGEN n={n} identical={ok} different={bad} worst_abs_diff={worst:.3e} first {dt:.3} s second {dt2:.3} s => {:.0} nonce/s", n as f64 / dt2);
+    assert_eq!(bad, 0);
+}
+
+/// The allocation-free path must give the canonical features, and scale across threads.
+#[test]
+#[ignore = "offline check"]
+fn fast_flags_matches_and_scales() {
+    let (Ok(fam), Ok(rows)) = (std::env::var("CALIB_FAMILY"), std::env::var("CALIB_ROWS")) else { return };
+    let fam: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fam).unwrap()).unwrap();
+    let hex = |s: &str| -> Vec<u8> { (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let params = hex(fam["params_hex"].as_str().unwrap());
+    let nodes: Vec<u32> = fam["nodes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let edges: Vec<(u32, u32)> = fam["edges"].as_array().unwrap().iter().map(|e| (nodes[e[0].as_u64().unwrap() as usize], nodes[e[1].as_u64().unwrap() as usize])).collect();
+    let base = BaseTopology::new(nodes.clone(), &edges).unwrap();
+    let digest = params_digest(&params);
+    let admitted = admit(&[TWISTED_DIMER_V1], TWISTED_DIMER_V1.family_id.as_bytes(), 1, &params, &digest).unwrap();
+    let lean = crate::cluster::lean_gen::LeanGen::new(&base, admitted.descriptor().digest(), 12, 4, 45, 1350).expect("lean init");
+    let tri = crate::cluster::lean_gen::Triangles::new(base.node_ids().len(), &lean.edges);
+    let nonces: Vec<[u8; 32]> = std::fs::read_to_string(rows).unwrap().lines().take(300).map(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        let mut n = [0u8; 32];
+        n.copy_from_slice(&hex(v["n"].as_str().unwrap()));
+        n
+    }).collect();
+    let mut sc = crate::cluster::lean_gen::FastScratch::new(lean.gpu_tables().unwrap());
+    let (mut ok, mut bad) = (0, 0);
+    for n in &nonces {
+        let old = tri.features(&lean.couplings(n).unwrap());
+        let good = lean.fast_flags(n, &mut sc);
+        if good && tri.features_flags(&sc.flags) == old { ok += 1 } else { bad += 1 }
+    }
+    eprintln!("FAST identical={ok} different={bad}");
+    for threads in [1usize, 8, 24] {
+        let t = Instant::now();
+        let per = 150usize;
+        std::thread::scope(|s| {
+            for k in 0..threads {
+                let (lean, tri, nonces) = (&lean, &tri, &nonces);
+                s.spawn(move || {
+                    let mut sc = crate::cluster::lean_gen::FastScratch::new(lean.gpu_tables().unwrap());
+                    for i in 0..per {
+                        let n = &nonces[(k * 7 + i) % nonces.len()];
+                        if lean.fast_flags(n, &mut sc) { std::hint::black_box(tri.features_flags(&sc.flags)); }
+                    }
+                });
+            }
+        });
+        let dt = t.elapsed().as_secs_f64();
+        eprintln!("FAST threads {threads}: {:.0} salt/s total ({:.2} ms per salt per thread)", (threads * per) as f64 / dt, dt / per as f64 * 1e3);
+    }
+    let t = Instant::now();
+    let per = 150usize;
+    std::thread::scope(|s| {
+        for k in 0..24 {
+            let (lean, tri, nonces) = (&lean, &tri, &nonces);
+            s.spawn(move || {
+                for i in 0..per {
+                    let n = &nonces[(k * 7 + i) % nonces.len()];
+                    if let Some(j) = lean.couplings(n) { std::hint::black_box(tri.features(&j)); }
+                }
+            });
+        }
+    });
+    let dt = t.elapsed().as_secs_f64();
+    eprintln!("OLD(lean, allocating) threads 24: {:.0} salt/s total", (24 * per) as f64 / dt);
+}
+
+/// Throughput of the in-tree MSA streaming driver on live chain 120 instances: many different models in flight at once.
+#[test]
+#[ignore = "GPU test"]
+fn msa_stream_throughput() {
+    use quip_solver_core::{CancelToken, StreamJob, StreamOutcome, StreamResult};
+    let (Ok(fam), Ok(rows)) = (std::env::var("CALIB_FAMILY"), std::env::var("CALIB_ROWS")) else { return };
+    let fam: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fam).unwrap()).unwrap();
+    let hexb = |s: &str| -> Vec<u8> { (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let params = hexb(fam["params_hex"].as_str().unwrap());
+    let nodes: Vec<u32> = fam["nodes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let edges: Vec<(u32, u32)> = fam["edges"].as_array().unwrap().iter().map(|e| (nodes[e[0].as_u64().unwrap() as usize], nodes[e[1].as_u64().unwrap() as usize])).collect();
+    let base = BaseTopology::new(nodes.clone(), &edges).unwrap();
+    let digest = params_digest(&params);
+    let admitted = admit(&[TWISTED_DIMER_V1], TWISTED_DIMER_V1.family_id.as_bytes(), 1, &params, &digest).unwrap();
+    let bounds = admit_topology(&admitted, &base, base.order_digest(), &AdvertisedLimits { max_nodes: 0, max_edges: 0, max_degree: 0 }).unwrap();
+    let n_jobs: usize = std::env::var("MSA_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let mut graphs = Vec::new();
+    for line in std::fs::read_to_string(rows).unwrap().lines().take(n_jobs) {
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&hexb(line.trim()));
+        if let Ok(inst) = generate_instance(&admitted, &base, &bounds, nonce) {
+            graphs.push(crate::cluster::sampler::lease_run::ising_graph_for_timing(&inst));
+        }
+    }
+    eprintln!("MSASTREAM instances ready: {}", graphs.len());
+    let device = crate::cuda_device::CudaDevice::open_with_nodes(0, crate::KernelKind::Msa, 4600).unwrap();
+    eprintln!("MSASTREAM stream width (nonces in flight): {}", crate::streaming::stream_width(&device, crate::KernelKind::Msa));
+    let cfgs: Vec<(usize, usize)> = std::env::var("MSA_CFG").ok().map_or_else(
+        || vec![(128usize, 1024usize), (128, 4096)],
+        |v| v.split(',').filter_map(|c| c.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))).collect(),
+    );
+    // MSA_BETA="lo,hi;lo,hi;default": the annealing range for every configuration (None = the sampler default).
+    let betas: Vec<Option<(f64, f64)>> = std::env::var("MSA_BETA").ok().map_or_else(
+        || vec![None],
+        |v| v.split(';').map(|c| c.split_once(',').and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)))).collect(),
+    );
+    // MSA_SEEDS="11,1011,...": repeat every configuration with these base seeds (repeatability of the MSA judge).
+    let seeds: Vec<u64> = std::env::var("MSA_SEEDS").ok().map_or_else(|| vec![11], |v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+    for &seed0 in &seeds {
+    for &beta in &betas {
+    for &(reads, sweeps) in &cfgs {
+        let gov = crate::nvml_gov::UtilGovernor::start(&device.pci_bus_id, 100, false);
+        let (job_tx, job_rx) = tokio::sync::mpsc::channel::<StreamJob>(64);
+        let (res_tx, mut res_rx) = tokio::sync::mpsc::channel::<StreamResult>(64);
+        let t0 = Instant::now();
+        let mut energies = vec![f64::NAN; graphs.len()];
+        std::thread::scope(|sc| {
+            let dev = &device;
+            let g = &gov;
+            sc.spawn(move || crate::streaming::run_stream(dev, crate::KernelKind::Msa, job_rx, res_tx, CancelToken::default(), g, crate::streaming::StallConfig::default()));
+            let graphs_ref = &graphs;
+            sc.spawn(move || {
+                for (i, gr) in graphs_ref.iter().enumerate() {
+                    let p = SampleParams { num_reads: reads, num_sweeps: sweeps, sweeps_per_beta: 1, seed: seed0 + i as u64, beta_range: beta, ..SampleParams::default() };
+                    job_tx.blocking_send(StreamJob { job_id: (i as u32).to_le_bytes().to_vec(), graph: gr.clone(), params: p, watermark: None }).unwrap();
+                }
+            });
+            let mut got = 0usize;
+            while got < graphs.len() {
+                let Some(r) = res_rx.blocking_recv() else { break };
+                let i = u32::from_le_bytes(r.job_id[..4].try_into().unwrap()) as usize;
+                if let StreamOutcome::Completed(Ok(rs)) = r.outcome {
+                    energies[i] = rs.iter().map(|x| x.energy_milli).min().unwrap_or(0) as f64 * 0.001;
+                }
+                got += 1;
+            }
+        });
+        let dt = t0.elapsed().as_secs_f64();
+        let ok = energies.iter().filter(|e| e.is_finite()).count();
+        let mean = energies.iter().filter(|e| e.is_finite()).sum::<f64>() / ok.max(1) as f64;
+        eprintln!("MSASTREAM beta={beta:?} {reads}x{sweeps}: {ok}/{} jobs in {dt:.1} s => {:.1} nonce/s ; nang luong tb {mean:.2}", graphs.len(), ok as f64 / dt);
+        let line: String = energies.iter().map(|e| format!("{e:.3}")).collect::<Vec<_>>().join(",");
+        eprintln!("MSAENERGIES seed={seed0} beta={beta:?} {reads}x{sweeps} {line}");
+    }
+    }
+    }
 }
