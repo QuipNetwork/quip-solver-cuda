@@ -1,0 +1,1 @@
+{"cpu_workers":8,"cold":{"updates":30000,"refinement_pass_limit":2},"ramp_base":15000,"ramp_step":5000,"fusion_width":18,"fusion_donors":64,"weak_scale":1.2}

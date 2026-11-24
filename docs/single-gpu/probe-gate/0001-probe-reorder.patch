@@ -1,0 +1,804 @@
+From ea9b0f9fb01dcee2d5a53a23fc1d8159bdd9d562 Mon Sep 17 00:00:00 2001
+From: rdyplayerB <rdyplayerb@gmail.com>
+Date: Mon, 23 Nov 2026 12:09:31 -0800
+Subject: [PATCH 1/2] feat(otsuka): re-order the ladder's final candidates by a
+ helper probe
+
+QUIP_OTSUKA_BP_PROBE_HELPER=<command>: a second helper process (the same solver with a
+short probe configuration) probes the best QUIP_OTSUKA_BP_PROBE_N final candidates; each
+probe's best read is verified on our graph and the candidates are re-ordered by probe
+energy before the top-K full solves. Probe results are never pushed. Probe helper down
+= ladder order. QUIP_OTSUKA_BP_PROBE_TIMEOUT_S bounds one probe.
+---
+ src/cluster/bp_helper.rs    | 454 +++++++++++++++++++++++++++++++++++-
+ src/cluster/screen_lease.rs | 109 ++++++++-
+ tools/bp_fake_helper.py     |  25 +-
+ 3 files changed, 577 insertions(+), 11 deletions(-)
+
+diff --git a/src/cluster/bp_helper.rs b/src/cluster/bp_helper.rs
+index bed42ec..948c10f 100644
+--- a/src/cluster/bp_helper.rs
++++ b/src/cluster/bp_helper.rs
+@@ -33,6 +33,20 @@
+ //!   earliest moment it is good enough. Without a session target it changes nothing.
+ //! * `QUIP_OTSUKA_BP_TOPK=k` (1, 1..=8): the ladder path also solves ranks 2..k of the last rung through
+ //!   the helper, one after another, each pushed when it finishes (no fallback anneal for those ranks).
++//!
++//! Patch 42 (E86), off by default:
++//! * `QUIP_OTSUKA_BP_PROBE_HELPER="<cmd>"`: a second helper process (same protocol, same spawn, environment,
++//!   ready, cancel, timeout and respawn handling), meant to be the same binary with a short probe search
++//!   config. With it (and the main helper) set, the ladder path probes its best final candidates through it,
++//!   one request each (`max_reads` 1, shift 0), verifies each probe's best read on our own graph, re-orders the
++//!   candidates by probe energy (best first, ties and failed probes keep ladder order, failed ones last) and
++//!   the top-K full solves follow that order. Probe results are never pushed. Unset or empty = off.
++//! * `QUIP_OTSUKA_BP_PROBE_N=n` (4, 2..=16): candidates probed, in the ladder's final order (the last rung's
++//!   order, then the earlier rungs' remaining candidates in theirs).
++//! * `QUIP_OTSUKA_BP_PROBE_TIMEOUT_S` (30): per probe; past it the probe helper is killed as hung.
++//!
++//! If the probe helper cannot start or dies, the ladder order is used (one warning per outage) until it is
++//! back (respawn at most once a minute, as for the main helper).
+ 
+ use quip_solver_core::ising_generators::instance::Instance;
+ use quip_solver_core::quip_protocol::scoring::energy_milli;
+@@ -43,6 +57,7 @@ use std::io::{BufRead, BufReader, Write};
+ use std::path::{Path, PathBuf};
+ use std::process::{Child, ChildStdin, Command, Stdio};
+ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Mutex, Once, PoisonError};
+ use std::time::{Duration, Instant};
+ 
+@@ -206,6 +221,143 @@ pub fn bp_cfg() -> Option<BpCfg> {
+     Some(cfg)
+ }
+ 
++/// Probe helper settings (patch 42).
++#[derive(Clone, Debug)]
++pub struct ProbeCfg {
++    /// The probe helper: its command line, `QUIP_OTSUKA_BP_PROBE_TIMEOUT_S`, one read, no re-draws; the
++    /// directory, ready wait and cancel handling are the main helper's.
++    pub helper: BpCfg,
++    /// Candidates probed, 2..=16.
++    pub n: usize,
++}
++
++/// `QUIP_OTSUKA_BP_PROBE_N`: 2..=16; unparsable = 4, out of range is clamped.
++#[must_use]
++pub fn parse_probe_n(v: &str) -> usize {
++    v.trim().parse::<usize>().map_or(4, |n| n.clamp(2, 16))
++}
++
++/// Probe settings from `get` (a key lookup), on top of the main helper's `main`; `None` when
++/// `QUIP_OTSUKA_BP_PROBE_HELPER` is unset or blank.
++#[must_use]
++pub fn probe_cfg_with(main: &BpCfg, get: &dyn Fn(&str) -> Option<String>) -> Option<ProbeCfg> {
++    let mut helper = BpCfg::with_cmd(&get("QUIP_OTSUKA_BP_PROBE_HELPER")?)?;
++    helper.dir = main.dir.clone();
++    helper.ready = main.ready;
++    helper.cancel_wait = main.cancel_wait;
++    helper.cancel_inline = main.cancel_inline;
++    helper.timeout = Duration::from_secs(get("QUIP_OTSUKA_BP_PROBE_TIMEOUT_S").and_then(|v| v.trim().parse().ok()).unwrap_or(30));
++    helper.reads = 1;
++    let n = get("QUIP_OTSUKA_BP_PROBE_N").map_or(4, |v| parse_probe_n(&v));
++    Some(ProbeCfg { helper, n })
++}
++
++/// `probe_cfg_with` on the environment; logs the configuration once per process. Call only when the main
++/// helper is configured.
++#[must_use]
++pub fn probe_cfg(main: &BpCfg) -> Option<ProbeCfg> {
++    let pc = probe_cfg_with(main, &|k| std::env::var(k).ok())?;
++    static LOGGED: Once = Once::new();
++    LOGGED.call_once(|| {
++        tracing::info!(cmd = pc.helper.cmd.as_str(), n = pc.n, timeout_s = pc.helper.timeout.as_secs(), "gpu-pa bp probe configured");
++    });
++    Some(pc)
++}
++
++/// The ladder's final order after one more rung: the rung's own order `cur` first, then the entries of
++/// the order so far `ext` that the rung did not probe, in their order.
++#[must_use]
++pub fn merge_rung_order(ext: &[usize], cur: &[usize]) -> Vec<usize> {
++    let mut v = cur.to_vec();
++    v.extend(ext.iter().copied().filter(|k| !cur.contains(k)));
++    v
++}
++
++/// `[a,b,c]` for log lines.
++#[must_use]
++pub fn fmt_list<I>(v: I) -> String
++where
++    I: IntoIterator,
++    I::Item: std::fmt::Display,
++{
++    format!("[{}]", v.into_iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","))
++}
++
++/// `order` with `first` moved to (or put at) the front.
++#[must_use]
++pub fn with_first(order: &[usize], first: usize) -> Vec<usize> {
++    let mut v = vec![first];
++    v.extend(order.iter().copied().filter(|&k| k != first));
++    v
++}
++
++/// What one probe produced.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum ProbeOutcome {
++    /// The verified best read's energy, offset included.
++    Best {
++        /// Energy, offset included.
++        energy: i64,
++        /// The helper's `solve_ms`.
++        helper_ms: u64,
++        /// The helper's stage label.
++        stage: String,
++        /// The helper's `screened_out` flag.
++        screened_out: bool,
++    },
++    /// The lease stopped.
++    Cancelled,
++    /// No usable answer while the probe helper stays up; this candidate keeps its ladder position, last.
++    Failed(String),
++    /// The probe helper is not running (spawn failed, died, killed, or waiting to respawn).
++    Down(String),
++}
++
++/// Probing a ladder's final candidates.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ProbeOrder {
++    /// Positions in the probed list (= ladder rank - 1), in the order the full solves follow.
++    pub order: Vec<usize>,
++    /// The verified probe energy per position of the probed list (`None`: failed or not probed).
++    pub best: Vec<Option<i64>>,
++    /// The lease stopped while probing.
++    pub cancelled: bool,
++    /// The probe helper is down: `order` is the ladder order.
++    pub down: Option<String>,
++}
++
++/// Probe positions `0..n` in order with `probe`, checking `stopped` before each, and order them by probe
++/// energy (best first). Ties keep the ladder order; failed probes follow the probed ones in ladder order.
++/// A down helper ends probing and gives the ladder order; a stop ends probing (the order is then moot).
++pub fn order_by_probe(n: usize, probe: &mut dyn FnMut(usize) -> ProbeOutcome, stopped: &dyn Fn() -> bool) -> ProbeOrder {
++    let mut best: Vec<Option<i64>> = vec![None; n];
++    let mut cancelled = false;
++    let mut down = None;
++    for (k, slot) in best.iter_mut().enumerate() {
++        if stopped() {
++            cancelled = true;
++            break;
++        }
++        match probe(k) {
++            ProbeOutcome::Best { energy, .. } => *slot = Some(energy),
++            ProbeOutcome::Failed(_) => {}
++            ProbeOutcome::Cancelled => {
++                cancelled = true;
++                break;
++            }
++            ProbeOutcome::Down(why) => {
++                down = Some(why);
++                break;
++            }
++        }
++    }
++    let mut order: Vec<usize> = (0..n).collect();
++    if down.is_none() {
++        order.sort_by_key(|&k| (best[k].is_none(), best[k].unwrap_or(i64::MAX)));
++    }
++    ProbeOrder { order, best, cancelled, down }
++}
++
+ /// The helper's environment: only the variables PROTOCOL.md lists, taken from ours, plus
+ /// `QUIP_TWO_PASS_REFINEMENT=native-cluster-rebase`.
+ #[must_use]
+@@ -290,6 +442,10 @@ pub struct Answer {
+     pub reads: Vec<(i64, String)>,
+     /// The helper's own `solve_ms`.
+     pub solve_ms: u64,
++    /// The helper's `stage` label (`""` when absent; patch 42).
++    pub stage: String,
++    /// The helper's `screened_out` flag (patch 42).
++    pub screened_out: bool,
+ }
+ 
+ /// A parsed helper line.
+@@ -321,7 +477,9 @@ pub fn parse_line(line: &str) -> Option<Msg> {
+         }
+     }
+     let solve_ms = v.get("solve_ms").and_then(Value::as_u64).unwrap_or(0);
+-    Some(Msg::Answer(id, Ok(Answer { reads, solve_ms })))
++    let stage = v.get("stage").and_then(Value::as_str).unwrap_or("").to_string();
++    let screened_out = v.get("screened_out").and_then(Value::as_bool) == Some(true);
++    Some(Msg::Answer(id, Ok(Answer { reads, solve_ms, stage, screened_out })))
+ }
+ 
+ /// Why a helper request gave no answer.
+@@ -511,6 +669,16 @@ impl Helper {
+                 }
+             }
+         }
++        self.settle(cfg, stopped)
++    }
++
++    /// Wait for the answer of a previously cancelled solve, if any (until `cancel_wait` after the cancel; past
++    /// it the helper is killed as hung). Never spawns. `Ok` when nothing is in flight any more.
++    ///
++    /// # Errors
++    /// `Fail::Cancelled` when `stopped()` turned true first, `Fail::Failed` when the helper was killed or exited.
++    pub fn settle(&mut self, cfg: &BpCfg, stopped: &dyn Fn() -> bool) -> Result<(), Fail> {
++        let Some(p) = self.proc.as_mut() else { return Ok(()) };
+         while let Some((id, at)) = p.pending {
+             match p.rx.recv_timeout(POLL) {
+                 Ok(line) => {
+@@ -730,6 +898,39 @@ impl Helper {
+         reads.truncate(cfg.reads);
+         BpOutcome::Reads { reads, helper_ms: first.solve_ms, redraws }
+     }
++
++    /// Probe `inst` (lease graph `graph`) once through this helper (patch 42): shift 0, one read, the
++    /// returned read verified exactly as for full solves.
++    pub fn probe_via_helper(&mut self, cfg: &BpCfg, inst: &Instance, graph: &IsingGraph, stopped: &dyn Fn() -> bool) -> ProbeOutcome {
++        if stopped() {
++            return ProbeOutcome::Cancelled;
++        }
++        let path = match self.write_instance(cfg, inst) {
++            Ok(p) => p,
++            Err(e) => return ProbeOutcome::Failed(e),
++        };
++        let out = self.probe_file(cfg, &path, inst.offset_milli(), graph, stopped);
++        let _ = std::fs::remove_file(&path);
++        out
++    }
++
++    fn probe_file(&mut self, cfg: &BpCfg, path: &Path, offset: i64, graph: &IsingGraph, stopped: &dyn Fn() -> bool) -> ProbeOutcome {
++        match self.request(cfg, path, 0, 1, stopped) {
++            Ok(a) => {
++                let (ok, bad) = verify_reads(graph, offset, &a.reads);
++                for b in &bad {
++                    tracing::error!(why = b.as_str(), "gpu-pa bp probe read rejected");
++                }
++                match ok.first() {
++                    Some(r) => ProbeOutcome::Best { energy: r.energy_milli, helper_ms: a.solve_ms, stage: a.stage, screened_out: a.screened_out },
++                    None => ProbeOutcome::Failed(format!("no read verified ({} sent, {} rejected)", a.reads.len(), bad.len())),
++                }
++            }
++            Err(Fail::Cancelled) => ProbeOutcome::Cancelled,
++            Err(Fail::Failed(e)) if self.alive() => ProbeOutcome::Failed(e),
++            Err(Fail::Failed(e)) => ProbeOutcome::Down(e),
++        }
++    }
+ }
+ 
+ static HELPER: Mutex<Helper> = Mutex::new(Helper::new());
+@@ -740,6 +941,40 @@ pub fn solve(cfg: &BpCfg, inst: &Instance, graph: &IsingGraph, stopped: &dyn Fn(
+     h.solve_via_helper(cfg, inst, graph, stopped, target)
+ }
+ 
++static PROBE: Mutex<Helper> = Mutex::new(Helper::new());
++static PROBE_DOWN: AtomicBool = AtomicBool::new(false);
++
++/// `Helper::probe_via_helper` on the process-wide probe helper (patch 42; started at first use, kept across
++/// leases). Warns once when it goes down and logs once when it answers again.
++pub fn probe(cfg: &BpCfg, inst: &Instance, graph: &IsingGraph, stopped: &dyn Fn() -> bool) -> ProbeOutcome {
++    let out = PROBE.lock().unwrap_or_else(PoisonError::into_inner).probe_via_helper(cfg, inst, graph, stopped);
++    match &out {
++        ProbeOutcome::Down(why) => {
++            if !PROBE_DOWN.swap(true, Ordering::Relaxed) {
++                tracing::warn!(reason = why.as_str(), "gpu-pa bp probe helper unavailable; the ladder order is used until it is back");
++            }
++        }
++        ProbeOutcome::Best { .. } | ProbeOutcome::Failed(_) => {
++            if PROBE_DOWN.swap(false, Ordering::Relaxed) {
++                tracing::info!("gpu-pa bp probe helper back; probing again");
++            }
++        }
++        ProbeOutcome::Cancelled => {}
++    }
++    out
++}
++
++/// Wait out a cancelled solve still running in the main helper (patch 42: before probing, so the two
++/// helpers never run at the same time). Never spawns.
++pub fn settle_main(cfg: &BpCfg, stopped: &dyn Fn() -> bool) -> Result<(), Fail> {
++    HELPER.lock().unwrap_or_else(PoisonError::into_inner).settle(cfg, stopped)
++}
++
++/// Wait out a cancelled probe still running in the probe helper (patch 42: before the full solves).
++pub fn settle_probe(cfg: &BpCfg, stopped: &dyn Fn() -> bool) -> Result<(), Fail> {
++    PROBE.lock().unwrap_or_else(PoisonError::into_inner).settle(cfg, stopped)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1000,8 +1235,13 @@ mod tests {
+ 
+     /// A deterministic 240-node instance (offset -42) big enough for distinct planned energies.
+     fn mid_file(tag: &str) -> (PathBuf, IsingGraph) {
++        mid_file_seeded(tag, 0x9E37_79B9_7F4A_7C15)
++    }
++
++    /// `mid_file` with another random instance per `seed` (patch 42).
++    fn mid_file_seeded(tag: &str, seed: u64) -> (PathBuf, IsingGraph) {
+         let n = 240usize;
+-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
++        let mut x: u64 = seed;
+         let mut rnd = || {
+             x ^= x << 13;
+             x ^= x >> 7;
+@@ -1112,6 +1352,216 @@ mod tests {
+         assert_eq!(outcome(h.solve_file(&c, &p, -42, &g, &|| false, &|| Some(e[1]))), (e[1], 1));
+     }
+ 
++    // ---- patch 42 ----
++
++    #[test]
++    fn probe_cfg_and_orders() {
++        assert_eq!(parse_probe_n("4"), 4);
++        assert_eq!(parse_probe_n(" 16 "), 16);
++        assert_eq!(parse_probe_n("1"), 2);
++        assert_eq!(parse_probe_n("99"), 16);
++        assert_eq!(parse_probe_n("x"), 4);
++        let main = BpCfg::with_cmd("main --serve").unwrap();
++        // knob unset or blank: off
++        assert!(probe_cfg_with(&main, &|_| None).is_none());
++        assert!(probe_cfg_with(&main, &|k| (k == "QUIP_OTSUKA_BP_PROBE_HELPER").then(|| "  ".to_string())).is_none());
++        // set: defaults n 4, timeout 30 s, one read, no re-draws, top-K 1; dir and ready from the main helper
++        let pc = probe_cfg_with(&main, &|k| (k == "QUIP_OTSUKA_BP_PROBE_HELPER").then(|| "probe --serve".to_string())).unwrap();
++        assert_eq!((pc.n, pc.helper.timeout, pc.helper.reads, pc.helper.redraw, pc.helper.topk), (4, Duration::from_secs(30), 1, None, 1));
++        assert_eq!(pc.helper.argv, vec!["probe", "--serve"]);
++        assert_eq!((pc.helper.dir.clone(), pc.helper.ready), (main.dir.clone(), main.ready));
++        let pc = probe_cfg_with(&main, &|k| match k {
++            "QUIP_OTSUKA_BP_PROBE_HELPER" => Some("probe".into()),
++            "QUIP_OTSUKA_BP_PROBE_N" => Some("7".into()),
++            "QUIP_OTSUKA_BP_PROBE_TIMEOUT_S" => Some("5".into()),
++            _ => None,
++        })
++        .unwrap();
++        assert_eq!((pc.n, pc.helper.timeout), (7, Duration::from_secs(5)));
++        // ladder order over rungs: 8 candidates, rung A keeps 4 (its order 5,2,7,0,...), rung B probes those 4
++        let a = merge_rung_order(&[], &[5, 2, 7, 0, 1, 3, 6, 4]);
++        assert_eq!(a, vec![5, 2, 7, 0, 1, 3, 6, 4]);
++        let b = merge_rung_order(&a, &[7, 0, 5, 2]);
++        assert_eq!(b, vec![7, 0, 5, 2, 1, 3, 6, 4]);
++        assert_eq!(with_first(&b, 7), b);
++        assert_eq!(with_first(&b, 2), vec![2, 7, 0, 5, 1, 3, 6, 4]);
++    }
++
++    fn scripted(v: Vec<ProbeOutcome>) -> impl FnMut(usize) -> ProbeOutcome {
++        move |k| v[k].clone()
++    }
++
++    fn best(e: i64) -> ProbeOutcome {
++        ProbeOutcome::Best { energy: e, helper_ms: 1, stage: "probe".into(), screened_out: true }
++    }
++
++    #[test]
++    fn probe_order_rules() {
++        let f = |s: &str| ProbeOutcome::Failed(s.into());
++        // by energy, best first
++        let o = order_by_probe(4, &mut scripted(vec![best(-10), best(-30), best(-20), best(-5)]), &|| false);
++        assert_eq!((o.order, o.cancelled, o.down), (vec![1, 2, 0, 3], false, None));
++        // ties keep the ladder order
++        let o = order_by_probe(4, &mut scripted(vec![best(-10), best(-20), best(-20), best(-10)]), &|| false);
++        assert_eq!(o.order, vec![1, 2, 0, 3]);
++        // failed probes go last, in ladder order
++        let o = order_by_probe(4, &mut scripted(vec![f("x"), best(-1), f("y"), best(-2)]), &|| false);
++        assert_eq!(o.order, vec![3, 1, 0, 2]);
++        assert_eq!(o.best, vec![None, Some(-1), None, Some(-2)]);
++        // a down helper: ladder order, the probes after it are not asked for
++        let mut asked = 0;
++        let o = order_by_probe(
++            4,
++            &mut |k| {
++                asked += 1;
++                if k == 1 { ProbeOutcome::Down("gone".into()) } else { best(-(k as i64)) }
++            },
++            &|| false,
++        );
++        assert_eq!((o.order, o.down.as_deref(), asked), (vec![0, 1, 2, 3], Some("gone"), 2));
++        // a stop: no probe after it
++        let asked = std::cell::Cell::new(0);
++        let o = order_by_probe(4, &mut |k| { asked.set(asked.get() + 1); best(-(k as i64)) }, &|| asked.get() >= 2);
++        assert_eq!((o.cancelled, asked.get()), (true, 2));
++        let o = order_by_probe(4, &mut scripted(vec![best(-1), ProbeOutcome::Cancelled, best(-3), best(-4)]), &|| false);
++        assert!(o.cancelled);
++        // n 0 / 1
++        assert_eq!(order_by_probe(1, &mut scripted(vec![best(0)]), &|| false).order, vec![0]);
++        assert!(order_by_probe(0, &mut scripted(vec![]), &|| false).order.is_empty());
++    }
++
++    /// Probe helper settings for the fake helper.
++    fn pcfg(args: &str) -> Option<BpCfg> {
++        let mut c = cfg(args)?;
++        c.reads = 1;
++        Some(c)
++    }
++
++    #[test]
++    fn probe_through_fake_helper_orders_and_verifies() {
++        let Some(c) = pcfg("--stage probe") else { return };
++        // four instances in "ladder order"; the second and the fourth are the same puzzle (a tie)
++        let files: Vec<(PathBuf, IsingGraph)> =
++            [("pa", 33u64), ("pb", 22), ("pc", 11), ("pd", 22)].iter().map(|&(t, s)| mid_file_seeded(t, s)).collect();
++        let mut h = Helper::new();
++        let mut energies = Vec::new();
++        let o = order_by_probe(
++            4,
++            &mut |k| {
++                let out = h.probe_file(&c, &files[k].0, -42, &files[k].1, &|| false);
++                if let ProbeOutcome::Best { energy, ref stage, screened_out, .. } = out {
++                    assert_eq!((stage.as_str(), screened_out), ("probe", true));
++                    energies.push(energy);
++                }
++                out
++            },
++            &|| false,
++        );
++        assert_eq!(energies.len(), 4);
++        assert_eq!(energies[1], energies[3], "same puzzle, same probe energy");
++        let mut want: Vec<usize> = (0..4).collect();
++        want.sort_by_key(|&k| energies[k]);
++        assert_eq!(o.order, want);
++        let p1 = o.order.iter().position(|&k| k == 1).unwrap();
++        assert_eq!(o.order[p1 + 1], 3, "the tie keeps ladder order: {:?} {energies:?}", o.order);
++        assert_ne!(o.order, vec![0, 1, 2, 3], "these seeds are meant to re-order: {energies:?}");
++        eprintln!("probe energies {energies:?} order {:?}", o.order);
++    }
++
++    #[test]
++    fn probe_failures_keep_ladder_position() {
++        // pb answers ok:false, pc sends a read whose energy does not verify: both keep their position, last
++        let Some(c) = pcfg("--stage probe --fail-match /pf-b. --bad-match /pf-c.") else { return };
++        let files: Vec<(PathBuf, IsingGraph)> = [("pf-a", 11u64), ("pf-b", 22), ("pf-c", 33), ("pf-d", 44)].iter().map(|&(t, s)| mid_file_seeded(t, s)).collect();
++        let mut h = Helper::new();
++        let outs: Vec<ProbeOutcome> = files.iter().map(|(p, g)| h.probe_file(&c, p, -42, g, &|| false)).collect();
++        assert!(matches!(outs[1], ProbeOutcome::Failed(ref e) if e.contains("scripted")), "{:?}", outs[1]);
++        assert!(matches!(outs[2], ProbeOutcome::Failed(ref e) if e.contains("no read verified")), "{:?}", outs[2]);
++        assert!(h.alive());
++        let o = order_by_probe(4, &mut scripted(outs.clone()), &|| false);
++        let (ea, ed) = match (&outs[0], &outs[3]) {
++            (ProbeOutcome::Best { energy: a, .. }, ProbeOutcome::Best { energy: d, .. }) => (*a, *d),
++            other => panic!("{other:?}"),
++        };
++        let head = if ea <= ed { vec![0, 3] } else { vec![3, 0] };
++        assert_eq!(o.order, [head, vec![1, 2]].concat());
++    }
++
++    #[test]
++    fn probe_helper_down_gives_ladder_order() {
++        let Some(mut c) = pcfg("--stage probe") else { return };
++        let (p, g) = mid_file_seeded("pdown", 5);
++        // cannot start
++        let mut bad = c.clone();
++        bad.argv = vec!["/nonexistent/quip-probe".into()];
++        let mut h = Helper::new();
++        let o = order_by_probe(3, &mut |_| h.probe_file(&bad, &p, -42, &g, &|| false), &|| false);
++        assert_eq!(o.order, vec![0, 1, 2]);
++        assert!(o.down.as_deref().is_some_and(|e| e.contains("spawn")), "{o:?}");
++        // dies after one probe: the next probe finds it gone, ladder order (the first result is ignored)
++        c.argv = pcfg("--stage probe --die-after 1").unwrap().argv;
++        let mut h = Helper::new();
++        let o = order_by_probe(3, &mut |_| h.probe_file(&c, &p, -42, &g, &|| false), &|| false);
++        assert_eq!(o.order, vec![0, 1, 2]);
++        assert!(o.best[0].is_some() && o.down.is_some(), "{o:?}");
++        // and while it may not respawn yet, it stays down
++        c.respawn = Duration::from_secs(60);
++        assert!(matches!(h.probe_file(&c, &p, -42, &g, &|| false), ProbeOutcome::Down(ref e) if e.contains("respawn")));
++        // a hung probe (timeout) is killed: down
++        let mut slow = pcfg("--stage probe --sleep 30").unwrap();
++        slow.timeout = Duration::from_secs(1);
++        let mut h = Helper::new();
++        assert!(matches!(h.probe_file(&slow, &p, -42, &g, &|| false), ProbeOutcome::Down(ref e) if e.contains("hung")));
++    }
++
++    #[test]
++    fn stop_mid_probing_returns_fast() {
++        let Some(c) = pcfg("--stage probe --sleep 2") else { return };
++        let files: Vec<(PathBuf, IsingGraph)> = [("ps-a", 1u64), ("ps-b", 2), ("ps-c", 3)].iter().map(|&(t, s)| mid_file_seeded(t, s)).collect();
++        let mut h = Helper::new();
++        h.ensure(&c, &|| false).unwrap();
++        let flag = Arc::new(AtomicBool::new(false));
++        let f2 = Arc::clone(&flag);
++        // the first probe takes 2 s; stop 300 ms into it
++        let t = std::thread::spawn(move || {
++            std::thread::sleep(Duration::from_millis(300));
++            f2.store(true, Ordering::SeqCst);
++            Instant::now()
++        });
++        let stopped = || flag.load(Ordering::SeqCst);
++        let mut asked = 0;
++        let o = order_by_probe(3, &mut |k| { asked += 1; h.probe_file(&c, &files[k].0, -42, &files[k].1, &stopped) }, &stopped);
++        let back = Instant::now();
++        let lag = back.duration_since(t.join().unwrap());
++        eprintln!("probing returned {} ms after the stop", lag.as_millis());
++        assert!(o.cancelled && asked == 1, "{o:?} {asked}");
++        assert!(lag < Duration::from_millis(150), "{lag:?}");
++        // the cancel was answered inline; the helper serves the next probe at once
++        assert!(h.proc.as_ref().unwrap().pending.is_none());
++        let fast = BpCfg { argv: pcfg("--stage probe").unwrap().argv, ..c };
++        assert!(h.settle(&fast, &|| false).is_ok());
++        assert!(matches!(h.probe_file(&fast, &files[0].0, -42, &files[0].1, &|| false), ProbeOutcome::Best { .. }));
++    }
++
++    #[test]
++    fn settle_waits_for_a_deferred_cancel() {
++        // a helper that ignores cancel: the stopped probe returns after cancel_inline; settle then waits for
++        // the stale answer before anything else uses the GPU
++        let Some(mut c) = pcfg("--stage probe --sleep 1 --ignore-cancel") else { return };
++        c.cancel_inline = Duration::from_millis(100);
++        let (p, g) = mid_file_seeded("pset", 9);
++        let mut h = Helper::new();
++        h.ensure(&c, &|| false).unwrap();
++        let t0 = Instant::now();
++        assert_eq!(h.probe_file(&c, &p, -42, &g, &|| t0.elapsed() > Duration::from_millis(200)), ProbeOutcome::Cancelled);
++        assert!(h.proc.as_ref().unwrap().pending.is_some());
++        assert!(h.settle(&c, &|| false).is_ok());
++        assert!(t0.elapsed() >= Duration::from_millis(900), "{:?}", t0.elapsed());
++        assert!(h.proc.as_ref().unwrap().pending.is_none());
++        // settle on an empty slot is a no-op
++        assert!(Helper::new().settle(&c, &|| false).is_ok());
++    }
++
+     /// Regenerate a reference instance through the vendored generator and compare the canonical JSON
+     /// key by key with the file canon-gen wrote. Needs the topology file and the reference directory.
+     #[test]
+diff --git a/src/cluster/screen_lease.rs b/src/cluster/screen_lease.rs
+index c170a7e..8a1b080 100644
+--- a/src/cluster/screen_lease.rs
++++ b/src/cluster/screen_lease.rs
+@@ -18,7 +18,9 @@
+ //! `QUIP_OTSUKA_SCREEN_BETA="b0,b1,weak_scale"` sets the probe schedule (default 1,12,1.5).
+ //! `QUIP_OTSUKA_BP_HELPER="<cmd>"` (E84): the ladder's pick and replay puzzles go to a helper process;
+ //! see bp_helper.rs (unset = unchanged). E85: `QUIP_OTSUKA_BP_TOPK=k` also solves ranks 2..k of the last
+-//! rung through the helper (patch-gpu-pa-41.py; 1 = unchanged).
++//! rung through the helper (patch-gpu-pa-41.py; 1 = unchanged). E86: `QUIP_OTSUKA_BP_PROBE_HELPER=<cmd>`
++//! re-orders the ladder's best candidates by a short helper probe before the full solves
++//! (patch-gpu-pa-42.py; unset = unchanged).
+ 
+ use quip_solver_core::families::{FamilyContext, FamilySource};
+ use quip_solver_core::ising_generators::fastgen;
+@@ -516,6 +518,8 @@ where
+     };
+     // E84 helper solve: see patch-gpu-pa-40.py.
+     let bp = super::bp_helper::bp_cfg();
++    // E86 probe re-order: see patch-gpu-pa-42.py (None unless QUIP_OTSUKA_BP_PROBE_HELPER is set).
++    let bp_probe = bp.as_ref().and_then(super::bp_helper::probe_cfg);
+     if let Ok(path) = std::env::var("QUIP_OTSUKA_SCREEN_NONCES") {
+         // Bench only: solve the puzzles of the nonces listed in a file (one 64-hex nonce per line) with the
+         // full GPU pipeline, log each best energy and write the best state to QUIP_OTSUKA_SCREEN_DUMP/<nonce>.spins.
+@@ -965,7 +969,9 @@ where
+             // E85 (patch-gpu-pa-41.py): `rank` is the ladder rank (1 = the winner); it is logged only with
+             // QUIP_OTSUKA_BP_TOPK > 1, and only rank 1 falls back to our own anneal.
+             let topk = bp.as_ref().map_or(1, |b| b.topk);
+-            let solve_final = |c: &Cand, fr: usize, fs: usize, rank: usize| -> Result<Option<Vec<SamplerResult>>, SampleError> {
++            // E86 (patch-gpu-pa-42.py): `lrank` is Some(ladder rank) only on the probe path; `rank` is then the
++            // position in the probe order and the line carries both.
++            let solve_final = |c: &Cand, fr: usize, fs: usize, rank: usize, lrank: Option<usize>| -> Result<Option<Vec<SamplerResult>>, SampleError> {
+                 let Some(bpc) = bp.as_ref() else {
+                     return solve_one(c, fr, fs, "final");
+                 };
+@@ -975,7 +981,9 @@ where
+                     super::bp_helper::BpOutcome::Reads { reads: rs, helper_ms, redraws } => {
+                         let best = rs.iter().map(|r| r.energy_milli).min().unwrap_or(i64::MAX);
+                         let screened = shared.lock().unwrap_or_else(PoisonError::into_inner).screened;
+-                        if topk > 1 {
++                        if let Some(lrank) = lrank {
++                            tracing::info!(salt = c.idx, probe = c.score, best, ms = ts.elapsed().as_millis() as u64, screened, stage = "bp", helper_ms, reads = rs.len(), redraws, rank, lrank, "gpu-pa screen solve");
++                        } else if topk > 1 {
+                             tracing::info!(salt = c.idx, probe = c.score, best, ms = ts.elapsed().as_millis() as u64, screened, stage = "bp", helper_ms, reads = rs.len(), redraws, rank, "gpu-pa screen solve");
+                         } else {
+                             tracing::info!(salt = c.idx, probe = c.score, best, ms = ts.elapsed().as_millis() as u64, screened, stage = "bp", helper_ms, reads = rs.len(), redraws, "gpu-pa screen solve");
+@@ -1002,6 +1010,7 @@ where
+                     let mut alive: Vec<usize> = (0..batch.len()).collect();
+                     let mut lad_acc: Vec<f64> = vec![0.0; batch.len()];
+                     let mut last_order: Vec<usize> = Vec::new();
++                    let mut ext_order: Vec<usize> = Vec::new();
+                     for (ri, &(_, reads, sweeps, width)) in lad.iter().enumerate() {
+                         let tr = Instant::now();
+                         let mut scored: Vec<(i64, usize)> = Vec::with_capacity(alive.len());
+@@ -1064,11 +1073,100 @@ where
+                         if topk > 1 {
+                             last_order = scored.iter().map(|x| x.1).collect();
+                         }
++                        if bp_probe.is_some() {
++                            let cur: Vec<usize> = scored.iter().map(|x| x.1).collect();
++                            ext_order = super::bp_helper::merge_rung_order(&ext_order, &cur);
++                        }
+                         alive = scored.iter().take(keep).map(|x| x.1).collect();
+                         if alive.is_empty() {
+                             break;
+                         }
+                     }
++                    // E86 (patch-gpu-pa-42.py): with the probe helper, probe the best n final candidates, then the
++                    // top-K full solves follow the probe order. Without it this block is skipped and the E85 code
++                    // after it runs unchanged (kept at its old indentation inside the labelled block).
++                    'e86: {
++                    if let (Some(pc), Some(w)) = (bp_probe.as_ref(), alive.first().copied()) {
++                        let ext = super::bp_helper::with_first(&ext_order, w);
++                        let n = pc.n.min(ext.len());
++                        let span = n.max(topk).min(ext.len());
++                        // never screen a salt that may still be solved
++                        for (k, c) in batch.iter().enumerate() {
++                            if !ext[..span].contains(&k) {
++                                let _ = sink.screen(c.idx, c.energy);
++                            }
++                        }
++                        // positions in `ext` (ladder rank - 1) in the order the full solves follow
++                        let mut order: Vec<usize> = (0..span).collect();
++                        if !stopped() && fatal.is_none() {
++                            let c = &batch[w];
++                            let pick: String = lease.nonce(c.idx).iter().map(|b| format!("{b:02x}")).collect();
++                            tracing::info!(salt = c.idx, ms = t_lad.elapsed().as_millis() as u64, nonce = pick.as_str(), "gpu-pa ladder winner");
++                            if n > 1 {
++                                if let Some(bpc) = bp.as_ref() {
++                                    let _ = super::bp_helper::settle_main(bpc, &stopped);
++                                }
++                                let tp = Instant::now();
++                                let po = super::bp_helper::order_by_probe(
++                                    n,
++                                    &mut |j| {
++                                        let c = &batch[ext[j]];
++                                        let ts = Instant::now();
++                                        let (graph, _ctx) = build(c);
++                                        let out = super::bp_helper::probe(&pc.helper, &c.inst, &graph, &stopped);
++                                        match &out {
++                                            super::bp_helper::ProbeOutcome::Best { energy, helper_ms, stage, .. } => {
++                                                tracing::info!(salt = c.idx, best = *energy, ms = ts.elapsed().as_millis() as u64, lrank = j + 1, helper_ms = *helper_ms, stage = stage.as_str(), "gpu-pa bp probe");
++                                            }
++                                            super::bp_helper::ProbeOutcome::Failed(reason) => {
++                                                tracing::warn!(salt = c.idx, lrank = j + 1, reason = reason.as_str(), "gpu-pa bp probe failed; the salt keeps its ladder position after the probed ones");
++                                            }
++                                            super::bp_helper::ProbeOutcome::Cancelled => {
++                                                tracing::info!(salt = c.idx, ms = ts.elapsed().as_millis() as u64, "gpu-pa bp probe cancelled: the lease stopped");
++                                            }
++                                            super::bp_helper::ProbeOutcome::Down(_) => {}
++                                        }
++                                        out
++                                    },
++                                    &stopped,
++                                );
++                                let ms = tp.elapsed().as_millis() as u64;
++                                if let Some(reason) = po.down.as_deref() {
++                                    let salts = super::bp_helper::fmt_list(ext[..n].iter().map(|&k| batch[k].idx));
++                                    tracing::info!(reason, salts = %salts, ms, "gpu-pa bp probe skipped; ladder order");
++                                } else if !po.cancelled {
++                                    let salts = super::bp_helper::fmt_list(po.order.iter().map(|&j| batch[ext[j]].idx));
++                                    let bests = super::bp_helper::fmt_list(po.order.iter().map(|&j| po.best[j].map_or_else(|| "null".to_string(), |e| e.to_string())));
++                                    let lranks = super::bp_helper::fmt_list(po.order.iter().map(|&j| j + 1));
++                                    tracing::info!(salts = %salts, bests = %bests, lranks = %lranks, ms, "gpu-pa bp probe order");
++                                }
++                                order = po.order;
++                                order.extend(n..span);
++                                let _ = super::bp_helper::settle_probe(&pc.helper, &stopped);
++                            }
++                        }
++                        // probed (or extension) candidates that get no full solve: screened now, never pushed
++                        for &j in order.iter().skip(topk) {
++                            let c = &batch[ext[j]];
++                            let _ = sink.screen(c.idx, c.energy);
++                        }
++                        for (ri, &j) in order.iter().take(topk).enumerate() {
++                            let c = &batch[ext[j]];
++                            let mut pushed = false;
++                            if !stopped() && fatal.is_none() {
++                                if let Some(rs) = solve_final(c, fr, fs, ri + 1, Some(j + 1)).unwrap_or_else(|e| { fatal = Some(e); None }) {
++                                    best_solved = best_solved.min(rs.iter().map(|r| r.energy_milli).min().unwrap_or(i64::MAX));
++                                    solved += 1;
++                                    let _ = sink.push(c.idx, rs);
++                                    pushed = true;
++                                }
++                            }
++                            if !pushed {
++                                let _ = sink.screen(c.idx, c.energy);
++                            }
++                        }
++                        break 'e86;
++                    }
+                     let winner = alive.first().copied();
+                     let ranks: Vec<usize> = match winner {
+                         Some(w) if topk > 1 => super::bp_helper::topk_ranks(w, &last_order, topk),
+@@ -1086,7 +1184,7 @@ where
+                         if !stopped() && fatal.is_none() {
+                             let pick: String = lease.nonce(c.idx).iter().map(|b| format!("{b:02x}")).collect();
+                             tracing::info!(salt = c.idx, ms = t_lad.elapsed().as_millis() as u64, nonce = pick.as_str(), "gpu-pa ladder winner");
+-                            if let Some(rs) = solve_final(c, fr, fs, 1).unwrap_or_else(|e| { fatal = Some(e); None }) {
++                            if let Some(rs) = solve_final(c, fr, fs, 1, None).unwrap_or_else(|e| { fatal = Some(e); None }) {
+                                 best_solved = best_solved.min(rs.iter().map(|r| r.energy_milli).min().unwrap_or(i64::MAX));
+                                 solved += 1;
+                                 let _ = sink.push(c.idx, rs);
+@@ -1102,7 +1200,7 @@ where
+                         let c = &batch[k];
+                         let mut pushed = false;
+                         if !stopped() && fatal.is_none() {
+-                            if let Some(rs) = solve_final(c, fr, fs, ri + 1).unwrap_or_else(|e| { fatal = Some(e); None }) {
++                            if let Some(rs) = solve_final(c, fr, fs, ri + 1, None).unwrap_or_else(|e| { fatal = Some(e); None }) {
+                                 best_solved = best_solved.min(rs.iter().map(|r| r.energy_milli).min().unwrap_or(i64::MAX));
+                                 solved += 1;
+                                 let _ = sink.push(c.idx, rs);
+@@ -1113,6 +1211,7 @@ where
+                             let _ = sink.screen(c.idx, c.energy);
+                         }
+                     }
++                    }
+                 }
+                 (None, _) => {
+                     let c = &batch[0];
+diff --git a/tools/bp_fake_helper.py b/tools/bp_fake_helper.py
+index 200a10f..cb73b44 100644
+--- a/tools/bp_fake_helper.py
++++ b/tools/bp_fake_helper.py
+@@ -18,6 +18,10 @@ Options (the real helper's `--search-config X --serve --device N` are accepted a
+                      greedy descent only until it has made the fraction Qk (0..1) of the full descent's
+                      improvement; shifts past the list use the last value. The states stay exact, so the
+                      energies verify; Q 1.0 = the full descent (best), Q 0 = all-up only (worst).
++  --stage NAME       (patch 42) answer with stage NAME and screened_out true, as the real helper does when its
++                     probe config stops a solve at the probe (default: stage "fake", screened_out false)
++  --fail-match S     (patch 42) answer ok:false ("fake: scripted failure") when the instance path contains S
++  --bad-match S      (patch 42) like --bad-energy, only when the instance path contains S
+ """
+ import json
+ import os
+@@ -27,7 +31,8 @@ import time
+ 
+ 
+ def parse_args(argv):
+-    o = {"sleep": 0.0, "bad": False, "die_after": None, "ready_delay": 0.0, "ignore_cancel": False, "greedy": True, "plan": None}
++    o = {"sleep": 0.0, "bad": False, "die_after": None, "ready_delay": 0.0, "ignore_cancel": False, "greedy": True, "plan": None,
++         "stage": None, "fail_match": None, "bad_match": None}
+     i = 0
+     while i < len(argv):
+         a = argv[i]
+@@ -45,6 +50,12 @@ def parse_args(argv):
+             o["greedy"] = False
+         elif a == "--plan":
+             o["plan"] = [float(x) for x in argv[i + 1].split(",") if x.strip()]; i += 1
++        elif a == "--stage":
++            o["stage"] = argv[i + 1]; i += 1
++        elif a == "--fail-match":
++            o["fail_match"] = argv[i + 1]; i += 1
++        elif a == "--bad-match":
++            o["bad_match"] = argv[i + 1]; i += 1
+         elif a in ("--search-config", "--device"):
+             i += 1
+         i += 1
+@@ -120,6 +131,10 @@ def planned(q, h, edges, j):
+ 
+ 
+ def solve(req, opt):
++    path = str(req["instance"])
++    if opt["fail_match"] is not None and opt["fail_match"] in path:
++        raise RuntimeError("fake: scripted failure")
++    bad = opt["bad"] or (opt["bad_match"] is not None and opt["bad_match"] in path)
+     with open(req["instance"]) as fh:
+         inst = json.load(fh)
+     h, j = inst["h_milli"], inst["j_milli"]
+@@ -140,7 +155,7 @@ def solve(req, opt):
+         if key in seen:
+             continue
+         seen.add(key)
+-        e = energy(s, h, edges, j) + (1000 if opt["bad"] else 0)
++        e = energy(s, h, edges, j) + (1000 if bad else 0)
+         reads.append({"energy_milli": e, "spins": "".join("1" if x > 0 else "0" for x in s)})
+     reads.sort(key=lambda r: r["energy_milli"])
+     reads = reads[: max(1, min(64, int(req.get("max_reads", 8))))]
+@@ -197,11 +212,13 @@ def main():
+             continue
+         answered += 1
+         q = opt["plan"][min(int(msg.get("shift", 0)), len(opt["plan"]) - 1)] if opt["plan"] else None
+-        sys.stderr.write(f"FAKE_SOLVED id={rid} shift={msg.get('shift', 0)} q={q} best_milli={reads[0]['energy_milli']} reads={len(reads)}\n")
++        sys.stderr.write(f"FAKE_SOLVED id={rid} shift={msg.get('shift', 0)} q={q} best_milli={reads[0]['energy_milli']} reads={len(reads)}"
++                         + (f" stage={opt['stage']}" if opt["stage"] else "") + "\n")
+         sys.stderr.flush()
+         out({
+             "id": rid, "ok": True, "energy_milli": reads[0]["energy_milli"], "reads": reads,
+-            "solve_ms": int((time.monotonic() - t0) * 1000), "stage": "fake", "screened_out": False,
++            "solve_ms": int((time.monotonic() - t0) * 1000),
++            "stage": opt["stage"] or "fake", "screened_out": opt["stage"] is not None,
+         })
+ 
+ 
+-- 
+2.47.1
+

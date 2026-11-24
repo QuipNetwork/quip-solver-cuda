@@ -1,0 +1,315 @@
+From 676cfcf2456d58830e0446d9d5baf26069636490 Mon Sep 17 00:00:00 2001
+From: rdyplayerB <rdyplayerb@gmail.com>
+Date: Mon, 23 Nov 2026 12:09:47 -0800
+Subject: [PATCH 2/2] feat(otsuka): probe gate on the full solve
+
+QUIP_OTSUKA_BP_SOLVE_MAX=<milli, offset included>: a probed candidate gets the full
+solve only when its verified probe energy is at or under the limit; the walk over the
+probe order stops at the first candidate above it. Nothing clears: no full solve, the
+miner goes to the next ladder. No verified probe: the limit is not applied.
+---
+ src/cluster/bp_helper.rs    | 191 +++++++++++++++++++++++++++++++++++-
+ src/cluster/screen_lease.rs |  29 +++++-
+ 2 files changed, 215 insertions(+), 5 deletions(-)
+
+diff --git a/src/cluster/bp_helper.rs b/src/cluster/bp_helper.rs
+index 948c10f..9c74148 100644
+--- a/src/cluster/bp_helper.rs
++++ b/src/cluster/bp_helper.rs
+@@ -47,6 +47,15 @@
+ //!
+ //! If the probe helper cannot start or dies, the ladder order is used (one warning per outage) until it is
+ //! back (respawn at most once a minute, as for the main helper).
++//!
++//! Patch 43 (E88), off by default:
++//! * `QUIP_OTSUKA_BP_SOLVE_MAX=<milli>` (offset included, e.g. `-5084000`): with the probe on, a candidate
++//!   gets a full solve only when its verified probe energy is <= this limit. The candidates are walked in
++//!   probe order, up to top-K, and the walk stops at the first one that does not clear it (failed or
++//!   unprobed candidates never clear it). When none clears it the ladder ends without a full solve (and
++//!   without the long-anneal fallback). When no probe verified at all (every probe failed, or the probe
++//!   helper is down) the limit is not applied: patch 42 behaviour. Unset or empty = off; unparsable = off
++//!   (shown as `solve_max="off"` in the `bp probe configured` line).
+ 
+ use quip_solver_core::ising_generators::instance::Instance;
+ use quip_solver_core::quip_protocol::scoring::energy_milli;
+@@ -229,6 +238,17 @@ pub struct ProbeCfg {
+     pub helper: BpCfg,
+     /// Candidates probed, 2..=16.
+     pub n: usize,
++    /// Patch 43: full-solve limit on the verified probe energy (offset included); `None` = off.
++    pub solve_max: Option<i64>,
++    /// Patch 43: `QUIP_OTSUKA_BP_SOLVE_MAX` was set (non-blank), even if unparsable; only then does the
++    /// configured line carry `solve_max`.
++    pub solve_max_set: bool,
++}
++
++/// `QUIP_OTSUKA_BP_SOLVE_MAX`: an integer (milli, offset included); blank or unparsable = `None` (off).
++#[must_use]
++pub fn parse_solve_max(v: &str) -> Option<i64> {
++    v.trim().parse::<i64>().ok()
+ }
+ 
+ /// `QUIP_OTSUKA_BP_PROBE_N`: 2..=16; unparsable = 4, out of range is clamped.
+@@ -249,7 +269,9 @@ pub fn probe_cfg_with(main: &BpCfg, get: &dyn Fn(&str) -> Option<String>) -> Opt
+     helper.timeout = Duration::from_secs(get("QUIP_OTSUKA_BP_PROBE_TIMEOUT_S").and_then(|v| v.trim().parse().ok()).unwrap_or(30));
+     helper.reads = 1;
+     let n = get("QUIP_OTSUKA_BP_PROBE_N").map_or(4, |v| parse_probe_n(&v));
+-    Some(ProbeCfg { helper, n })
++    let sm = get("QUIP_OTSUKA_BP_SOLVE_MAX").filter(|v| !v.trim().is_empty());
++    let solve_max = sm.as_deref().and_then(parse_solve_max);
++    Some(ProbeCfg { helper, n, solve_max, solve_max_set: sm.is_some() })
+ }
+ 
+ /// `probe_cfg_with` on the environment; logs the configuration once per process. Call only when the main
+@@ -259,7 +281,13 @@ pub fn probe_cfg(main: &BpCfg) -> Option<ProbeCfg> {
+     let pc = probe_cfg_with(main, &|k| std::env::var(k).ok())?;
+     static LOGGED: Once = Once::new();
+     LOGGED.call_once(|| {
+-        tracing::info!(cmd = pc.helper.cmd.as_str(), n = pc.n, timeout_s = pc.helper.timeout.as_secs(), "gpu-pa bp probe configured");
++        if let Some(m) = pc.solve_max {
++            tracing::info!(cmd = pc.helper.cmd.as_str(), n = pc.n, timeout_s = pc.helper.timeout.as_secs(), solve_max = m, "gpu-pa bp probe configured");
++        } else if pc.solve_max_set {
++            tracing::info!(cmd = pc.helper.cmd.as_str(), n = pc.n, timeout_s = pc.helper.timeout.as_secs(), solve_max = "off", "gpu-pa bp probe configured");
++        } else {
++            tracing::info!(cmd = pc.helper.cmd.as_str(), n = pc.n, timeout_s = pc.helper.timeout.as_secs(), "gpu-pa bp probe configured");
++        }
+     });
+     Some(pc)
+ }
+@@ -358,6 +386,58 @@ pub fn order_by_probe(n: usize, probe: &mut dyn FnMut(usize) -> ProbeOutcome, st
+     ProbeOrder { order, best, cancelled, down }
+ }
+ 
++/// Patch 43: how many entries of the solve order get a full solve.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SolveCut {
++    /// No limit configured, or probing was cancelled: top-K as in patch 42.
++    Off,
++    /// The limit is set but no probe verified (every probe failed, or the helper is down): top-K as in
++    /// patch 42. `down` = the probe helper is down (its own warning already covers it).
++    NoVerified {
++        /// The probe helper is down.
++        down: bool,
++    },
++    /// The limit applies: this many leading entries of the order (0..=top-K) clear it.
++    Applied(usize),
++}
++
++impl SolveCut {
++    /// Full solves to run out of `topk`.
++    #[must_use]
++    pub const fn count(self, topk: usize) -> usize {
++        match self {
++            Self::Off | Self::NoVerified { .. } => topk,
++            Self::Applied(k) => k,
++        }
++    }
++}
++
++/// Patch 43: apply `QUIP_OTSUKA_BP_SOLVE_MAX` to a probe result. `order` is the solve order (positions,
++/// probe order first, then unprobed extension positions); `po.best` holds the verified probe energies.
++/// Walks the first `topk` entries of `order` and counts them while each one's verified probe energy is
++/// <= `limit`, stopping at the first that is not (a failed or unprobed entry never clears it).
++#[must_use]
++pub fn solve_cut(po: &ProbeOrder, order: &[usize], topk: usize, limit: Option<i64>) -> SolveCut {
++    let Some(limit) = limit else {
++        return SolveCut::Off;
++    };
++    if po.cancelled {
++        return SolveCut::Off;
++    }
++    if po.down.is_some() {
++        return SolveCut::NoVerified { down: true };
++    }
++    if po.best.iter().all(Option::is_none) {
++        return SolveCut::NoVerified { down: false };
++    }
++    let k = order
++        .iter()
++        .take(topk)
++        .take_while(|&&j| po.best.get(j).copied().flatten().is_some_and(|e| e <= limit))
++        .count();
++    SolveCut::Applied(k)
++}
++
+ /// The helper's environment: only the variables PROTOCOL.md lists, taken from ours, plus
+ /// `QUIP_TWO_PASS_REFINEMENT=native-cluster-rebase`.
+ #[must_use]
+@@ -1635,4 +1715,111 @@ mod tests {
+         }
+         assert!(checked > 0);
+     }
++
++    // ---- patch 43 ----
++
++    fn po(best: Vec<Option<i64>>) -> ProbeOrder {
++        let n = best.len();
++        let mut order: Vec<usize> = (0..n).collect();
++        order.sort_by_key(|&k| (best[k].is_none(), best[k].unwrap_or(i64::MAX)));
++        ProbeOrder { order, best, cancelled: false, down: None }
++    }
++
++    #[test]
++    fn solve_max_cfg() {
++        assert_eq!(parse_solve_max("-5084000"), Some(-5_084_000));
++        assert_eq!(parse_solve_max(" -5084000 "), Some(-5_084_000));
++        assert_eq!(parse_solve_max(""), None);
++        assert_eq!(parse_solve_max("-5084.0"), None);
++        assert_eq!(parse_solve_max("off"), None);
++        let main = BpCfg::with_cmd("main --serve").unwrap();
++        let get = |sm: Option<&'static str>| {
++            move |k: &str| match k {
++                "QUIP_OTSUKA_BP_PROBE_HELPER" => Some("probe".to_string()),
++                "QUIP_OTSUKA_BP_SOLVE_MAX" => sm.map(str::to_string),
++                _ => None,
++            }
++        };
++        // unset / blank: off and not shown
++        let pc = probe_cfg_with(&main, &get(None)).unwrap();
++        assert_eq!((pc.solve_max, pc.solve_max_set), (None, false));
++        let pc = probe_cfg_with(&main, &get(Some("  "))).unwrap();
++        assert_eq!((pc.solve_max, pc.solve_max_set), (None, false));
++        // set: on; garbage: off but shown
++        let pc = probe_cfg_with(&main, &get(Some("-5084000"))).unwrap();
++        assert_eq!((pc.solve_max, pc.solve_max_set), (Some(-5_084_000), true));
++        let pc = probe_cfg_with(&main, &get(Some("x"))).unwrap();
++        assert_eq!((pc.solve_max, pc.solve_max_set), (None, true));
++        // without the probe helper there is no probe config, so the limit cannot apply
++        assert!(probe_cfg_with(&main, &|k| (k == "QUIP_OTSUKA_BP_SOLVE_MAX").then(|| "-5084000".to_string())).is_none());
++    }
++
++    #[test]
++    fn solve_cut_rules() {
++        let lim = Some(-5_084_000);
++        // limit off: top-K as before, whatever the probes say
++        let p = po(vec![Some(-5_080_000), Some(-5_070_000)]);
++        assert_eq!(solve_cut(&p, &p.order, 1, None), SolveCut::Off);
++        assert_eq!(solve_cut(&p, &p.order, 1, None).count(1), 1);
++        assert_eq!(solve_cut(&p, &p.order, 2, None).count(2), 2);
++        // best clears (TOPK 1)
++        let p = po(vec![Some(-5_082_000), Some(-5_086_000), Some(-5_079_000), Some(-5_083_000)]);
++        assert_eq!(p.order, vec![1, 3, 0, 2]);
++        assert_eq!(solve_cut(&p, &p.order, 1, lim), SolveCut::Applied(1));
++        // best fails the limit: nothing solved
++        let p = po(vec![Some(-5_082_000), Some(-5_083_999), Some(-5_079_000), Some(-5_083_000)]);
++        assert_eq!(solve_cut(&p, &p.order, 1, lim), SolveCut::Applied(0));
++        assert_eq!(solve_cut(&p, &p.order, 2, lim).count(2), 0);
++        // TOPK 2: rank 2 clears / does not clear
++        let p = po(vec![Some(-5_082_000), Some(-5_086_000), Some(-5_079_000), Some(-5_085_000)]);
++        assert_eq!(solve_cut(&p, &p.order, 2, lim), SolveCut::Applied(2));
++        let p = po(vec![Some(-5_082_000), Some(-5_086_000), Some(-5_079_000), Some(-5_083_000)]);
++        assert_eq!(solve_cut(&p, &p.order, 2, lim), SolveCut::Applied(1));
++        // TOPK larger than what clears, and than the order
++        let p = po(vec![Some(-5_090_000), Some(-5_086_000)]);
++        assert_eq!(solve_cut(&p, &p.order, 8, lim), SolveCut::Applied(2));
++        // ties: exactly at the limit clears (<=); equal probes keep ladder order and both clear
++        let p = po(vec![Some(-5_084_000), Some(-5_084_000), Some(-5_083_999)]);
++        assert_eq!(p.order, vec![0, 1, 2]);
++        assert_eq!(solve_cut(&p, &p.order, 1, lim), SolveCut::Applied(1));
++        assert_eq!(solve_cut(&p, &p.order, 3, lim), SolveCut::Applied(2));
++        // a failed probe never clears: rank 2 is a failed probe after one that clears
++        let p = po(vec![None, Some(-5_086_000), None, None]);
++        assert_eq!(p.order, vec![1, 0, 2, 3]);
++        assert_eq!(solve_cut(&p, &p.order, 2, lim), SolveCut::Applied(1));
++        // the ladder winner's probe failed and the only verified probe is above the limit: nothing solved
++        let p = po(vec![None, Some(-5_080_000), Some(-5_070_000), None]);
++        assert_eq!(solve_cut(&p, &p.order, 2, lim), SolveCut::Applied(0));
++        // unprobed extension entries (TOPK > n) never clear
++        let p = po(vec![Some(-5_090_000), Some(-5_089_000)]);
++        let mut order = p.order.clone();
++        order.extend(2..4);
++        assert_eq!(solve_cut(&p, &order, 4, lim), SolveCut::Applied(2));
++        // every probe failed: the limit is not applied (patch 42 behaviour: top-K in ladder order)
++        let p = po(vec![None, None, None, None]);
++        assert_eq!(solve_cut(&p, &p.order, 2, lim), SolveCut::NoVerified { down: false });
++        assert_eq!(solve_cut(&p, &p.order, 2, lim).count(2), 2);
++        // the probe helper is down (even after a verified probe): not applied
++        let mut p = po(vec![Some(-5_070_000), None, None, None]);
++        p.down = Some("gone".into());
++        p.order = vec![0, 1, 2, 3];
++        assert_eq!(solve_cut(&p, &p.order, 1, lim), SolveCut::NoVerified { down: true });
++        assert_eq!(solve_cut(&p, &p.order, 1, lim).count(1), 1);
++        // probing cancelled (the lease stopped): off; nothing is solved anyway since the lease stopped
++        let mut p = po(vec![Some(-5_070_000), None]);
++        p.cancelled = true;
++        assert_eq!(solve_cut(&p, &p.order, 1, lim), SolveCut::Off);
++    }
++
++    #[test]
++    fn solve_cut_on_real_probe_orders() {
++        // order_by_probe output fed straight in, as the lease does
++        let o = order_by_probe(4, &mut scripted(vec![best(-5_083_000), best(-5_085_500), ProbeOutcome::Failed("x".into()), best(-5_084_000)]), &|| false);
++        assert_eq!(o.order, vec![1, 3, 0, 2]);
++        assert_eq!(solve_cut(&o, &o.order, 2, Some(-5_084_000)), SolveCut::Applied(2));
++        assert_eq!(solve_cut(&o, &o.order, 2, Some(-5_085_000)), SolveCut::Applied(1));
++        assert_eq!(solve_cut(&o, &o.order, 2, Some(-5_086_000)), SolveCut::Applied(0));
++        let o = order_by_probe(3, &mut |k| if k == 0 { best(-5_090_000) } else { ProbeOutcome::Down("gone".into()) }, &|| false);
++        assert_eq!(solve_cut(&o, &o.order, 1, Some(-5_095_000)), SolveCut::NoVerified { down: true });
++    }
+ }
+diff --git a/src/cluster/screen_lease.rs b/src/cluster/screen_lease.rs
+index 8a1b080..4917667 100644
+--- a/src/cluster/screen_lease.rs
++++ b/src/cluster/screen_lease.rs
+@@ -20,7 +20,9 @@
+ //! see bp_helper.rs (unset = unchanged). E85: `QUIP_OTSUKA_BP_TOPK=k` also solves ranks 2..k of the last
+ //! rung through the helper (patch-gpu-pa-41.py; 1 = unchanged). E86: `QUIP_OTSUKA_BP_PROBE_HELPER=<cmd>`
+ //! re-orders the ladder's best candidates by a short helper probe before the full solves
+-//! (patch-gpu-pa-42.py; unset = unchanged).
++//! (patch-gpu-pa-42.py; unset = unchanged). E88: `QUIP_OTSUKA_BP_SOLVE_MAX=<milli>` full-solves a probed
++//! candidate only when its verified probe energy is at or under the limit (patch-gpu-pa-43.py; unset =
++//! unchanged).
+ 
+ use quip_solver_core::families::{FamilyContext, FamilySource};
+ use quip_solver_core::ising_generators::fastgen;
+@@ -1098,6 +1100,8 @@ where
+                         }
+                         // positions in `ext` (ladder rank - 1) in the order the full solves follow
+                         let mut order: Vec<usize> = (0..span).collect();
++                        // E88 (patch-gpu-pa-43.py): full solves to run, top-K unless QUIP_OTSUKA_BP_SOLVE_MAX cuts it
++                        let mut solve_n = topk;
+                         if !stopped() && fatal.is_none() {
+                             let c = &batch[w];
+                             let pick: String = lease.nonce(c.idx).iter().map(|b| format!("{b:02x}")).collect();
+@@ -1140,17 +1144,36 @@ where
+                                     let lranks = super::bp_helper::fmt_list(po.order.iter().map(|&j| j + 1));
+                                     tracing::info!(salts = %salts, bests = %bests, lranks = %lranks, ms, "gpu-pa bp probe order");
+                                 }
++                                // E88 (patch-gpu-pa-43.py): only candidates whose verified probe clears the limit
++                                let mut cut_order = po.order.clone();
++                                cut_order.extend(n..span);
++                                let cut = super::bp_helper::solve_cut(&po, &cut_order, topk, pc.solve_max);
++                                if let (Some(limit), Some(&j0)) = (pc.solve_max, po.order.first()) {
++                                    let probes = po.best.iter().filter(|b| b.is_some()).count();
++                                    match cut {
++                                        super::bp_helper::SolveCut::Applied(0) => {
++                                            let best = po.best.get(j0).copied().flatten().unwrap_or(i64::MAX);
++                                            let salt = batch[ext[j0]].idx;
++                                            tracing::info!(best, limit, salt, probes, "gpu-pa bp solve skipped: best probe above the limit");
++                                        }
++                                        super::bp_helper::SolveCut::NoVerified { down: false } => {
++                                            tracing::warn!(limit, probes = n, "gpu-pa bp solve limit not applied: no probe verified; solving in ladder order");
++                                        }
++                                        _ => {}
++                                    }
++                                }
++                                solve_n = cut.count(topk);
+                                 order = po.order;
+                                 order.extend(n..span);
+                                 let _ = super::bp_helper::settle_probe(&pc.helper, &stopped);
+                             }
+                         }
+                         // probed (or extension) candidates that get no full solve: screened now, never pushed
+-                        for &j in order.iter().skip(topk) {
++                        for &j in order.iter().skip(solve_n) {
+                             let c = &batch[ext[j]];
+                             let _ = sink.screen(c.idx, c.energy);
+                         }
+-                        for (ri, &j) in order.iter().take(topk).enumerate() {
++                        for (ri, &j) in order.iter().take(solve_n).enumerate() {
+                             let c = &batch[ext[j]];
+                             let mut pushed = false;
+                             if !stopped() && fatal.is_none() {
+-- 
+2.47.1
+
