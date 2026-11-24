@@ -243,7 +243,27 @@ extern "C" __global__ void native_strong_defect_seed_probe(const int*eu,const in
 // Revisit a selected decision without altering its incoming factor-message sum.
 __device__ __forceinline__ void native_backtrack_field(float&h,float&b,int strength){float cavity=h-b;float amplitude=fabsf(cavity)+float(strength);b=h>0.f?-amplitude:amplitude;h=cavity+b;}
 extern "C" __global__ void native_backtrack_field_probe(const float*input,int count,int strength,float*out){int u=blockIdx.x*blockDim.x+threadIdx.x;if(u<count){float h=input[2*u],b=input[2*u+1];native_backtrack_field(h,b,strength);out[2*u]=h;out[2*u+1]=b;}}
-extern "C" __global__ __launch_bounds__(512,1) void loop_factor_bp(
+__device__ __forceinline__ float fsel4(float4 a,int i){return i==0?a.x:(i==1?a.y:(i==2?a.z:a.w));}
+
+// Thread-count generic copies of the reductions used by loop_factor_bp (QUIP_NT threads per block;
+// integer / xor reductions are exact in any order, so QUIP_NT=256 gives the same values as 512).
+#ifndef QUIP_NT
+#define QUIP_NT 512
+#endif
+__device__ __forceinline__ void native_energy_reduce_nt(int value,int tid,int*sums){
+#if QUIP_FAST_INTEGER_REDUCTION
+ int lane=tid&31;for(int offset=16;offset;offset>>=1){int other=__shfl_down_sync(0xffffffff,value,offset);if(lane+offset<32)value+=other;}
+ if(lane==0)sums[tid>>5]=value;__syncthreads();
+ if(tid<32){int total=tid<(QUIP_NT/32)?sums[tid]:0;for(int offset=16;offset;offset>>=1){int other=__shfl_down_sync(0xffffffff,total,offset);if(lane+offset<32)total+=other;}if(tid==0)sums[0]=total;}
+ __syncthreads();
+#else
+ sums[tid]=value;__syncthreads();for(int step=QUIP_NT/2;step;step>>=1){if(tid<step)sums[tid]+=sums[tid+step];__syncthreads();}
+#endif
+}
+__device__ __forceinline__ int record_reduce_nt(unsigned key,int tid,int*sums){sums[tid]=int(key);__syncthreads();for(int step=QUIP_NT/2;step;step>>=1){if(tid<step)sums[tid]^=sums[tid+step];__syncthreads();}return unsigned(sums[0])&31u;}
+__device__ __forceinline__ int record_cell_nt(const float*h,int n,int tid,int*sums){unsigned key=0;bool first=h[0]>0;for(int u=tid;u<n;u+=QUIP_NT)if((h[u]>0)!=first)key^=record_mix(unsigned(u));return record_reduce_nt(key,tid,sums);}
+__device__ __forceinline__ int record_strong_reduce_nt(int local,int tid,int*sums){sums[tid]=local;__syncthreads();for(int step=QUIP_NT/2;step;step>>=1){if(tid<step)sums[tid]+=sums[tid+step];__syncthreads();}return sums[0]<32?sums[0]:-1;}
+extern "C" __global__ __launch_bounds__(QUIP_NT,512/QUIP_NT) void loop_factor_bp(
  const int*eu,const int*ev,const int*ej,const int*eo,int ec,int edges,
  const int*rn,const int*roff,const int*taboff,const int*q2,const int*fixed,
  const int*rc,int colors,int regions,int slots,const int*fields,int n,int constant,
@@ -259,14 +279,29 @@ extern "C" __global__ __launch_bounds__(512,1) void loop_factor_bp(
  float*h=smem,*b=h+n;int*sums=(int*)(b+n);
  unsigned long long rng=*seed_ptr^(0x9e3779b97f4a7c15ULL*(r+1))^(tid+1);
  if(start==0){
-  if(guided_mode){for(int e=tid;e<edges;e+=512)edge_penalties[r*edges+e]=0;if(tid==0)last_best[r]=2147483647;}
+  if(guided_mode){for(int e=tid;e<edges;e+=QUIP_NT)edge_penalties[r*edges+e]=0;if(tid==0)last_best[r]=2147483647;}
+#if QUIP_NT==512
   for(int u=tid;u<n;u+=512){float noise=((next_rng(rng)>>40)*(1.f/16777216.f)-.5f);b[u]=initial_mode==3&&unpin_mask[r*n+u]==0?float(initial_bias[r*n+u]):initial_mode?native_seed_initial(r,initial_bias[(initial_mode>=2?r*n:0)+u],noise):noise;h[u]=working_fields[u]+b[u];}
-  for(int e=tid;e<edges;e+=512)em[r*edges+e]=make_float2(0,0);
-  for(int e=tid;e<slots;e+=512)rm[r*slots+e]=0.f;
-  for(int e=tid;e<jtables;e+=512)jm[r*jtables+e]=0.f;
- }else for(int u=tid;u<n;u+=512){h[u]=gh[r*n+u];b[u]=gb[r*n+u];}
+#else
+  for(int vt=tid;vt<512;vt+=QUIP_NT){unsigned long long rng=*seed_ptr^(0x9e3779b97f4a7c15ULL*(r+1))^(vt+1);for(int u=vt;u<n;u+=512){float noise=((next_rng(rng)>>40)*(1.f/16777216.f)-.5f);b[u]=initial_mode==3&&unpin_mask[r*n+u]==0?float(initial_bias[r*n+u]):initial_mode?native_seed_initial(r,initial_bias[(initial_mode>=2?r*n:0)+u],noise):noise;h[u]=working_fields[u]+b[u];}}
+#endif
+  for(int e=tid;e<edges;e+=QUIP_NT)em[r*edges+e]=make_float2(0,0);
+  for(int e=tid;e<slots;e+=QUIP_NT)rm[r*slots+e]=0.f;
+  for(int e=tid;e<jtables;e+=QUIP_NT)jm[r*jtables+e]=0.f;
+ }else for(int u=tid;u<n;u+=QUIP_NT){h[u]=gh[r*n+u];b[u]=gb[r*n+u];}
  if(start==0&&tid==0){adapt_state[r*3]=0.f;adapt_state[r*3+1]=0.f;adapt_state[r*3+2]=0.f;}
  __syncthreads();float damping=QUIP_DAMPING_BASE+QUIP_DAMPING_STEP*(r%6),weight=native_region_weight(r,start,sweep_policy);
+#ifndef QUIP_NO_FAST_SWEEPS
+ // Fast sweeps: same arithmetic in the same order as the generic loops below, with wide loads,
+ // register-resident 4-entry junction tables and the next edge colour prefetched while waiting at the barrier.
+ const bool fast_edges=!guided_mode&&!edge_unary_mode&&!(sweep_policy&(4|8|16))&&!(thermal_messages&&r>=QUIP_MINSUM_REPLICAS);
+ __shared__ int fast_reg_ok;
+ if(tid==0)fast_reg_ok=(slots==4*regions)&&(jtables%4==0)&&!((((unsigned long long)rm)|((unsigned long long)rn)|((unsigned long long)physical)|((unsigned long long)q2)|((unsigned long long)working_fixed)|((unsigned long long)wfx_b)|((unsigned long long)jm)|((unsigned long long)jmaps))&15ULL);
+ __syncthreads();
+ for(int t=tid;t<=regions;t+=QUIP_NT)if(roff[t]!=4*t||taboff[t]!=16*t)fast_reg_ok=0;
+ __syncthreads();
+ const bool fast_regions=fast_reg_ok&&!mplp&&!(thermal_messages&&r>=QUIP_MINSUM_REPLICAS);
+#endif
  for(int iter=start;iter<start+count;iter++){
   if(sweep_policy&2)weight=native_region_weight(r,iter,sweep_policy);
   float wbeta=wsched?fmaxf(0.f,1.f-float(iter)/ramp_base_arg):0.f;
@@ -283,22 +318,47 @@ extern "C" __global__ __launch_bounds__(512,1) void loop_factor_bp(
 #endif
   if(reinforcement_epoch>0&&iter==reinforcement_epoch){
    if(release_mode>=2&&!external_backtrack){
-    for(int u=tid;u<n;u+=512)unpin_mask[r*n+u]=0;__syncthreads();
-    for(int t=tid;t<regions;t+=512){int mask=0;for(int u=roff[t];u<roff[t+1];u++)mask|=(h[rn[u]]<=0)<<(u-roff[t]);if(q2[taboff[t]+mask]!=0){for(int u=roff[t];u<roff[t+1];u++)atomicOr(unpin_mask+r*n+rn[u],1);}}__syncthreads();
-    if(seed_strong_defects)native_seed_strong_defects(eu,ev,ej,edges,h,unpin_mask+r*n,tid,512);__syncthreads();
-    for(int e=tid;e<edges;e+=512)if(abs(ej[e])>=1000){int u=eu[e],v=ev[e];if(atomicOr(unpin_mask+r*n+u,0)&1)atomicOr(unpin_mask+r*n+v,2);if(atomicOr(unpin_mask+r*n+v,0)&1)atomicOr(unpin_mask+r*n+u,2);}__syncthreads();
+    for(int u=tid;u<n;u+=QUIP_NT)unpin_mask[r*n+u]=0;__syncthreads();
+    for(int t=tid;t<regions;t+=QUIP_NT){int mask=0;for(int u=roff[t];u<roff[t+1];u++)mask|=(h[rn[u]]<=0)<<(u-roff[t]);if(q2[taboff[t]+mask]!=0){for(int u=roff[t];u<roff[t+1];u++)atomicOr(unpin_mask+r*n+rn[u],1);}}__syncthreads();
+    if(seed_strong_defects)native_seed_strong_defects(eu,ev,ej,edges,h,unpin_mask+r*n,tid,QUIP_NT);__syncthreads();
+    for(int e=tid;e<edges;e+=QUIP_NT)if(abs(ej[e])>=1000){int u=eu[e],v=ev[e];if(atomicOr(unpin_mask+r*n+u,0)&1)atomicOr(unpin_mask+r*n+v,2);if(atomicOr(unpin_mask+r*n+v,0)&1)atomicOr(unpin_mask+r*n+u,2);}__syncthreads();
    }
-   for(int u=tid;u<n;u+=512)if(release_mode<2||unpin_mask[r*n+u]!=0){if(external_backtrack)native_backtrack_field(h[u],b[u],kick_strength);else{h[u]-=b[u];b[u]=0.f;}}__syncthreads();
+   for(int u=tid;u<n;u+=QUIP_NT)if(release_mode<2||unpin_mask[r*n+u]!=0){if(external_backtrack)native_backtrack_field(h[u],b[u],kick_strength);else{h[u]-=b[u];b[u]=0.f;}}__syncthreads();
    if(release_mode>=3){
-    for(int c=0;c<ec;c++){for(int e=eo[c]+tid;e<eo[c+1];e+=512){int u=eu[e],v=ev[e];if(unpin_mask[r*n+u]||unpin_mask[r*n+v]){float2 old=em[r*edges+e];h[u]-=old.x;h[v]-=old.y;em[r*edges+e]=make_float2(0.f,0.f);}}__syncthreads();}
-    for(int c=0;c<colors;c++){for(int t=rc[c]+tid;t<rc[c+1];t+=512){int at=roff[t];bool clear=false;for(int u=at;u<roff[t+1];u++)clear|=unpin_mask[r*n+rn[u]]!=0;if(clear){for(int u=at;u<roff[t+1];u++){if(r<QUIP_MINSUM_REPLICAS||physical[u])h[rn[u]]-=rm[r*slots+u];rm[r*slots+u]=0.f;}if(r>=QUIP_MINSUM_REPLICAS)for(int k=jo[t];k<jo[t+1];k++){int d=jdirs[k];for(int v=joffset[d];v<joffset[d+1];v++)jm[r*jtables+v]=0.f;}}}__syncthreads();}
-    if(release_mode==4){for(int u=tid;u<n;u+=512){gh[r*n+u]=h[u];gb[r*n+u]=b[u];}return;}
+    for(int c=0;c<ec;c++){for(int e=eo[c]+tid;e<eo[c+1];e+=QUIP_NT){int u=eu[e],v=ev[e];if(unpin_mask[r*n+u]||unpin_mask[r*n+v]){float2 old=em[r*edges+e];h[u]-=old.x;h[v]-=old.y;em[r*edges+e]=make_float2(0.f,0.f);}}__syncthreads();}
+    for(int c=0;c<colors;c++){for(int t=rc[c]+tid;t<rc[c+1];t+=QUIP_NT){int at=roff[t];bool clear=false;for(int u=at;u<roff[t+1];u++)clear|=unpin_mask[r*n+rn[u]]!=0;if(clear){for(int u=at;u<roff[t+1];u++){if(r<QUIP_MINSUM_REPLICAS||physical[u])h[rn[u]]-=rm[r*slots+u];rm[r*slots+u]=0.f;}if(r>=QUIP_MINSUM_REPLICAS)for(int k=jo[t];k<jo[t+1];k++){int d=jdirs[k];for(int v=joffset[d];v<joffset[d+1];v++)jm[r*jtables+v]=0.f;}}}__syncthreads();}
+    if(release_mode==4){for(int u=tid;u<n;u+=QUIP_NT){gh[r*n+u]=h[u];gb[r*n+u]=b[u];}return;}
    }
   }
   for(int stage=0;stage<native_message_stages(colors,sweep_policy);stage++){
   int2 pair_bounds=native_message_bounds(stage,ec,colors,sweep_policy,true),region_bounds=native_message_bounds(stage,ec,colors,sweep_policy,false);
+#ifndef QUIP_NO_FAST_SWEEPS
+  if(fast_edges){
+   int fU[3],fV[3];float fJ[3];float2 fO[3];int cb=0,cn=0;
+#define FE_LOAD() do{_Pragma("unroll") for(int k=0;k<3;k++){int e=cb+tid+QUIP_NT*k;if(e<cn){fU[k]=__ldg(eu+e);fV[k]=__ldg(ev+e);int wj=__ldg(working_ej+e);fJ[k]=wbeta>0.f?float(wj)+wbeta*float(__ldg(wej_b+e)-wj):float(wj);fO[k]=em[r*edges+e];}}}while(0)
+   if(pair_bounds.x<pair_bounds.y){int c=native_sweep_color(pair_bounds.x,ec,iter,sweep_policy);cb=eo[c];cn=eo[c+1];FE_LOAD();}
+   for(int sweep=pair_bounds.x;sweep<pair_bounds.y;sweep++){
+    #pragma unroll
+    for(int k=0;k<3;k++){int e=cb+tid+QUIP_NT*k;if(e<cn){
+     int u=fU[k],v=fV[k];float j=fJ[k];float2 old=fO[k];float hu=h[u]-old.x,hv=h[v]-old.y;
+     float mu=-(j>0?1.f:-1.f)*fminf(fabsf(j),fmaxf(-fabsf(j),hv));
+     float mv=-(j>0?1.f:-1.f)*fminf(fabsf(j),fmaxf(-fabsf(j),hu));
+     float a=old.x+damping_now*(mu-old.x),bb=old.y+damping_now*(mv-old.y);
+     h[u]+=a-old.x;h[v]+=bb-old.y;em[r*edges+e]=make_float2(a,bb);}}
+    for(int e=cb+tid+3*QUIP_NT;e<cn;e+=QUIP_NT){
+     int u=eu[e],v=ev[e];float j=wbeta>0.f?float(working_ej[e])+wbeta*float(wej_b[e]-working_ej[e]):float(working_ej[e]);float2 old=em[r*edges+e];float hu=h[u]-old.x,hv=h[v]-old.y;
+     float mu=-(j>0?1.f:-1.f)*fminf(fabsf(j),fmaxf(-fabsf(j),hv));
+     float mv=-(j>0?1.f:-1.f)*fminf(fabsf(j),fmaxf(-fabsf(j),hu));
+     float a=old.x+damping_now*(mu-old.x),bb=old.y+damping_now*(mv-old.y);
+     h[u]+=a-old.x;h[v]+=bb-old.y;em[r*edges+e]=make_float2(a,bb);}
+    if(sweep+1<pair_bounds.y){int c=native_sweep_color(sweep+1,ec,iter,sweep_policy);cb=eo[c];cn=eo[c+1];FE_LOAD();}
+    __syncthreads();
+   }
+#undef FE_LOAD
+  }else
+#endif
   for(int sweep=pair_bounds.x;sweep<pair_bounds.y;sweep++){int c=native_sweep_color(sweep,ec,iter,sweep_policy);
-   for(int e=eo[c]+tid;e<eo[c+1];e+=512){
+   for(int e=eo[c]+tid;e<eo[c+1];e+=QUIP_NT){
     int u=eu[e],v=ev[e];float j=wbeta>0.f?float(working_ej[e])+wbeta*float(wej_b[e]-working_ej[e]):float(working_ej[e]);if(guided_mode&&abs(ej[e])<1000)j*=1.f+edge_penalties[r*edges+e];float2 old=em[r*edges+e];float hu=h[u]-old.x,hv=h[v]-old.y;
     float mu=!mplp&&thermal_messages&&r>=QUIP_MINSUM_REPLICAS?native_thermal_pair(j,hv,temp_now):-(j>0?1.f:-1.f)*fminf(fabsf(j),fmaxf(-fabsf(j),hv));
     float mv=!mplp&&thermal_messages&&r>=QUIP_MINSUM_REPLICAS?native_thermal_pair(j,hu,temp_now):-(j>0?1.f:-1.f)*fminf(fabsf(j),fmaxf(-fabsf(j),hu));
@@ -313,7 +373,77 @@ extern "C" __global__ __launch_bounds__(512,1) void loop_factor_bp(
    }__syncthreads();
   }
   for(int sweep=region_bounds.x;sweep<region_bounds.y;sweep++){int c=native_sweep_color(sweep,colors,iter,sweep_policy);
-   for(int t=rc[c]+tid;t<rc[c+1];t+=512){
+   for(int t=rc[c]+tid;t<rc[c+1];t+=QUIP_NT){
+#ifndef QUIP_NO_FAST_SWEEPS
+    if(fast_regions){
+     const bool uj=!mplp&&r>=QUIP_MINSUM_REPLICAS;const int at=4*t;
+     const int degree=uj?jo[t+1]-jo[t]:0;const int j0=uj?jo[t]:0;
+     const float4 o4=*(const float4*)(rm+r*slots+at);
+     const int4 n4=__ldg((const int4*)(rn+at));
+     const int4 p4=uj?__ldg((const int4*)(physical+at)):make_int4(1,1,1,1);
+     const float fo[4]={o4.x,o4.y,o4.z,o4.w};const int fnn[4]={n4.x,n4.y,n4.z,n4.w};const int fpp[4]={p4.x,p4.y,p4.z,p4.w};
+     float cav[4];
+     #pragma unroll
+     for(int u=0;u<4;u++)cav[u]=(!uj||fpp[u])?h[fnn[u]]-fo[u]:0.f;
+     int qv[16],fv[16];
+     #pragma unroll
+     for(int i=0;i<4;i++){int4 a=__ldg((const int4*)(q2+16*t)+i);qv[4*i]=a.x;qv[4*i+1]=a.y;qv[4*i+2]=a.z;qv[4*i+3]=a.w;int4 b2=__ldg((const int4*)(working_fixed+16*t)+i);fv[4*i]=b2.x;fv[4*i+1]=b2.y;fv[4*i+2]=b2.z;fv[4*i+3]=b2.w;}
+     float cost[16];
+     #pragma unroll
+     for(int mask=0;mask<16;mask++){
+      float linear=0.f;
+      #pragma unroll
+      for(int u=0;u<4;u++)linear+=cav[u]*((mask>>u&1)?1.f:-1.f);
+      float fx=wbeta>0.f?float(fv[mask])+wbeta*float(__ldg(wfx_b+16*t+mask)-fv[mask]):float(fv[mask]);
+      cost[mask]=weight_now*qv[mask]+fx+linear;
+     }
+     for(int k=0;k<degree;k++){
+      const int kk=j0+k;const int d=__ldg(jdirs+kk);const int bi=__ldg(joffset+(d^1));const int si=__ldg(joffset+(d^1)+1)-bi;
+      const float*inc=jm+r*jtables+bi;const int*mp=jmaps+16*kk;
+      if(si==4&&!(bi&3)){
+       const float4 in4=*(const float4*)inc;
+       #pragma unroll
+       for(int i=0;i<4;i++){int4 m=__ldg((const int4*)mp+i);cost[4*i]+=fsel4(in4,m.x);cost[4*i+1]+=fsel4(in4,m.y);cost[4*i+2]+=fsel4(in4,m.z);cost[4*i+3]+=fsel4(in4,m.w);}
+      }else{
+       #pragma unroll
+       for(int mask=0;mask<16;mask++)cost[mask]+=inc[__ldg(mp+mask)];
+      }
+     }
+     #pragma unroll
+     for(int u=0;u<4;u++)if(!uj||fpp[u]){
+      float pos=1.e30f,neg=1.e30f;
+      #pragma unroll
+      for(int mask=0;mask<16;mask++){float v=cost[mask]-cav[u]*((mask>>u&1)?1.f:-1.f);if(mask>>u&1)pos=fminf(pos,v);else neg=fminf(neg,v);}
+      float message=.5f*(pos-neg);float next=fo[u]+damping_now*(message-fo[u]);h[fnn[u]]+=next-fo[u];rm[r*slots+at+u]=next;
+     }
+     for(int k=0;k<degree;k++){
+      const int kk=j0+k;const int d=__ldg(jdirs+kk);const int bo=__ldg(joffset+d),size=__ldg(joffset+d+1)-bo;const int bi=__ldg(joffset+(d^1));
+      const float*inc=jm+r*jtables+bi;const int*mp=jmaps+16*kk;
+      if(size==4&&!(bo&3)&&!(bi&3)){
+       const float4 in4=*(const float4*)inc;const float inv[4]={in4.x,in4.y,in4.z,in4.w};
+       int mv[16];
+       #pragma unroll
+       for(int i=0;i<4;i++){int4 m=__ldg((const int4*)mp+i);mv[4*i]=m.x;mv[4*i+1]=m.y;mv[4*i+2]=m.z;mv[4*i+3]=m.w;}
+       float o[4];
+       #pragma unroll
+       for(int v=0;v<4;v++){float m=1.e30f;
+        #pragma unroll
+        for(int mask=0;mask<16;mask++)if(mv[mask]==v)m=fminf(m,cost[mask]-inv[v]);
+        o[v]=m;}
+       float normal=o[0];normal=fminf(normal,o[1]);normal=fminf(normal,o[2]);normal=fminf(normal,o[3]);
+       #pragma unroll
+       for(int v=0;v<4;v++)o[v]-=normal;
+       float4*jp=(float4*)(jm+r*jtables+bo);float4 ol=*jp;
+       ol.x=ol.x+damping_now*(o[0]-ol.x);ol.y=ol.y+damping_now*(o[1]-ol.y);ol.z=ol.z+damping_now*(o[2]-ol.z);ol.w=ol.w+damping_now*(o[3]-ol.w);
+       *jp=ol;
+      }else{
+       float target[8];separator_minimum(cost,inc,mp,size,target);
+       for(int v=0;v<size;v++){int idx=r*jtables+bo+v;float old=jm[idx];jm[idx]=old+damping_now*(target[v]-old);}
+      }
+     }
+     continue;
+    }
+#endif
     bool use_joint=!mplp&&r>=QUIP_MINSUM_REPLICAS;int at=roff[t],degree=use_joint?jo[t+1]-jo[t]:0;float cavity[4],old[4],cost[16];
     for(int u=0;u<4;u++){old[u]=rm[r*slots+at+u];cavity[u]=(!use_joint||physical[at+u])?h[rn[at+u]]-old[u]:0.f;}
     junction_cost_ab(q2+taboff[t],working_fixed+taboff[t],wfx_b+taboff[t],wbeta,cavity,jdirs+jo[t],degree,joffset,jmaps+16*jo[t],jm+r*jtables,weight_now,cost);
@@ -334,24 +464,24 @@ extern "C" __global__ __launch_bounds__(512,1) void loop_factor_bp(
   } // complete one interleaved group (or the unmodified full sweep)
 
   int value=0,strong_units=0;unsigned charge_key=0;
-  for(int u=tid;u<n;u+=512)value+=fields[u]*(h[u]>0?-1:1);
-  for(int e=tid;e<edges;e+=512){int su=h[eu[e]]>0?-1:1,sv=h[ev[e]]>0?-1:1;value+=ej[e]*su*sv;if(edge_unary_mode)value+=edge_unary[2*e]*su+edge_unary[2*e+1]*sv;}
-  for(int t=tid;t<regions;t+=512){int mask=0;for(int u=roff[t];u<roff[t+1];u++)mask|=(h[rn[u]]<=0)<<(u-roff[t]);int at=taboff[t]+mask;value+=500*q2[at]+fixed[at];if(record_slots==64){if(record_descriptor==1)strong_units+=q2[at]/4;else if(q2[at]!=0)charge_key^=record_mix(unsigned(t));}}
-  native_energy_reduce(value,tid,sums);
+  for(int u=tid;u<n;u+=QUIP_NT)value+=fields[u]*(h[u]>0?-1:1);
+  for(int e=tid;e<edges;e+=QUIP_NT){int su=h[eu[e]]>0?-1:1,sv=h[ev[e]]>0?-1:1;value+=ej[e]*su*sv;if(edge_unary_mode)value+=edge_unary[2*e]*su+edge_unary[2*e+1]*sv;}
+  for(int t=tid;t<regions;t+=QUIP_NT){int mask=0;for(int u=roff[t];u<roff[t+1];u++)mask|=(h[rn[u]]<=0)<<(u-roff[t]);int at=taboff[t]+mask;value+=500*q2[at]+fixed[at];if(record_slots==64){if(record_descriptor==1)strong_units+=q2[at]/4;else if(q2[at]!=0)charge_key^=record_mix(unsigned(t));}}
+  native_energy_reduce_nt(value,tid,sums);
   __shared__ int accepted,current_energy;if(tid==0){int energy=constant+sums[0];current_energy=energy;accepted=energy<best[r];if(accepted)best[r]=energy;}__syncthreads();
-  if(accepted)for(int u=tid;u<n;u+=512)states[r*n+u]=h[u]>0?-1:1;
+  if(accepted)for(int u=tid;u<n;u+=QUIP_NT)states[r*n+u]=h[u]>0?-1:1;
   __syncthreads();
-  if(accepted&&record_slots>=32){int cell=record_cell(h,n,tid,sums);int slot=r*record_slots+cell;if(tid==0)record_energies[slot]=best[r];for(int u=tid;u<n;u+=512)record_states[slot*n+u]=h[u]>0?-1:1;__syncthreads();}
+  if(accepted&&record_slots>=32){int cell=record_cell_nt(h,n,tid,sums);int slot=r*record_slots+cell;if(tid==0)record_energies[slot]=best[r];for(int u=tid;u<n;u+=QUIP_NT)record_states[slot*n+u]=h[u]>0?-1:1;__syncthreads();}
   // Separate neutral-state archive: never alter strict record cells or live messages.
-  if(record_slots==96&&!accepted&&current_energy==best[r]){int cell=record_cell(h,n,tid,sums);int slot=r*record_slots+64+cell;__shared__ int save_neutral;if(tid==0){save_neutral=current_energy<record_energies[slot];if(save_neutral)record_energies[slot]=current_energy;}__syncthreads();if(save_neutral)for(int u=tid;u<n;u+=512)record_states[slot*n+u]=h[u]>0?-1:1;__syncthreads();}
-  if(record_slots==64){int extra=record_descriptor==1?record_strong_reduce(strong_units,tid,sums):record_reduce(charge_key,tid,sums);int cell=32+extra;int slot=r*record_slots+cell;__shared__ int save_charge;if(tid==0){save_charge=extra>=0&&current_energy<record_energies[slot];if(save_charge)record_energies[slot]=current_energy;}__syncthreads();if(save_charge)for(int u=tid;u<n;u+=512)record_states[slot*n+u]=h[u]>0?-1:1;__syncthreads();}
+  if(record_slots==96&&!accepted&&current_energy==best[r]){int cell=record_cell_nt(h,n,tid,sums);int slot=r*record_slots+64+cell;__shared__ int save_neutral;if(tid==0){save_neutral=current_energy<record_energies[slot];if(save_neutral)record_energies[slot]=current_energy;}__syncthreads();if(save_neutral)for(int u=tid;u<n;u+=QUIP_NT)record_states[slot*n+u]=h[u]>0?-1:1;__syncthreads();}
+  if(record_slots==64){int extra=record_descriptor==1?record_strong_reduce_nt(strong_units,tid,sums):record_reduce_nt(charge_key,tid,sums);int cell=32+extra;int slot=r*record_slots+cell;__shared__ int save_charge;if(tid==0){save_charge=extra>=0&&current_energy<record_energies[slot];if(save_charge)record_energies[slot]=current_energy;}__syncthreads();if(save_charge)for(int u=tid;u<n;u+=QUIP_NT)record_states[slot*n+u]=h[u]>0?-1:1;__syncthreads();}
 
 
   if(guided_mode&&(iter+1)%100==0){
    __shared__ int stalled;if(tid==0){stalled=best[r]>=last_best[r];last_best[r]=best[r];}__syncthreads();
-   if(stalled){int utility=0;for(int e=tid;e<edges;e+=512){int j=ej[e];if(abs(j)<1000&&j*int(states[r*n+eu[e]])*int(states[r*n+ev[e]])>0){float value=float(abs(j))/(1.f+edge_penalties[r*edges+e]);utility=max(utility,__float_as_int(value));}}sums[tid]=utility;__syncthreads();for(int step=256;step;step>>=1){if(tid<step)sums[tid]=max(sums[tid],sums[tid+step]);__syncthreads();}int maximum=sums[0];for(int e=tid;e<edges;e+=512){int j=ej[e];if(abs(j)<1000&&j*int(states[r*n+eu[e]])*int(states[r*n+ev[e]])>0){float value=float(abs(j))/(1.f+edge_penalties[r*edges+e]);if(maximum>0&&__float_as_int(value)==maximum)edge_penalties[r*edges+e]++;}}__syncthreads();}
+   if(stalled){int utility=0;for(int e=tid;e<edges;e+=QUIP_NT){int j=ej[e];if(abs(j)<1000&&j*int(states[r*n+eu[e]])*int(states[r*n+ev[e]])>0){float value=float(abs(j))/(1.f+edge_penalties[r*edges+e]);utility=max(utility,__float_as_int(value));}}sums[tid]=utility;__syncthreads();for(int step=QUIP_NT/2;step;step>>=1){if(tid<step)sums[tid]=max(sums[tid],sums[tid+step]);__syncthreads();}int maximum=sums[0];for(int e=tid;e<edges;e+=QUIP_NT){int j=ej[e];if(abs(j)<1000&&j*int(states[r*n+eu[e]])*int(states[r*n+ev[e]])>0){float value=float(abs(j))/(1.f+edge_penalties[r*edges+e]);if(maximum>0&&__float_as_int(value)==maximum)edge_penalties[r*edges+e]++;}}__syncthreads();}
   }
-  for(int u=tid;u<n;u+=512){int epoch=(release_mode>=2&&unpin_mask[r*n+u]==0)?0:reinforcement_epoch;float tphase=float(iter-epoch);
+  for(int u=tid;u<n;u+=QUIP_NT){int epoch=(release_mode>=2&&unpin_mask[r*n+u]==0)?0:reinforcement_epoch;float tphase=float(iter-epoch);
 #ifdef QUIP_ADAPT
   if(initial_mode==0&&release_mode<2)tphase=adapt_state[r*3];
 #endif
@@ -362,7 +492,7 @@ extern "C" __global__ __launch_bounds__(512,1) void loop_factor_bp(
   __syncthreads();
 #endif
  }
- for(int u=tid;u<n;u+=512){gh[r*n+u]=h[u];gb[r*n+u]=b[u];}
+ for(int u=tid;u<n;u+=QUIP_NT){gh[r*n+u]=h[u];gb[r*n+u]=b[u];}
 }
 
 // Experimental Cosm (Collective Switched Motion), arXiv:2605.30355v4.

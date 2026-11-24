@@ -47,6 +47,17 @@ Point the miner's `[cuda.0] binary` at a launcher that exports `QUIP_TWO_PASS_RE
 
 Two practical warnings: a mistyped or missing config silently runs the default settings (which is slow), so always check with `--print-search-config`; and `probe0_updates` must be a multiple of 100, at least 500 and below `probe_updates`.
 
+## Speed settings
+
+`loop_factor_bp` (the cold and stage-0 kernel, ~85% of GPU time) takes the fast sweep path by default: the same arithmetic in the same order as the generic loops, with wide loads, register-resident junction tables and the next edge colour prefetched during the barrier wait. Best energies are bit-identical to the generic path.
+
+| Environment variable | Effect |
+|---|---|
+| `QUIP_FBP_NT` | Threads per block of `loop_factor_bp`: `512` (default), `256` or `128`. At 256 two blocks share an SM. Results are bit-identical for every value: the kernel emulates the 512-thread random streams, and its reductions are integer or xor, so they are exact in any order. |
+| `QUIP_FBP_CARVEOUT` | Preferred shared-memory carveout in percent (default 100) when `QUIP_FBP_NT` is below 512. |
+
+Defining `QUIP_NO_FAST_SWEEPS` at the top of `kernel.cu` compiles only the generic sweep loops, for comparison.
+
 ## Pointers
 
 - Knobs: `SearchConfig` and its `validate()` in `solver.rs`.

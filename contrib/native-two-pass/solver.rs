@@ -8653,7 +8653,7 @@ mod native_seed {
                 ctx.disable_event_tracking();
             }
             let baseline = include_str!("kernel.cu").split_once("// NATIVE_CLUSTER_EXTENSION").map_or(include_str!("kernel.cu"), |(prefix,_)|prefix);
-            let source_text = crate::search_config().kernel_prefix() + baseline;
+            let source_text = crate::fbp_kernel_prefix() + &crate::search_config().kernel_prefix() + baseline;
             let source = source_text.as_str();
             let arch = crate::cuda_device::device_arch(&ctx);
             let module = crate::jit_cache::load_or_compile(
@@ -8682,9 +8682,21 @@ mod native_seed {
                 bifurcation: module.load_function("native_bifurcation").map_err(|e|e.to_string())?,
                 cosm: module.load_function("ice_cosm_collective").map_err(|e|e.to_string())?,
                 polish: module.load_function("polish_physical_groups").map_err(|e|e.to_string())?,
-                function: module
-                    .load_function("loop_factor_bp")
-                    .map_err(|e| e.to_string())?,
+                function: {
+                    let f = module
+                        .load_function("loop_factor_bp")
+                        .map_err(|e| e.to_string())?;
+                    // With fewer threads per block (QUIP_FBP_NT) two blocks share an SM, which needs the
+                    // shared-memory carveout for two blocks (2 x ~29 KB); the default carveout fits one.
+                    if crate::fbp_threads() != 512 {
+                        f.set_attribute(
+                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                            crate::fbp_carveout(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    f
+                },
                 stream: ctx.new_stream().map_err(|e| e.to_string())?,
             })
         }
@@ -9313,7 +9325,7 @@ mod native_seed {
                 if self.cluster_function.is_some(){launch.arg(&self.jmap_offsets).arg(&self.native_focus_mask);}else{launch.arg(&ramp_b).arg(&ramp_s).arg(&mut self.adapt).arg(&self.weak_sets).arg(&self.weak_stride);}
                 launch.launch(LaunchConfig {
                         grid_dim: (self.replicas as u32, 1, 1),
-                        block_dim: (512, 1, 1),
+                        block_dim: (if self.cluster_function.is_some() { 512 } else { crate::fbp_threads() }, 1, 1),
                         shared_mem_bytes: 2 * n as u32 * 4 + 512 * 4,
                     })
             }
@@ -12550,6 +12562,38 @@ impl SearchConfig{
     fn kernel_prefix(&self)->String{let d=Self::default();let mut out=String::new();if self.speed_integer_reduction{out+="#define QUIP_FAST_INTEGER_REDUCTION 1\n";}if self.effective_minsum()!=42{out+=&format!("#define QUIP_MINSUM_REPLICAS {}\n",self.effective_minsum());}for(name,value,default)in [("QUIP_DAMPING_BASE",self.damping_base,d.damping_base),("QUIP_DAMPING_STEP",self.damping_step,d.damping_step),("QUIP_PENALTY_BASE",self.penalty_base,d.penalty_base),("QUIP_PENALTY_STEP",self.penalty_step,d.penalty_step),("QUIP_TEMPERATURE",self.temperature_milli,d.temperature_milli),("QUIP_SEEDED_RAMP_SCALE",self.seeded_ramp_scale,d.seeded_ramp_scale),("QUIP_RAMP_BASE",self.ramp_base,d.ramp_base),("QUIP_RAMP_STEP",self.ramp_step,d.ramp_step),("QUIP_RHO_CAP",self.rho_cap,d.rho_cap)]{if value!=default{out+=&format!("#define {name} {}\n",cuda_float_literal(value));}}if self.ramp_power!=0.{out+=&format!("#define QUIP_RAMP_POWER {}\n",cuda_float_literal(self.ramp_power));}if self.weight_growth!=0.{out+=&format!("#define QUIP_WEIGHT_GROWTH {}\n",cuda_float_literal(self.weight_growth));}if self.adapt_scale!=0.{out+=&format!("#define QUIP_ADAPT {}\n",cuda_float_literal(self.adapt_scale));}if self.temp_anneal!=0.{out+=&format!("#define QUIP_TEMP_ANNEAL {}\n",cuda_float_literal(self.temp_anneal));}if self.damping_decay!=0.{out+=&format!("#define QUIP_DAMP_DECAY {}\n",cuda_float_literal(self.damping_decay));}out}
 }
 fn cuda_float_literal(value:f32)->String{format!("{value:.9e}f")}
+
+/// Threads per block of `loop_factor_bp` (env `QUIP_FBP_NT`: 512 default, or 256 / 128). Results are
+/// bit-identical for every value: the kernel emulates the 512-thread random streams and its reductions are
+/// integer / xor (exact in any order). 256 lets two blocks share an SM (+21% solves/min on a 3090).
+/// The cluster kernel stays at 512.
+fn fbp_threads() -> u32 {
+    static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| match std::env::var("QUIP_FBP_NT").ok().and_then(|v| v.parse::<u32>().ok()) {
+        Some(t @ (128 | 256)) => t,
+        _ => 512,
+    })
+}
+
+/// Preferred shared-memory carveout (percent) for `loop_factor_bp` when `QUIP_FBP_NT` < 512 (env
+/// `QUIP_FBP_CARVEOUT`, default 100).
+fn fbp_carveout() -> i32 {
+    std::env::var("QUIP_FBP_CARVEOUT")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|v| (0..=100).contains(v))
+        .unwrap_or(100)
+}
+
+/// Kernel define for the opt-in thread count `QUIP_NT` (see [`fbp_threads`]); empty at the default 512.
+fn fbp_kernel_prefix() -> String {
+    if fbp_threads() == 512 {
+        String::new()
+    } else {
+        format!("#define QUIP_NT {}\n", fbp_threads())
+    }
+}
+
 // Merge partial settings into the stage-specific built-in defaults. This keeps
 // a seed-only override from silently resetting that stage's work budget.
 fn search_config_from_patch(patch:serde_json::Value)->Result<SearchConfig,String>{
