@@ -302,6 +302,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -646,9 +661,9 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "ising-generators"
-version = "0.0.17"
+version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2997d98d61331b741b1e1e19792c093a5b31c106b449b301ac4f2e1175b5144f"
+checksum = "6c47d3427ebb21766756b89faf79ed47ce540d946439b161db6dce1e197cc600"
 dependencies = [
  "blake3",
  "miniz_oxide",
@@ -945,9 +960,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quip-proto"
-version = "0.0.17"
+version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1654ca26343653f6bd91d76a0af95b0e2893330f9ef02cbab3b1775e131ab72"
+checksum = "d4ea6c7e37c7caa67b13efc691311cda52fc0d8d927776226aa25052fd361b5f"
 dependencies = [
  "prost",
  "tonic",
@@ -955,9 +970,9 @@ dependencies = [
 
 [[package]]
 name = "quip-protocol"
-version = "0.0.17"
+version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96e039be26873ad65c90fd3b2a407aa8c9d4e2a1c990a50641c56cd764c004e8"
+checksum = "e61b9571851ee3d89f17dc1d45086e4960d5c957f0460220b9d4e05983c67002"
 dependencies = [
  "ising-generators",
  "quip-proto",
@@ -965,9 +980,9 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-conformance"
-version = "0.0.17"
+version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1da9e14efe52ce2716166423e34467fc13efd9062ed39bc74e312e8f5a76cd9f"
+checksum = "5790141062605840f69d82c7db5bbf32d222327d62d2e3c74f5a979904c1654d"
 dependencies = [
  "hyper-util",
  "ising-generators",
@@ -984,9 +999,9 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-core"
-version = "0.0.17"
+version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "833f3bda3673633f4125299cda881adb89f87bc9dcf8903aa2516ba1236d54e2"
+checksum = "ea6cab7d24f7cd8704f76f9f4c6565d10a8b16970abd9df1bac2a831f30172db"
 dependencies = [
  "base64",
  "clap",
@@ -1009,8 +1024,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "quip-solver-cpu"
+version = "0.3.6"
+dependencies = [
+ "clap",
+ "crossbeam-channel",
+ "quip-proto",
+ "quip-protocol",
+ "quip-solver-core",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-flame",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "quip-solver-cuda"
-version = "0.3.7"
+version = "0.3.6-rc6"
 dependencies = [
  "blake3",
  "clap",
@@ -1021,6 +1055,7 @@ dependencies = [
  "quip-protocol",
  "quip-solver-conformance",
  "quip-solver-core",
+ "quip-solver-cpu",
  "serde",
  "serde_json",
  "serial_test",

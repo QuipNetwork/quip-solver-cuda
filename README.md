@@ -71,7 +71,6 @@ The precision options are `binary`, `int8`, `int32`, and `float`.
 | `quip-cuda-msa` | multi-spin coded simulated annealing, 64 reads per word |
 | `quip-cuda-msa-descent` | the `quip-cuda-msa` kernel, then host greedy and loop descent |
 | `quip-cuda-gibbs` | heat-bath Gibbs |
-| `quip-cuda-otsuka` | Otsuka cluster annealing for `quip/twisted-ice-dimer` jobs, CUDA SA otherwise |
 
 Each [release](https://gitlab.com/quip.network/quip-solver-cuda/-/releases)
 provides prebuilt `amd64` binaries.
@@ -149,12 +148,6 @@ quip-cuda-sa --capabilities   # capabilities JSON
 quip-cuda-sa --check          # probe the backend is runnable
 ```
 
-`--capabilities` does not open the device. It reports limits for a small
-reference device (64 MiB free, one SM). A session reports the limits of the
-device it opens. If the device does not open, `--check`, `--solve`, and a
-session exit 69. This includes a host with no visible GPU, and a host with the
-driver but no NVRTC.
-
 ## Multi-spin kernel (`quip-cuda-msa`)
 
 `kernels/msa.cu` is a CUDA port of the multi-spin coded simulated annealing
@@ -182,7 +175,8 @@ which reaches L2 and then DRAM as the graph grows. Placement does not change
 the samples: a spilled run returns the same reads as an all-shared run of the
 same seed. Without `--max-nodes`, the miner uses its device-derived node limit.
 The flag sets a lower cap. A value that exceeds the device limit fails at open.
-The error names the largest capacity that fits.
+The error names the largest capacity that fits. MSA `--capabilities`
+opens the selected device to read its memory limits.
 See the [A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)
 for the throughput at each size.
 
@@ -221,8 +215,7 @@ Such a model gets greedy descent without tiles.
 
 The descent runs on jobs with at most 262,144 nodes and 4,194,304 edges. A
 job of 200,000 nodes at degree 20 fits. A larger job logs the skip and returns
-its raw reads. The binary lists only `ISING_SAMPLE` and rejects coordinator
-leases with `UNSUPPORTED_KIND`. The binary logs `kernel_s`,
+its raw reads. Lease salts run without descent. The binary logs `kernel_s`,
 `descent_s`, and the raw, greedy, loop, and final best energies of each job.
 
 `tests/msa_descent.rs` checks the descent against the research code on
@@ -282,52 +275,6 @@ See the [calibration and session results](docs/perf/2026-10-cuda-lease-screen.md
 
 The probe kernel comes from rdyplayerB's
 [QuipNetwork/quip-solver-cuda#1](https://github.com/QuipNetwork/quip-solver-cuda/pull/1).
-
-## Otsuka cluster miner (`quip-cuda-otsuka`)
-
-`quip-cuda-otsuka` anneals `quip/twisted-ice-dimer` jobs with tile and pair
-cluster moves and sends every other job to CUDA SA. Between kernel launches the
-host runs a population step, as the CPU Otsuka sampler does: it resamples the
-reads by their true energies and swaps Houdayer clusters between pairs of reads
-from beta 3.
-
-| Setting (`[cuda.N]` key, or environment) | Default | Meaning |
-| --- | --- | --- |
-| `otsuka_beta` / `QUIP_OTSUKA_BETA` | `1,8` | Beta range for jobs that carry none. `stock` keeps the job's own range. |
-| `otsuka_resamples` / `QUIP_OTSUKA_RESAMPLES` | `256` | Population steps per anneal. `0` turns them off. |
-| `otsuka_houdayer` / `QUIP_OTSUKA_HOUDAYER` | `1` | Houdayer rounds per population step. |
-| `otsuka_chunk` / `QUIP_OTSUKA_CHUNK` | `16` | Sweeps per kernel launch. |
-| `otsuka_reads`, `otsuka_sweeps` / `QUIP_OTSUKA_READS`, `QUIP_OTSUKA_SWEEPS` | job budget | Pin the replicas and sweeps of every job. |
-| `QUIP_OTSUKA_TILE_MILLI`, `QUIP_OTSUKA_PAIR_MILLI` | `250` | Cluster-draw weights, the research default. `1000` is full weight. |
-| `QUIP_OTSUKA_WEAK_SCALE` | `1.5` | Scale on the weak couplings in the anneal model. Reported energies stay exact. |
-
-On the first Aglais twisted-ice graph (4,575 nodes, recipe w62-p1200) with an
-RTX 5090 Laptop GPU, the previous settings reached about −5,030 in 33 s per salt.
-The defaults in the table reach about −5,054 in 2.4 s at 160 reads by 8,192 sweeps.
-
-### Lease screening
-
-With `QUIP_OTSUKA_SCREEN="threads,warm,keep"` set, the miner works family
-leases itself. It generates every salt on `threads` CPU threads, scores each
-instance from four structural counts, and keeps the best `keep`. The GPU solves
-only the kept salts. The best few get a short solve, and the best of those gets
-one long anneal. See `src/cluster/screen_lease.rs` for the score and the other settings
-(`QUIP_OTSUKA_SCREEN_RUNGS`, `QUIP_OTSUKA_SCREEN_SCORE`,
-`QUIP_OTSUKA_SCREEN_HOLDERS`). A typical value is `20,10000,48` on a 24-thread
-host. Each miner process owns one GPU and starts its own generator threads, so
-on a host with more than one GPU, divide `threads` between the processes.
-Leave cores for the host population step. On a 32-thread host with two A4000
-cards, a probe took 6.5 s with 10 threads per process and 13.5 s with 14.
-
-On the current Aglais graph (4,560 nodes, recipe w45-p1350) and the same
-machine, 600 s bench rounds averaged a best energy of −5,074.4 without screening
-(every salt solved at 160 by 8,192, the best re-solved deeper) and −5,082.3 with
-it. Running live, the miner's share of rounds rose from 1 in about 600 to about
-6 %.
-
-On two RTX A4000 cards, screening reached a round best 12.5 units lower than
-solving every salt, and an estimated 8 to 11 % of rounds. See the
-[A4000 round measurements](docs/perf/2026-11-16-otsuka-rounds-a4000.md).
 
 ## Sharing the graphics processor
 

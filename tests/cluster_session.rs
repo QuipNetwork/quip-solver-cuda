@@ -7,10 +7,9 @@ use quip_solver_core::{
 use quip_solver_cuda::capacity::DeviceLimits;
 use quip_solver_cuda::cluster::device::{ClusterDeviceError, ClusterRun};
 use quip_solver_cuda::cluster::sampler::{
-    cuda_otsuka_identity, ClusterBackend, ClusterWork, OtsukaSampler,
+    cuda_otsuka_identity, ClusterBackend, ClusterWork, OtsukaSampler, HEADLESS_LIMITS,
 };
 use quip_solver_cuda::cluster::{Model, Motifs, PreparedGraph, Weights};
-use quip_solver_cuda::headless::HEADLESS_LIMITS;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -847,7 +846,6 @@ mod gpu {
             beta_range: Some((0.1, 1.7)),
             schedule: quip_solver_core::BetaSchedule::Geometric,
             seed: 73,
-            ..quip_solver_core::SampleParams::default()
         };
         let prepared = PreparedGraph::from_instance(
             &instance,

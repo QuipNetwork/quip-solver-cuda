@@ -8,6 +8,7 @@ use crate::capacity::{
     cluster_footprint, ClusterShape, DeviceLimits, Footprint, CLUSTER_DYNAMIC_PADDING,
     CLUSTER_SHARED_BYTES_PER_NODE, CLUSTER_STATIC_SHARED_BYTES,
 };
+use quip_solver_core::families::FamilyContext;
 use quip_solver_core::ising_generators::descriptor::Contract;
 use quip_solver_core::ising_generators::ice::twisted_dimer::local_gauges;
 use quip_solver_core::ising_generators::ice::TWISTED_DIMER_V1;
@@ -140,30 +141,6 @@ impl PreparedGraph {
         limits: &DeviceLimits,
         anneals: usize,
     ) -> Result<Self, PrepareError> {
-        Self::with_weak_scale(model, motifs, weights, limits, anneals, 1.0)
-    }
-
-    /// [`Self::new`] with the weak couplings (|J| < 500 milli) scaled by `weak_scale` in the
-    /// uploaded anneal model. Energies, rescoring and the original graph stay exact.
-    ///
-    /// # Errors
-    /// The same as [`Self::new`].
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the weak-coupling scale is applied where the rows are built"
-    )]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "a weak coupling is below 500 milli and the scale is at most 8, well inside i32"
-    )]
-    pub fn with_weak_scale(
-        model: &Model<'_>,
-        motifs: &Motifs<'_>,
-        weights: Weights,
-        limits: &DeviceLimits,
-        anneals: usize,
-        weak_scale: f64,
-    ) -> Result<Self, PrepareError> {
         let original = OtsukaGraph::new(model, motifs, weights)?;
         let n = original.n;
         if n > MAX_PACKED_NODES {
@@ -174,20 +151,7 @@ impl PreparedGraph {
         }
         check_residual_sum(original.weak_edges.iter().map(|edge| edge.2))?;
         let (color_off, device_to_original, original_to_device) = coloring(&original);
-        // The anneal sees the weak couplings scaled; reported energies stay exact.
-        let scaled = |j: i32| {
-            if j.abs() < 500 {
-                (f64::from(j) * weak_scale).round() as i32
-            } else {
-                j
-            }
-        };
-        let scaled_edges: Vec<Edge> = original
-            .edges
-            .iter()
-            .map(|&(u, v, j)| (u, v, scaled(j)))
-            .collect();
-        let all_rows = rows(n, &scaled_edges, &original_to_device);
+        let all_rows = rows(n, &original.edges, &original_to_device);
         // Keep original edge order for the residual ELL, as prep.py does.
         let residual: HashMap<_, _> = original
             .weak_edges
@@ -197,13 +161,8 @@ impl PreparedGraph {
         let weak_edges: Vec<_> = original
             .edges
             .iter()
-            .map(|&(u, v, jm)| {
-                let r = residual.get(&key(u, v)).copied().unwrap_or(0);
-                (u, v, if jm.abs() < 500 { scaled(r) } else { r })
-            })
+            .map(|&(u, v, _)| (u, v, residual.get(&key(u, v)).copied().unwrap_or(0)))
             .collect();
-        // A weak scale above 1 raises the residual sum the kernel accumulates.
-        check_residual_sum(weak_edges.iter().map(|edge| edge.2))?;
         let weak_rows = rows(n, &weak_edges, &original_to_device);
         let shape = ClusterShape {
             nodes: n,
@@ -288,7 +247,7 @@ impl PreparedGraph {
     /// Prepare a session-validated canonical instance under its family contract.
     ///
     /// The caller must validate the instance against `contract` and its declared
-    /// parameters first. Session jobs use [`Self::from_instance_scaled`] with the configured weak scale.
+    /// parameters first. Prefer [`Self::from_family`] for session jobs.
     ///
     /// # Errors
     /// Returns unsupported family or unreadable metadata, then the same errors
@@ -300,22 +259,6 @@ impl PreparedGraph {
         limits: &DeviceLimits,
         anneals: usize,
     ) -> Result<Self, PrepareError> {
-        Self::from_instance_scaled(instance, contract, weights, limits, anneals, 1.0)
-    }
-
-    /// [`Self::from_instance`] with the weak couplings scaled by `weak_scale` in the anneal model.
-    ///
-    /// # Errors
-    /// The same as [`Self::from_instance`].
-    #[doc(hidden)]
-    pub fn from_instance_scaled(
-        instance: &Instance,
-        contract: &Contract,
-        weights: Weights,
-        limits: &DeviceLimits,
-        anneals: usize,
-        weak_scale: f64,
-    ) -> Result<Self, PrepareError> {
         if contract.family_id != TWISTED_DIMER_V1.family_id
             || contract.revision != TWISTED_DIMER_V1.revision
         {
@@ -323,7 +266,7 @@ impl PreparedGraph {
         }
         let (tiles, gauges) = local_gauges(instance).ok_or(PrepareError::Metadata)?;
         let pairs = metadata_pairs(instance.metadata()).ok_or(PrepareError::Metadata)?;
-        Self::with_weak_scale(
+        Self::new(
             &Model {
                 h_milli: instance.h(),
                 edges: instance.edges(),
@@ -337,7 +280,25 @@ impl PreparedGraph {
             weights,
             limits,
             anneals,
-            weak_scale,
+        )
+    }
+
+    /// Read the bound canonical instance supplied by a lease or explicit job.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::from_instance`].
+    pub fn from_family(
+        family: &FamilyContext,
+        weights: Weights,
+        limits: &DeviceLimits,
+        anneals: usize,
+    ) -> Result<Self, PrepareError> {
+        Self::from_instance(
+            family.instance(),
+            family.contract(),
+            weights,
+            limits,
+            anneals,
         )
     }
 
@@ -489,6 +450,28 @@ fn check_residual_sum(couplings: impl Iterator<Item = i32>) -> Result<(), Prepar
     Ok(())
 }
 
+/// The greedy colour of every node (largest degree first), from the undirected edge list.
+pub(crate) fn color_classes(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
+    let mut adj = vec![Vec::new(); n];
+    for &(u, v) in edges {
+        adj[u].push(v);
+        adj[v].push(u);
+    }
+    let mut order: Vec<_> = (0..n).collect();
+    order.sort_by_key(|&u| std::cmp::Reverse(adj[u].len()));
+    let mut color = vec![usize::MAX; n];
+    let mut seen = vec![usize::MAX; n];
+    for u in order {
+        for &v in &adj[u] {
+            if color[v] != usize::MAX {
+                seen[color[v]] = u;
+            }
+        }
+        color[u] = seen.iter().position(|&mark| mark != u).unwrap_or(0);
+    }
+    color
+}
+
 fn coloring(graph: &OtsukaGraph) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
     let n = graph.n;
     let mut adj = vec![Vec::new(); n];
@@ -583,25 +566,6 @@ fn metadata_pairs(region: &[u8]) -> Option<Vec<(u32, u32)>> {
     }
     None
 }
-
-/// Scale applied to the weak couplings (|J| < 500 milli) of a family model while it anneals.
-///
-/// The weak layer of a twisted-ice instance is about 4 % of the strong one, so at the family beta
-/// range it freezes before the strong layer settles. Annealing it 1.5 times stronger, with the
-/// 250-milli cluster weights, gave 10 to 17 units lower true energies on the Aglais twisted-ice
-/// graph at equal budget. Reported energies are
-/// always the exact model energies. `QUIP_OTSUKA_WEAK_SCALE` overrides it (1 = unscaled).
-#[must_use]
-pub fn weak_scale() -> f64 {
-    std::env::var("QUIP_OTSUKA_WEAK_SCALE")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|x| *x > 0.0 && *x <= 8.0)
-        .unwrap_or(DEFAULT_WEAK_SCALE)
-}
-
-/// Default weak-coupling scale during the anneal.
-pub const DEFAULT_WEAK_SCALE: f64 = 1.5;
 
 #[cfg(test)]
 mod tests {

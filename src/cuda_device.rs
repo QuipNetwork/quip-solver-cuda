@@ -112,33 +112,6 @@ pub(crate) fn driver_version() -> Result<i32, CudaError> {
     Ok(v)
 }
 
-/// Refuse with an error before cudarc panics on a missing shared library.
-///
-/// cudarc loads `libcuda` and `libnvrtc` on first use and panics when either
-/// is absent, which would exit 101. A host with the driver but no CUDA
-/// toolkit lacks NVRTC. Callers report this error, so the binary exits 69.
-///
-/// # Errors
-///
-/// [`CudaError::Driver`] naming the library that does not load.
-pub fn require_libraries() -> Result<(), CudaError> {
-    // SAFETY: `is_culib_present` only tries `dlopen` on cudarc's candidate
-    // names for the library and drops each handle. It runs the same library
-    // initializers that cudarc's own first load runs, and keeps no state.
-    if !unsafe { cudarc::driver::sys::is_culib_present() } {
-        return Err(CudaError::Driver(
-            "the CUDA driver library (libcuda) does not load".into(),
-        ));
-    }
-    // SAFETY: as above, for NVRTC.
-    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
-        return Err(CudaError::Driver(
-            "the NVRTC library (libnvrtc.so.12, package cuda-nvrtc-12-9) does not load".into(),
-        ));
-    }
-    Ok(())
-}
-
 /// Failures from opening a device or compiling its kernels.
 #[derive(Debug, Error)]
 pub enum CudaError {
@@ -644,7 +617,6 @@ impl CudaDevice {
         kernel: KernelKind,
         max_nodes: usize,
     ) -> Result<Self, CudaError> {
-        require_libraries()?;
         // CUDA reports counts as i32; reject a negative driver response rather
         // than silent truncation into usize.
         let n = usize::try_from(CudaContext::device_count()?)

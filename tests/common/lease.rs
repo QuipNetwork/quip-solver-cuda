@@ -322,9 +322,6 @@ impl Session {
             miner_msg::Msg::Status(status) => self.log.jobs_done = Some(status.jobs_done),
             miner_msg::Msg::Fatal(fatal) => self.log.fatal = Some(fatal),
             miner_msg::Msg::Capabilities(_) => {}
-            miner_msg::Msg::CalibrateDone(done) => {
-                panic!("unexpected CalibrateDone without a Calibrate: {done:?}")
-            }
         }
     }
 }
@@ -359,7 +356,6 @@ pub(crate) fn lease(
         generation,
         deadline_ms: 0,
         ising: None,
-        iqm: None,
         provenance: None,
         generator: Some(IsingProblemGenerator {
             algorithm: GeneratorAlgorithm::Blake3Chacha8V1 as i32,

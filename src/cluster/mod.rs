@@ -9,8 +9,9 @@ pub mod device;
 mod prepare;
 /// Family routing and production streaming for `quip-cuda-otsuka`.
 pub mod sampler;
-/// Lease-local salt screening for `quip-cuda-otsuka` (opt-in).
-pub mod screen_lease;
+pub(crate) mod lean_gen;
+pub(crate) mod gen_gpu;
+pub(crate) mod layout_opt;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -64,6 +65,13 @@ impl Weights {
         pair_milli: 1000,
         tile_milli: 1000,
     };
+
+    /// `FULL` unless `QC_WTILE` / `QC_WPAIR` (milli) override it.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let get = |k: &str, d: i32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        Self { pair_milli: get("QC_WPAIR", 1000), tile_milli: get("QC_WTILE", 1000) }
+    }
 
     fn is_valid(self) -> bool {
         (0..=1000).contains(&self.pair_milli) && (1..=1000).contains(&self.tile_milli)
@@ -270,6 +278,24 @@ fn check_pairs(
 }
 
 impl OtsukaGraph {
+    /// Tile nodes in original order, for the CPU pair-worm postprocess.
+    #[must_use]
+    pub fn tile_nodes(&self) -> Vec<[u32; 4]> {
+        self.tiles
+            .iter()
+            .map(|t| t.nodes.map(|v| u32::try_from(v).unwrap_or(0)))
+            .collect()
+    }
+
+    /// Pair edges in original order.
+    #[must_use]
+    pub fn pair_list(&self) -> Vec<(u32, u32)> {
+        self.pairs
+            .iter()
+            .map(|&(a, b)| (u32::try_from(a).unwrap_or(0), u32::try_from(b).unwrap_or(0)))
+            .collect()
+    }
+
     /// Validate `model` against `motifs` and split its couplings.
     ///
     /// # Errors

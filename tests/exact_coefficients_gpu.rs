@@ -399,18 +399,6 @@ fn stream_separates_one_x_and_thousand_x_schedules() {
     }
 }
 
-/// The MSA kernel shares one Metropolis draw across the 64 replicas of a
-/// word, so a 64-read job is one correlated sample. Two words and the sweep
-/// count of the other MSA ground-state tests keep the exact-ground check from
-/// missing by one coupling, as one finney run did at 1024 sweeps.
-fn stream_params() -> SampleParams {
-    SampleParams {
-        num_reads: 128,
-        num_sweeps: 4096,
-        ..params()
-    }
-}
-
 fn assert_stream_separates_scales(kind: KernelKind) {
     use quip_solver_core::{CancelToken, StreamJob, StreamOutcome, StreamResult};
     use quip_solver_cuda::nvml_gov::UtilGovernor;
@@ -431,7 +419,7 @@ fn assert_stream_separates_scales(kind: KernelKind) {
             .try_send(StreamJob {
                 job_id: vec![u8::try_from(id).unwrap()],
                 graph: graph.clone(),
-                params: stream_params(),
+                params: params(),
                 watermark: None,
             })
             .unwrap();
@@ -471,8 +459,7 @@ fn assert_stream_separates_scales(kind: KernelKind) {
         assert_eq!(
             best,
             brute_force_min(&graphs[id]),
-            "{kind:?} job {id} ({}x) missed the ground state",
-            [1, 1000][id]
+            "job {id} missed the ground state"
         );
     }
     driver.join().expect("stream driver exits");

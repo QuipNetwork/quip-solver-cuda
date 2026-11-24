@@ -6,7 +6,6 @@
 use clap::Parser;
 use quip_solver_core::{run, CommonArgs};
 use quip_solver_cuda::families::flow_loops::{FlowLoopsSampler, CUDA_FLOW_LOOPS_IDENTITY};
-use quip_solver_cuda::headless::require_visible;
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -22,7 +21,6 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     run(CUDA_FLOW_LOOPS_IDENTITY, &cli.common, || {
-        require_visible(cli.device)?;
         Ok(FlowLoopsSampler::new(cli.device))
     })
 }
