@@ -85,6 +85,17 @@ Offline refiner tests need no GPU and take minutes: `--refine-test INSTANCE ARCH
 - Refiner: `mod refine_native`; the restart ladder is the first loop in `refine_native::run`, and the follow-up passes (`QUIP_REFINE_EXTRA_*`: 16 s when the gap is under 1.0, a second when under 0.15, at most `QUIP_REFINE_EXTRA_TRIES`) are in the code that calls it.
 - Experiments and null results: `EXPERIMENTS.md`.
 
+## Credits and related work
+
+- **Base solver:** PR #5 (`rootztigmod`, native two-pass belief-propagation + cluster-rebase miner, the two-stage probe screen and the funnel settings). This build keeps its algorithm; the additions are listed above.
+- **Burer-Monteiro screen:** using a low-rank Burer-Monteiro relaxation of the instance as a salt screen (a cheap rank-4 prefilter, then rank 8) is the idea of PR #6 (`chenyiyi0618`, `super-sdp-feeder`). Our rank-4 / rank-8 kernels in `kernel.cu` are our own implementation, written after reading that PR; they differ in step counts, scheduling and memory layout, and in being combined with the CPU ridge score. The relaxation itself is the standard method of S. Burer and R. D. C. Monteiro, "A nonlinear programming algorithm for solving semidefinite programs via low-rank factorization", Math. Programming 95 (2003).
+- **Staged / probe-gated selection:** related work we read and compared against, but whose code we did not use: PR #4 (`ntllinh2511`, staged candidate selection) and PR #7 (`rdyplayerB`, probe gate and single-GPU measurements). Our probe stages come from PR #5.
+- **Not included here:** PR #9 (`vht210`, faster belief-propagation sweeps) is not part of this build.
+- **Salt generator:** the Quip network's `ising-generators` 0.0.15 (Apache-2.0); `patches/` modifies it and keeps its license.
+- **The CPU refiner, the restart ladder, the structural ridge score and the screening kernels** were developed in our own research workflow with AI assistance (Claude and another model); no code from outside PRs.
+
+If we have missed an author or misdescribed their work, please say so and we will fix it.
+
 ## Not covered here
 
 The source still contains optional multi-machine code from our earlier setup (a hub/worker split via `--worker-listen` / `QUIP_REMOTE`). It is off unless used and is neither documented nor tested here; the settings above do not touch it.
