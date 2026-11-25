@@ -1,0 +1,405 @@
+diff -ruN a/src/family.rs b/src/family.rs
+--- a/src/family.rs	2026-11-25 18:12:44.633374642 +0000
++++ b/src/family.rs	2026-11-25 18:12:44.654581729 +0000
+@@ -305,6 +305,10 @@
+ /// `Defect` for an unlisted label, any other construction code, code 15 or 16
+ /// from `Instance::new`, a count or degree above `bounds`, or failed
+ /// metadata.
++/// quip-cpu-screener: set to skip the post-hoc metadata self-check (the instance is still built identically).
++pub static SKIP_CHECKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++pub static PROF: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
++fn tick(i: usize, t: std::time::Instant) { PROF[i].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+ pub fn generate_instance(
+     admitted: &Admitted<'_>,
+     topology: &BaseTopology,
+@@ -322,7 +326,9 @@
+         *topology.order_digest(),
+         construction.labels,
+     );
++    let t0 = std::time::Instant::now();
+     let built = (construction.generate)(admitted.params(), topology, &mut streams);
++    tick(0, t0);
+     if streams.fault {
+         return Err(SaltFault::Defect(Defect::UnlistedLabel));
+     }
+@@ -344,6 +350,7 @@
+         offset_milli: body.offset_milli,
+         metadata: body.metadata,
+     };
++    let t1 = std::time::Instant::now();
+     let instance =
+         Instance::new(parts, &contract.limits, contract.metadata_kinds, None).map_err(|code| {
+             match code {
+@@ -351,12 +358,15 @@
+                 other => SaltFault::Defect(Defect::InstanceInvalid(other)),
+             }
+         })?;
++    tick(1, t1);
++    let t2 = std::time::Instant::now();
+     if beyond(&instance, bounds) {
+         return Err(SaltFault::Defect(Defect::SizeBound));
+     }
+-    if !(construction.check_metadata)(admitted.params(), &instance) {
++    if !SKIP_CHECKS.load(std::sync::atomic::Ordering::Relaxed) && !(construction.check_metadata)(admitted.params(), &instance) {
+         return Err(SaltFault::Defect(Defect::MetadataRejected));
+     }
++    tick(2, t2);
+     Ok(instance)
+ }
+ 
+diff -ruN a/src/gpugen.rs b/src/gpugen.rs
+--- a/src/gpugen.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/src/gpugen.rs	2026-11-25 18:12:44.658823147 +0000
+@@ -0,0 +1,84 @@
++//! quip-cpu-screener: the salt-independent tables and per-salt seeds that a GPU port of the
++//! `quip/twisted-ice-dimer` generator needs. Nothing here changes how instances are generated.
++
++use alloc::vec::Vec;
++
++use crate::descriptor::{admit, params_digest};
++use crate::family::BaseTopology;
++use crate::ice::build::{lattice, sorted_edges};
++use crate::ice::{candidates, prepare_tables, sides, TWISTED_DIMER_V1};
++use crate::rng::stream_seed;
++
++/// Stream labels in the order the GPU kernel expects them.
++pub const LABELS: [&str; 5] = ["left", "right", "gauge", "weak", "dimer"];
++
++/// Everything the generator needs that does not depend on the salt.
++pub struct GenData {
++    pub n_nodes: u32,
++    pub weak: i32,
++    pub pairs: u32,
++    /// Sorted edges (min, max).
++    pub edges: Vec<(u32, u32)>,
++    pub n_left: u32,
++    pub n_right: u32,
++    /// Candidate tiles, ascending (the order selected tiles are sorted in): the six edge indices of each.
++    pub cand_edges: Vec<[u32; 6]>,
++    /// Candidate indices of the free tiles (always selected).
++    pub free: Vec<u32>,
++    /// Left spine `l` owns `adj_r[adj_start[l]..adj_start[l + 1]]`, right spines ascending, with the candidate index in `adj_cand`.
++    pub adj_start: Vec<u32>,
++    pub adj_r: Vec<u32>,
++    pub adj_cand: Vec<u32>,
++    descriptor_digest: [u8; 32],
++    order_digest: [u8; 32],
++}
++
++pub fn gen_data(params: &[u8], topology: &BaseTopology) -> Result<GenData, alloc::string::String> {
++    let contracts = [TWISTED_DIMER_V1];
++    let admitted = admit(&contracts, TWISTED_DIMER_V1.family_id.as_bytes(), TWISTED_DIMER_V1.revision, params, &params_digest(params))
++        .map_err(|c| alloc::format!("admit: {c:?}"))?;
++    let lat = lattice(admitted.params()).map_err(|e| alloc::format!("lattice: {e:?}"))?;
++    let (weak, pairs) = crate::ice::twisted_dimer::gpu_params(admitted.params()).ok_or("params")?;
++    let found = candidates(lat, topology).map_err(|e| alloc::format!("candidates: {e:?}"))?;
++    let split = sides(lat, topology, &found).map_err(|e| alloc::format!("sides: {e:?}"))?;
++    let edges = sorted_edges(topology);
++    let find = |p: (u32, u32)| edges.binary_search(&p).map(|i| i as u32).map_err(|_| alloc::string::String::from("tile edge not found"));
++    let mut cand_edges = Vec::new();
++    for t in &found.tiles {
++        let [a, b, c, d] = t.nodes;
++        cand_edges.push([find((a, b))?, find((a, c))?, find((a, d))?, find((b, c))?, find((b, d))?, find((c, d))?]);
++    }
++    let (free, adj) = prepare_tables(&found, &split).map_err(|e| alloc::format!("tables: {e:?}"))?;
++    let mut adj_start = Vec::new();
++    let (mut adj_r, mut adj_cand) = (Vec::new(), Vec::new());
++    for list in &adj {
++        adj_start.push(adj_r.len() as u32);
++        for &(r, cand) in list {
++            adj_r.push(r as u32);
++            adj_cand.push(cand as u32);
++        }
++    }
++    adj_start.push(adj_r.len() as u32);
++    Ok(GenData {
++        n_nodes: topology.node_ids().len() as u32,
++        weak,
++        pairs: pairs as u32,
++        edges,
++        n_left: split.left.len() as u32,
++        n_right: split.right.len() as u32,
++        cand_edges,
++        free: free.into_iter().map(|i| i as u32).collect(),
++        adj_start,
++        adj_r,
++        adj_cand,
++        descriptor_digest: admitted.descriptor().digest(),
++        order_digest: *topology.order_digest(),
++    })
++}
++
++impl GenData {
++    /// The five substream seeds of a salt, in [`LABELS`] order.
++    pub fn seeds(&self, nonce: &[u8; 32]) -> [[u8; 32]; 5] {
++        LABELS.map(|l| stream_seed(nonce, &self.descriptor_digest, &self.order_digest, l.as_bytes()).expect("valid label"))
++    }
++}
+diff -ruN a/src/ice/build.rs b/src/ice/build.rs
+--- a/src/ice/build.rs	2026-11-25 18:12:44.633374642 +0000
++++ b/src/ice/build.rs	2026-11-25 18:12:44.658823147 +0000
+@@ -74,11 +74,27 @@
+     right: &str,
+ ) -> Result<Vec<Tile>, Code> {
+     let defect = Code::TopologyIncompatible;
+-    let found = candidates(lattice, topology).map_err(|_| defect)?;
+-    let split = sides(lattice, topology, &found).map_err(|_| defect)?;
+-    let left_order = shuffled_order(streams, left, split.left.len())?;
+-    let right_order = shuffled_order(streams, right, split.right.len())?;
+-    select(&found, &split, &left_order, &right_order).map_err(|_| defect)
++    // quip-cpu-screener: everything up to the shuffles depends only on the lattice and the topology, never on the salt,
++    // so it is computed once per topology and reused (the output is identical).
++    static CACHE: std::sync::Mutex<Option<(Lattice, [u8; 32], std::sync::Arc<(crate::ice::Prep, usize, usize)>)>> =
++        std::sync::Mutex::new(None);
++    let shared = {
++        let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
++        match g.as_ref() {
++            Some((l, d, c)) if *l == lattice && d == topology.order_digest() => c.clone(),
++            _ => {
++                let found = candidates(lattice, topology).map_err(|_| defect)?;
++                let split = sides(lattice, topology, &found).map_err(|_| defect)?;
++                let prep = crate::ice::prepare(&found, &split).map_err(|_| defect)?;
++                let c = std::sync::Arc::new((prep, split.left.len(), split.right.len()));
++                *g = Some((lattice, *topology.order_digest(), c.clone()));
++                c
++            }
++        }
++    };
++    let left_order = shuffled_order(streams, left, shared.1)?;
++    let right_order = shuffled_order(streams, right, shared.2)?;
++    crate::ice::select_prepared(&shared.0, &left_order, &right_order).map_err(|_| defect)
+ }
+ 
+ /// The edges of the topology as `(min, max)` pairs, sorted ascending.
+diff -ruN a/src/ice/matching.rs b/src/ice/matching.rs
+--- a/src/ice/matching.rs	2026-11-25 18:12:44.633374642 +0000
++++ b/src/ice/matching.rs	2026-11-25 18:12:44.658823147 +0000
+@@ -295,3 +295,85 @@
+     selected.sort_unstable();
+     Ok(selected)
+ }
++
++/// quip-cpu-screener: the salt-independent part of [`select`], computed once per topology.
++pub struct Prep {
++    free: Vec<Tile>,
++    adj: Vec<Vec<(usize, Tile)>>,
++    n_right: usize,
++}
++
++/// The part of [`select`] that does not depend on the shuffles.
++pub fn prepare(candidates: &Candidates, sides: &Sides) -> Result<Prep, StructureError> {
++    let mut tile_of: BTreeMap<(usize, usize), Tile> = BTreeMap::new();
++    let mut free: Vec<Tile> = Vec::new();
++    for (tile, spine) in candidates.tiles.iter().zip(&candidates.spines) {
++        let Some([e, f]) = spine else {
++            free.push(*tile);
++            continue;
++        };
++        let straight = (sides.left.binary_search(e), sides.right.binary_search(f));
++        let swapped = (sides.left.binary_search(f), sides.right.binary_search(e));
++        let (Ok(l), Ok(r)) = (if straight.0.is_ok() { straight } else { swapped }) else {
++            return Err(StructureError::Overflow);
++        };
++        if tile_of.insert((l, r), *tile).is_some() {
++            return Err(StructureError::Overflow);
++        }
++    }
++    let mut adj: Vec<Vec<(usize, Tile)>> = vec![Vec::new(); sides.left.len()];
++    for (&(l, r), tile) in &tile_of {
++        adj.get_mut(l).ok_or(StructureError::Overflow)?.push((r, *tile));
++    }
++    Ok(Prep { free, adj, n_right: sides.right.len() })
++}
++
++/// Same result as [`select`], for orders that are known to be permutations.
++pub fn select_prepared(prep: &Prep, left_order: &[u32], right_order: &[u32]) -> Result<Vec<Tile>, StructureError> {
++    let mut rank = vec![usize::MAX; prep.n_right];
++    for (position, &index) in right_order.iter().enumerate() {
++        *rank.get_mut(index as usize).ok_or(StructureError::BadOrder)? = position;
++    }
++    let mut adj: Vec<Vec<usize>> = prep
++        .adj
++        .iter()
++        .map(|l| {
++            let mut v: Vec<usize> = l.iter().map(|&(r, _)| r).collect();
++            v.sort_by_key(|r| rank.get(*r).copied().unwrap_or(usize::MAX));
++            v
++        })
++        .collect();
++    let mut matched: Vec<Option<usize>> = vec![None; prep.n_right];
++    let mut visited = vec![false; prep.n_right];
++    for &l in left_order {
++        visited.iter_mut().for_each(|v| *v = false);
++        augment(l as usize, &adj, &mut visited, &mut matched)?;
++    }
++    let mut selected: Vec<Tile> = prep.free.clone();
++    for (r, owner) in matched.iter().enumerate() {
++        if let Some(l) = owner {
++            let tile = prep.adj.get(*l).and_then(|v| v.iter().find(|&&(rr, _)| rr == r)).map(|&(_, t)| t).ok_or(StructureError::Overflow)?;
++            selected.push(tile);
++        }
++    }
++    selected.sort_unstable();
++    adj.clear();
++    Ok(selected)
++}
++
++/// quip-cpu-screener: the salt-independent tables of [`select`] with candidate indices, for the GPU port.
++/// Returns the free candidate indices and, per left spine, `(right spine, candidate index)` ascending in the right spine.
++pub fn prepare_tables(candidates: &Candidates, sides: &Sides) -> Result<(Vec<usize>, Vec<Vec<(usize, usize)>>), StructureError> {
++    let mut tile_of: BTreeMap<(usize, usize), usize> = BTreeMap::new();
++    let mut free = Vec::new();
++    for (idx, spine) in candidates.spines.iter().enumerate() {
++        let Some([e, f]) = spine else { free.push(idx); continue };
++        let straight = (sides.left.binary_search(e), sides.right.binary_search(f));
++        let swapped = (sides.left.binary_search(f), sides.right.binary_search(e));
++        let (Ok(l), Ok(r)) = (if straight.0.is_ok() { straight } else { swapped }) else { return Err(StructureError::Overflow) };
++        if tile_of.insert((l, r), idx).is_some() { return Err(StructureError::Overflow); }
++    }
++    let mut adj: Vec<Vec<(usize, usize)>> = vec![Vec::new(); sides.left.len()];
++    for (&(l, r), &idx) in &tile_of { adj.get_mut(l).ok_or(StructureError::Overflow)?.push((r, idx)); }
++    Ok((free, adj))
++}
+diff -ruN a/src/ice/mod.rs b/src/ice/mod.rs
+--- a/src/ice/mod.rs	2026-11-25 18:12:44.633374642 +0000
++++ b/src/ice/mod.rs	2026-11-25 18:12:44.658823147 +0000
+@@ -19,7 +19,7 @@
+ };
+ pub use fields::{ICE_FIELDS, ICE_FIELDS_RECIPES, ICE_FIELDS_SCHEMA, ICE_FIELDS_V1};
+ pub use glass::{ICE_GLASS, ICE_GLASS_SCHEMA, ICE_GLASS_V1, STRONG_MILLI};
+-pub use matching::{select, sides, Sides};
++pub use matching::{prepare, prepare_tables, select, select_prepared, sides, Prep, Sides};
+ pub use obstructions::{gauge_obstructions, Obstructions};
+ pub use topology::{
+     candidates, zephyr_coordinates, zephyr_coupler, zephyr_lattice, Candidates, Tile,
+diff -ruN a/src/ice/twisted_dimer.rs b/src/ice/twisted_dimer.rs
+--- a/src/ice/twisted_dimer.rs	2026-11-25 18:12:44.637616059 +0000
++++ b/src/ice/twisted_dimer.rs	2026-11-25 18:12:44.658823147 +0000
+@@ -190,6 +190,11 @@
+     pair_count(params).is_some_and(|pairs| pairs <= topology.node_ids().len() / 2)
+ }
+ 
++/// quip-cpu-screener: weak magnitude and pair count for the GPU port.
++pub fn gpu_params(params: &Params<'_>) -> Option<(i32, usize)> {
++    Some((weak_milli(params)?, pair_count(params)?))
++}
++
+ /// A pair taken by the walk: the edge position and the edge.
+ type ChosenPair = (usize, (u32, u32));
+ 
+@@ -216,6 +221,35 @@
+     ])
+ }
+ 
++
++/// quip-cpu-screener: the sorted edge list and a per-first-node index into it depend only on the topology, so they are built once.
++struct EdgeIndex { edges: Vec<(u32, u32)>, start: Vec<u32> }
++fn edge_index(topology: &BaseTopology) -> std::sync::Arc<EdgeIndex> {
++    static CACHE: std::sync::Mutex<Option<([u8; 32], std::sync::Arc<EdgeIndex>)>> = std::sync::Mutex::new(None);
++    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some((d, c)) = g.as_ref() {
++        if d == topology.order_digest() { return c.clone(); }
++    }
++    let edges = sorted_edges(topology);
++    let max = edges.iter().map(|&(u, _)| u as usize).max().unwrap_or(0);
++    let mut start = vec![0u32; max + 2];
++    for &(u, _) in &edges { start[u as usize + 1] += 1; }
++    for i in 1..start.len() { start[i] += start[i - 1]; }
++    let c = std::sync::Arc::new(EdgeIndex { edges, start });
++    *g = Some((*topology.order_digest(), c.clone()));
++    c
++}
++impl EdgeIndex {
++    /// Position of `pair` in the sorted edge list (same answer as `edges.binary_search(&pair)` when present).
++    fn find(&self, pair: (u32, u32)) -> Option<usize> {
++        let (a, b) = pair;
++        let a = a as usize;
++        if a + 1 >= self.start.len() { return None; }
++        let (lo, hi) = (self.start[a] as usize, self.start[a + 1] as usize);
++        self.edges[lo..hi].binary_search_by(|e| e.1.cmp(&b)).ok().map(|i| lo + i)
++    }
++}
++fn tk(i: usize, t: std::time::Instant) { crate::family::PROF[i].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+ fn generate(
+     params: &Params<'_>,
+     topology: &BaseTopology,
+@@ -225,7 +259,10 @@
+     let weak = weak_milli(params).ok_or(Code::ParamsMalformed)?;
+     let pairs = pair_count(params).ok_or(Code::ParamsMalformed)?;
+     let lattice = lattice(params).map_err(|_| defect)?;
++    let ta = std::time::Instant::now();
+     let tiles = select_tiles(lattice, topology, streams, LEFT, RIGHT)?;
++    tk(3, ta);
++    let tb = std::time::Instant::now();
+ 
+     let two = NonZeroU32::MIN.saturating_add(1);
+     let mut gauge_stream = streams.open(GAUGE).ok_or(Code::NoInstance)?;
+@@ -243,11 +280,14 @@
+         .collect();
+ 
+     let node_ids = topology.node_ids().to_vec();
+-    let edges = sorted_edges(topology);
++    let index = edge_index(topology);
++    let edges = index.edges.clone();
++    let _ = tb;
++    let tc = std::time::Instant::now();
+     let mut strong: Vec<Option<i32>> = vec![None; edges.len()];
+     for (tile, gauge) in tiles.iter().zip(&gauges) {
+         for (pair, coupling) in tile_couplings(tile.nodes, *gauge).ok_or(Code::BoundsExceeded)? {
+-            let at = edges.binary_search(&pair).map_err(|_| defect)?;
++            let at = index.find(pair).ok_or(defect)?;
+             *strong.get_mut(at).ok_or(defect)? = Some(coupling);
+         }
+     }
+@@ -262,6 +302,7 @@
+         });
+     }
+ 
++    let _ = tc;
+     let chosen = choose_pairs(streams, &edges, &strong, node_ids.len(), pairs)?;
+     for &(at, _) in &chosen {
+         *j.get_mut(at).ok_or(defect)? = PAIR_MILLI;
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-11-25 18:12:44.637616059 +0000
++++ b/src/lib.rs	2026-11-25 18:12:44.658823147 +0000
+@@ -31,6 +31,7 @@
+ //! - [`registry`]: the list of every family contract this crate implements.
+ 
+ #![no_std]
++extern crate std;
+ 
+ extern crate alloc;
+ 
+@@ -44,6 +45,7 @@
+ pub mod dipolar;
+ pub mod family;
+ pub mod flow;
++pub mod gpugen;
+ pub mod ice;
+ pub mod instance;
+ mod native;
+diff -ruN a/src/rng.rs b/src/rng.rs
+--- a/src/rng.rs	2026-11-25 18:12:44.637616059 +0000
++++ b/src/rng.rs	2026-11-25 18:12:44.654581729 +0000
+@@ -126,10 +126,18 @@
+ /// Unbiased draw in `0..n` by rejection. Reads at least one word, also for `n = 1`.
+ #[must_use]
+ pub fn uniform(rng: &mut ChaCha8Rng, n: NonZeroU32) -> u32 {
+-    let n = u64::from(n.get());
+-    let limit = (1u64 << 32) - ((1u64 << 32) % n);
++    // quip-cpu-screener: same draws and results as the 64-bit version below. 2^32 mod n < n, so every x below 2^32 - n is below the
++    // rejection limit and needs no limit computation (one 32-bit modulo instead of two 64-bit ones).
++    let n32 = n.get();
++    let easy = n32.wrapping_neg(); // 2^32 - n for n >= 1 (n = 1 gives 2^32 - 1)
+     loop {
+-        let x = u64::from(rng.next_u32());
++        let x32 = rng.next_u32();
++        if x32 < easy {
++            return x32 % n32;
++        }
++        let n = u64::from(n32);
++        let limit = (1u64 << 32) - ((1u64 << 32) % n);
++        let x = u64::from(x32);
+         if x < limit {
+             #[expect(clippy::cast_possible_truncation, reason = "x % n < n <= u32::MAX")]
+             return (x % n) as u32;
