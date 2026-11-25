@@ -1,0 +1,21 @@
+#!/bin/sh
+# Example launcher: point the miner's [cuda.N] binary at a script like this one (see README.md for what each setting does).
+# Single GPU, no helper machines. Tune QUIP_GEN_THREADS to your CPU (about CPU threads minus 8) and QUIP_PARALLEL_STREAMS to your GPU.
+set -eu
+export QUIP_TWO_PASS_REFINEMENT=native-cluster-rebase
+export QUIP_PARALLEL_STREAMS=6          # concurrent solve engines: 6 on an RTX 4090 / 5070 Ti, start lower (3-4) on smaller cards
+export QUIP_GEN_THREADS=22              # CPU threads that generate and ridge-score salts: CPU threads minus ~8 (22 of 30, 12-16 of 24)
+export QUIP_GPU_RESCORE=1               # GPU rank-8 rescoring of the best QUIP_RESCORE_FRAC of the CPU-ridge-scored salts (on the same GPU)
+export QUIP_RESCORE_FRAC=0.03
+export QUIP_GG_BATCH=512
+export QUIP_POOL=32                     # small candidate pool: surplus candidates are dropped at once, so leases finish and the coordinator grows them
+export QUIP_LEASE_ACTIVE=3
+export QUIP_REROLL_SLOTS=2
+export QUIP_FOCUS=1
+export QUIP_FOCUS_PAR=4
+export QUIP_FOCUS_FRAC=0.4
+export QUIP_REFINE=1                    # in-process CPU refiner (restart ladder) on solves near the round target
+export QUIP_REFINE_SECONDS=8
+export QUIP_REFINE_MARGIN_MILLI=2500    # refine solves within 2.5 energy units of the live target
+export QUIP_REFINE_MAX=2
+exec "$(dirname "$0")/target/release/quip-cuda-native-two-pass" --search-config "$(dirname "$0")/configs/example.json" "$@"
